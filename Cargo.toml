@@ -1,0 +1,10 @@
+[workspace]
+members = [
+  "tailtalk-packets",
+  "tailtalk",
+  "examples/nbp-lookup",
+  "examples/aep-echo",
+  "examples/pap-print",
+  "examples/afp-server"
+]
+resolver = "3"
