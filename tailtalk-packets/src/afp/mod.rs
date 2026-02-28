@@ -1,11 +1,13 @@
 mod bitmap;
 mod commands;
 mod types;
+mod util;
 
 // Re-export all public items
 pub use bitmap::*;
 pub use commands::*;
 pub use types::*;
+pub use util::*;
 
 #[cfg(test)]
 mod tests {
@@ -14,7 +16,7 @@ mod tests {
     #[test]
     fn test_afp_status_round_trip() {
         let status = FPGetSrvrInfo {
-            machine_type: "Macintosh".to_string(),
+            machine_type: MacString::from("Macintosh"),
             afp_versions: vec![
                 AfpVersion::Version1_1,
                 AfpVersion::Version2,
@@ -23,7 +25,7 @@ mod tests {
             uams: vec![AfpUam::NoUserAuthent, AfpUam::CleartxtPasswrd],
             volume_icon: Some([0xAA; 256]), // Dummy icon
             flags: 0x0001,                  // CopyFile
-            server_name: "Test Server".to_string(),
+            server_name: MacString::from("Test Server"),
         };
 
         let bytes = status.to_bytes().expect("Serialization failed");
@@ -38,12 +40,12 @@ mod tests {
     #[test]
     fn test_afp_status_no_icon() {
         let status = FPGetSrvrInfo {
-            machine_type: "Macintosh".to_string(),
+            machine_type: MacString::from("Macintosh"),
             afp_versions: vec![AfpVersion::Version2],
             uams: vec![AfpUam::NoUserAuthent],
             volume_icon: None,
             flags: 0,
-            server_name: "Mini".to_string(),
+            server_name: MacString::from("Mini"),
         };
 
         let bytes = status.to_bytes().expect("Serialization failed");
@@ -89,10 +91,10 @@ mod tests {
         let packet = FPGetSrvrInfo::parse(test_data).expect("Failed to parse test data");
 
         // Verify the parsed data is correct
-        assert_eq!(packet.machine_type, "Macintosh");
+        assert_eq!(packet.machine_type.as_str(), "Macintosh");
         assert_eq!(packet.afp_versions.len(), 3);
         assert_eq!(packet.uams.len(), 3);
-        assert_eq!(packet.server_name, "PowerBook G3");
+        assert_eq!(packet.server_name.as_str(), "PowerBook G3");
 
         // Re-serialize and verify it can be parsed back
         let encoded = packet.to_bytes().expect("Failed to encode packet");
@@ -127,7 +129,7 @@ mod tests {
         let login = FPLogin {
             afp_version: AfpVersion::Version2_1,
             auth: FPLoginAuth::CleartxtPasswrd {
-                username: "testuser".to_string(),
+                username: MacString::from("testuser"),
                 password,
             },
         };
@@ -143,7 +145,7 @@ mod tests {
             password: pwd,
         } = decoded.auth
         {
-            assert_eq!(username, "testuser");
+            assert_eq!(username.as_str(), "testuser");
             assert_eq!(&pwd[..4], b"pass");
             assert_eq!(&pwd[4..], &[0, 0, 0, 0]); // Verify padding
         } else {
@@ -162,7 +164,7 @@ mod tests {
             FPLogin {
                 afp_version: AfpVersion::Version2,
                 auth: FPLoginAuth::CleartxtPasswrd {
-                    username: "admin".to_string(),
+                    username: MacString::from("admin"),
                     password: *b"secret\0\0",
                 },
             },
@@ -217,7 +219,7 @@ mod tests {
         let login = FPLogin {
             afp_version: AfpVersion::Version2,
             auth: FPLoginAuth::CleartxtPasswrd {
-                username: long_username.clone(),
+                username: MacString::from(long_username.clone()),
                 password,
             },
         };
@@ -228,7 +230,7 @@ mod tests {
         // Username should be truncated to 255 characters
         if let FPLoginAuth::CleartxtPasswrd { username, .. } = decoded.auth {
             assert_eq!(username.len(), 255);
-            assert_eq!(username, "a".repeat(255));
+            assert_eq!(username.as_str(), "a".repeat(255));
         } else {
             panic!("Expected CleartxtPasswrd auth");
         }

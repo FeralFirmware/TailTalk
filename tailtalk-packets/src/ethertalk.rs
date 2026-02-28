@@ -87,15 +87,15 @@ impl EtherTalkFrame {
 
         if buf[Self::OUI_OFF..(Self::OUI_OFF + Self::AARP_OUI.len())] == Self::AARP_OUI {
             return Ok(Self {
-                dst_mac: dst_mac.try_into().unwrap(),
-                src_mac: src_mac.try_into().unwrap(),
+                dst_mac: *dst_mac.as_array().unwrap(),
+                src_mac: *src_mac.as_array().unwrap(),
                 len: 10,
                 protocol: EtherTalkType::Aarp,
             });
         } else if buf[Self::OUI_OFF..(Self::OUI_OFF + Self::DDP_OUI.len())] == Self::DDP_OUI {
             return Ok(Self {
-                dst_mac: dst_mac.try_into().unwrap(),
-                src_mac: src_mac.try_into().unwrap(),
+                dst_mac: *dst_mac.as_array().unwrap(),
+                src_mac: *src_mac.as_array().unwrap(),
                 len: 10,
                 protocol: EtherTalkType::Ddp,
             });

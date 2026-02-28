@@ -1,4 +1,5 @@
 use super::types::{AfpError, AfpUam, AfpVersion};
+use crate::afp::util::MacString;
 use crate::afp::{
     FPAccessRights, FPByteRangeLockFlags, FPDirectoryBitmap, FPFileAttributes, FPFileBitmap,
     FPVolumeBitmap,
@@ -44,7 +45,7 @@ pub enum FPLoginAuth {
 
     /// Clear text password authentication
     CleartxtPasswrd {
-        username: String,
+        username: MacString,
         password: [u8; 8], // Exactly 8 bytes, padded with nulls
     },
 }
@@ -68,19 +69,10 @@ impl FPLogin {
         let mut offset = 0;
 
         // Helper to read a Pascal string
-        let read_pstr = |offset: usize| -> Result<(String, usize), AfpError> {
-            if offset >= buf.len() {
-                return Err(AfpError::InvalidSize);
-            }
-            let len = buf[offset] as usize;
-            if offset + 1 + len > buf.len() {
-                return Err(AfpError::InvalidSize);
-            }
-            let s_bytes = &buf[offset + 1..offset + 1 + len];
-            Ok((
-                String::from_utf8_lossy(s_bytes).to_string(),
-                offset + 1 + len,
-            ))
+        let read_pstr = |offset: usize| -> Result<(MacString, usize), AfpError> {
+            let parsed = MacString::try_from(&buf[offset..])?;
+            let next_offset = offset + parsed.byte_len();
+            Ok((parsed, next_offset))
         };
 
         // Parse AFP version
@@ -144,9 +136,9 @@ impl FPLogin {
                 buf.extend_from_slice(uam_str.as_bytes());
 
                 // Serialize username
-                let username_len = username.len().min(255) as u8;
-                buf.push(username_len);
-                buf.extend_from_slice(&username.as_bytes()[..username_len as usize]);
+                let mut username_buf = [0u8; 256];
+                let written = username.bytes(&mut username_buf)?;
+                buf.extend_from_slice(&username_buf[..written]);
 
                 // Serialize 8-byte password
                 buf.extend_from_slice(password);
@@ -159,12 +151,12 @@ impl FPLogin {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FPGetSrvrInfo {
-    pub machine_type: String,
+    pub machine_type: MacString,
     pub afp_versions: Vec<AfpVersion>,
     pub uams: Vec<AfpUam>,
     pub volume_icon: Option<[u8; 256]>,
     pub flags: u16,
-    pub server_name: String,
+    pub server_name: MacString,
 }
 
 impl FPGetSrvrInfo {
@@ -185,11 +177,10 @@ impl FPGetSrvrInfo {
         if 10 + 1 + server_name_len > buf.len() {
             return Err(AfpError::InvalidSize);
         }
-        let server_name_bytes = &buf[11..11 + server_name_len];
-        let server_name = String::from_utf8_lossy(server_name_bytes).to_string();
+        let server_name = MacString::try_from(&buf[10..10 + 1 + server_name_len])?;
 
         // Helper to read a pascal string at a given offset
-        let read_pstr = |offset: usize| -> Result<String, AfpError> {
+        let read_pstr = |offset: usize| -> Result<MacString, AfpError> {
             if offset >= buf.len() {
                 return Err(AfpError::InvalidSize);
             }
@@ -197,42 +188,38 @@ impl FPGetSrvrInfo {
             if offset + 1 + len > buf.len() {
                 return Err(AfpError::InvalidSize);
             }
-            let s_bytes = &buf[offset + 1..offset + 1 + len];
-            Ok(String::from_utf8_lossy(s_bytes).to_string())
+            Ok(MacString::try_from(&buf[offset..offset + 1 + len])?)
         };
 
         // Helper to read a list of pascal strings (Count byte + Strings)
-        let read_pstr_list = |offset: usize| -> Result<Vec<String>, AfpError> {
+        let read_pstr_list = |offset: usize| -> Result<Vec<MacString>, AfpError> {
             if offset >= buf.len() {
                 return Err(AfpError::InvalidSize);
             }
             let count = buf[offset] as usize;
-            let mut strings = Vec::with_capacity(count);
+            let mut strings: Vec<MacString> = Vec::with_capacity(count);
             let mut current_pos = offset + 1;
 
             for _ in 0..count {
                 if current_pos >= buf.len() {
                     return Err(AfpError::InvalidSize);
                 }
-                let len = buf[current_pos] as usize;
-                if current_pos + 1 + len > buf.len() {
-                    return Err(AfpError::InvalidSize);
-                }
-                let s_bytes = &buf[current_pos + 1..current_pos + 1 + len];
-                strings.push(String::from_utf8_lossy(s_bytes).to_string());
-                current_pos += 1 + len;
+
+                let new_string = MacString::try_from(&buf[current_pos..])?;
+                current_pos += new_string.byte_len();
+                strings.push(new_string);
             }
             Ok(strings)
         };
 
         let machine_type = read_pstr(machine_type_offset)?;
-        let afp_versions_strings = read_pstr_list(afp_versions_offset)?;
+        let afp_versions_strings: Vec<MacString> = read_pstr_list(afp_versions_offset)?;
         let afp_versions: Vec<AfpVersion> = afp_versions_strings
             .iter()
             .map(|s| AfpVersion::try_from(s.as_str()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| AfpError::BadVersNum)?;
-        let uams_strings = read_pstr_list(uams_offset)?;
+        let uams_strings: Vec<MacString> = read_pstr_list(uams_offset)?;
         let uams: Vec<AfpUam> = uams_strings
             .iter()
             .map(|s| AfpUam::try_from(s.as_str()).map_err(|_| AfpError::BadUam))
@@ -265,7 +252,6 @@ impl FPGetSrvrInfo {
         let mut buf = Vec::new();
 
         // Header size = 10 bytes (offsets + flags) + Server Name (1 + 32 bytes).
-        let server_name_len = self.server_name.len().min(31) as u8;
 
         // TODO: Do we actually need to pad this? Classic MacOS does but Inside AppleTalk does not mention it
         const SERVER_NAME_FIELD_SIZE: u16 = 1 + 32; // length byte + 32-byte fixed field
@@ -274,12 +260,11 @@ impl FPGetSrvrInfo {
 
         let mut variable_data = Vec::new();
 
+        let mut tmp_macstr = [0u8; 256];
         let machine_type_ptr = current_offset;
         {
-            let s = &self.machine_type;
-            let len = s.len().min(255) as u8;
-            variable_data.push(len);
-            variable_data.extend_from_slice(&s.as_bytes()[..len as usize]);
+            let written = self.machine_type.bytes(&mut tmp_macstr)?;
+            variable_data.extend_from_slice(&tmp_macstr[..written]);
         }
         current_offset = 10 + SERVER_NAME_FIELD_SIZE + variable_data.len() as u16;
 
@@ -316,10 +301,14 @@ impl FPGetSrvrInfo {
         buf.extend_from_slice(&uams_ptr.to_be_bytes());
         buf.extend_from_slice(&volume_icon_ptr.to_be_bytes());
         buf.extend_from_slice(&self.flags.to_be_bytes());
-        buf.push(server_name_len);
-        buf.extend_from_slice(&self.server_name.as_bytes()[..server_name_len as usize]);
 
-        let padding_needed = 32 - server_name_len as usize;
+        // Write fixed length 32-byte server name (plus length byte)
+        let written = self.server_name.bytes(&mut tmp_macstr)?;
+        let server_name_len = (written - 1).min(31);
+        buf.push(server_name_len as u8);
+        buf.extend_from_slice(&tmp_macstr[1..1 + server_name_len]);
+
+        let padding_needed = 32 - server_name_len;
         buf.extend(std::iter::repeat_n(0x20, padding_needed));
         buf.extend_from_slice(&variable_data);
 
@@ -330,7 +319,7 @@ impl FPGetSrvrInfo {
 pub struct FPVolume {
     pub has_password: bool,
     pub has_config_info: bool,
-    pub name: String,
+    pub name: MacString,
 }
 
 impl FPVolume {
@@ -346,14 +335,14 @@ impl FPVolume {
         let target = &mut buf[..target_size];
 
         target[0] = (self.has_password as u8) << 7 | (self.has_config_info as u8) << 6;
-        target[1] = self.name.len() as u8;
-        target[2..target_size].copy_from_slice(self.name.as_bytes());
+        target[1] = (self.name.byte_len() - 1) as u8;
+        self.name.bytes(&mut target[1..])?;
 
         Ok(target_size)
     }
 
-    pub const fn size(&self) -> usize {
-        2 + self.name.len()
+    pub fn size(&self) -> usize {
+        2 + self.name.byte_len() - 1
     }
 }
 
@@ -399,27 +388,21 @@ pub struct FPEnumerate {
     pub req_count: u16,
     pub start_index: u16,
     pub max_reply_size: u16,
-    pub path: String,
+    pub path: MacString,
 }
 
 impl FPEnumerate {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
-        let volume_id = u16::from_be_bytes(buf[0..2].try_into().unwrap());
-        let directory_id = u32::from_be_bytes(buf[2..6].try_into().unwrap());
-        let file_bitmap = FPFileBitmap::from(u16::from_be_bytes(buf[6..8].try_into().unwrap()));
+        let volume_id = u16::from_be_bytes(*buf[0..2].as_array().unwrap());
+        let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
+        let file_bitmap = FPFileBitmap::from(u16::from_be_bytes(*buf[6..8].as_array().unwrap()));
         let directory_bitmap =
-            FPDirectoryBitmap::from(u16::from_be_bytes(buf[8..10].try_into().unwrap()));
-        let req_count = u16::from_be_bytes(buf[10..12].try_into().unwrap());
-        let start_index = u16::from_be_bytes(buf[12..14].try_into().unwrap());
-        let max_reply_size = u16::from_be_bytes(buf[14..16].try_into().unwrap());
+            FPDirectoryBitmap::from(u16::from_be_bytes(*buf[8..10].as_array().unwrap()));
+        let req_count = u16::from_be_bytes(*buf[10..12].as_array().unwrap());
+        let start_index = u16::from_be_bytes(*buf[12..14].as_array().unwrap());
+        let max_reply_size = u16::from_be_bytes(*buf[14..16].as_array().unwrap());
         let _path_type = buf[16];
-        let path_len = buf[17];
-
-        let path = if path_len > 0 {
-            String::from_utf8(buf[18..18 + path_len as usize].to_vec()).unwrap()
-        } else {
-            String::new()
-        };
+        let path = MacString::try_from(&buf[17..])?;
 
         Ok(Self {
             volume_id,
@@ -447,9 +430,9 @@ impl FPByteRangeLock {
         // Here Be Dragons:
         // This command also does not match Inside AppleTalk. Perhaps a version difference? Very confusing.
         let flags = FPByteRangeLockFlags::from(buf[0]);
-        let fork_id = u16::from_be_bytes(buf[1..3].try_into().unwrap());
-        let offset = i32::from_be_bytes(buf[3..7].try_into().unwrap());
-        let length = u32::from_be_bytes(buf[7..11].try_into().unwrap());
+        let fork_id = u16::from_be_bytes(*buf[1..3].as_array().unwrap());
+        let offset = i32::from_be_bytes(*buf[3..7].as_array().unwrap());
+        let length = u32::from_be_bytes(*buf[7..11].as_array().unwrap());
 
         Ok(Self {
             fork_id,
@@ -467,7 +450,7 @@ pub struct FPCloseFork {
 
 impl FPCloseFork {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
-        let fork_id = u16::from_be_bytes(buf[0..2].try_into().unwrap());
+        let fork_id = u16::from_be_bytes(*buf[0..2].as_array().unwrap());
 
         Ok(Self { fork_id })
     }
@@ -478,7 +461,7 @@ pub struct FPSetDirParms {
     pub volume_id: u16,
     pub directory_id: u32,
     pub dir_bitmap: FPDirectoryBitmap,
-    pub path: String,
+    pub path: MacString,
     pub attributes: Option<FPFileAttributes>,
     pub finder_info: Option<[u8; 32]>,
     pub owner_id: Option<u32>,
@@ -491,19 +474,14 @@ pub struct FPSetDirParms {
 
 impl FPSetDirParms {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
-        let volume_id = u16::from_be_bytes(buf[..2].try_into().unwrap());
-        let directory_id = u32::from_be_bytes(buf[2..6].try_into().unwrap());
-        let dir_bitmap = FPDirectoryBitmap::from(u16::from_be_bytes(buf[6..8].try_into().unwrap()));
+        let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
+        let dir_bitmap =
+            FPDirectoryBitmap::from(u16::from_be_bytes(*buf[6..8].as_array().unwrap()));
         let _path_type = buf[8];
-        let path_len = buf[9];
+        let path = MacString::try_from(&buf[9..])?;
 
-        let path = if path_len > 0 {
-            String::from_utf8(buf[10..10 + path_len as usize].to_vec()).unwrap()
-        } else {
-            String::new()
-        };
-
-        let mut offset = 10 + path_len as usize;
+        let mut offset = 9 + path.byte_len();
 
         let mut parsed_parms = Self {
             volume_id,
@@ -522,7 +500,7 @@ impl FPSetDirParms {
 
         if dir_bitmap.contains(FPDirectoryBitmap::ATTRIBUTES) {
             let attributes = FPFileAttributes::from(u16::from_be_bytes(
-                buf[offset..offset + 2].try_into().unwrap(),
+                *buf[offset..offset + 2].as_array().unwrap(),
             ));
             parsed_parms.attributes = Some(attributes);
             offset += 2;
@@ -536,13 +514,13 @@ impl FPSetDirParms {
         }
 
         if dir_bitmap.contains(FPDirectoryBitmap::OWNER_ID) {
-            let owner_id = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
+            let owner_id = u32::from_be_bytes(*buf[offset..offset + 4].as_array().unwrap());
             parsed_parms.owner_id = Some(owner_id);
             offset += 4;
         }
 
         if dir_bitmap.contains(FPDirectoryBitmap::GROUP_ID) {
-            let group_id = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
+            let group_id = u32::from_be_bytes(*buf[offset..offset + 4].as_array().unwrap());
             parsed_parms.group_id = Some(group_id);
             offset += 4;
         }
@@ -587,9 +565,9 @@ pub struct FPRead {
 
 impl FPRead {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
-        let fork_id = u16::from_be_bytes(buf[..2].try_into().unwrap());
-        let offset = u32::from_be_bytes(buf[2..6].try_into().unwrap());
-        let req_count = u32::from_be_bytes(buf[6..10].try_into().unwrap());
+        let fork_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let offset = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
+        let req_count = u32::from_be_bytes(*buf[6..10].as_array().unwrap());
         let newline_mask = buf[10];
         let newline_char = buf[11];
 
@@ -614,7 +592,7 @@ pub struct FPFlush {
 
 impl FPFlush {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
-        let volume_id = u16::from_be_bytes(buf[..2].try_into().unwrap());
+        let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         Ok(Self { volume_id })
     }
 }
@@ -626,8 +604,8 @@ pub struct FPGetVolParms {
 
 impl FPGetVolParms {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
-        let volume_id = u16::from_be_bytes(buf[..2].try_into().unwrap());
-        let bitmap = FPVolumeBitmap::from(u16::from_be_bytes(buf[2..4].try_into().unwrap()));
+        let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let bitmap = FPVolumeBitmap::from(u16::from_be_bytes(*buf[2..4].as_array().unwrap()));
         Ok(Self { volume_id, bitmap })
     }
 }
@@ -635,21 +613,15 @@ impl FPGetVolParms {
 pub struct FPDelete {
     pub volume_id: u16,
     pub directory_id: u32,
-    pub path: String,
+    pub path: MacString,
 }
 
 impl FPDelete {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
-        let volume_id = u16::from_be_bytes(buf[..2].try_into().unwrap());
-        let directory_id = u32::from_be_bytes(buf[2..6].try_into().unwrap());
+        let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
         let _path_type = buf[6];
-        let path_len = buf[7];
-
-        let path = if path_len > 0 {
-            String::from_utf8(buf[8..8 + path_len as usize].to_vec()).unwrap()
-        } else {
-            String::new()
-        };
+        let path = MacString::try_from(&buf[7..])?;
 
         Ok(Self {
             volume_id,
@@ -662,8 +634,8 @@ impl FPDelete {
 #[derive(Debug)]
 pub struct FPAddIcon {
     pub dt_ref_num: u16,
-    pub file_creator: String,
-    pub file_type: String,
+    pub file_creator: [u8; 4],
+    pub file_type: [u8; 4],
     pub icon_type: u8,
     pub icon_tag: u32,
     pub size: u16,
@@ -674,13 +646,13 @@ impl FPAddIcon {
         if buf.len() < 18 {
             return Err(AfpError::InvalidSize);
         }
-        let dt_ref_num = u16::from_be_bytes(buf[..2].try_into().unwrap());
-        let file_creator = String::from_utf8_lossy(&buf[2..6]).to_string();
-        let file_type = String::from_utf8_lossy(&buf[6..10]).to_string();
+        let dt_ref_num = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let file_creator: [u8; 4] = *buf[2..6].as_array().unwrap();
+        let file_type: [u8; 4] = *buf[6..10].as_array().unwrap();
         let icon_type = buf[10];
         // pad byte at 11
-        let icon_tag = u32::from_be_bytes(buf[12..16].try_into().unwrap());
-        let size = u16::from_be_bytes(buf[16..18].try_into().unwrap());
+        let icon_tag = u32::from_be_bytes(*buf[12..16].as_array().unwrap());
+        let size = u16::from_be_bytes(*buf[16..18].as_array().unwrap());
 
         Ok(Self {
             dt_ref_num,
@@ -696,20 +668,20 @@ impl FPAddIcon {
 #[derive(Debug)]
 pub struct FPGetIcon {
     pub dt_ref_num: u16,
-    pub file_creator: String,
-    pub file_type: String,
+    pub file_creator: [u8; 4],
+    pub file_type: [u8; 4],
     pub icon_type: u8,
     pub size: u16,
 }
 
 impl FPGetIcon {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
-        let dt_ref_num = u16::from_be_bytes(buf[..2].try_into().unwrap());
-        let file_creator = String::from_utf8(buf[2..6].to_vec()).unwrap();
-        let file_type = String::from_utf8(buf[6..10].to_vec()).unwrap();
+        let dt_ref_num = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let file_creator: [u8; 4] = *buf[2..6].as_array().unwrap();
+        let file_type: [u8; 4] = *buf[6..10].as_array().unwrap();
         let icon_type = buf[10];
         // Pad byte here, skip one.
-        let size = u16::from_be_bytes(buf[12..14].try_into().unwrap());
+        let size = u16::from_be_bytes(*buf[12..14].as_array().unwrap());
 
         Ok(Self {
             dt_ref_num,
@@ -724,7 +696,7 @@ impl FPGetIcon {
 #[derive(Debug)]
 pub struct FPGetIconInfo {
     pub dt_ref_num: u16,
-    pub file_creator: String,
+    pub file_creator: [u8; 4],
     pub icon_type: u16,
 }
 
@@ -733,10 +705,10 @@ impl FPGetIconInfo {
         if buf.len() < 8 {
             return Err(AfpError::InvalidSize);
         }
-        let dt_ref_num = u16::from_be_bytes(buf[..2].try_into().unwrap());
-        let file_creator = String::from_utf8_lossy(&buf[2..6]).to_string();
+        let dt_ref_num = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let file_creator: [u8; 4] = *buf[2..6].as_array().unwrap();
         // 2 byte icon type
-        let icon_type = u16::from_be_bytes(buf[6..8].try_into().unwrap());
+        let icon_type = u16::from_be_bytes(*buf[6..8].as_array().unwrap());
 
         Ok(Self {
             dt_ref_num,
@@ -750,21 +722,15 @@ impl FPGetIconInfo {
 pub struct FPGetComment {
     pub dt_ref_num: u16,
     pub directory_id: u32,
-    pub path: String,
+    pub path: MacString,
 }
 
 impl FPGetComment {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
-        let dt_ref_num = u16::from_be_bytes(buf[..2].try_into().unwrap());
-        let directory_id = u32::from_be_bytes(buf[2..6].try_into().unwrap());
+        let dt_ref_num = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
         let _path_type = buf[6];
-        let path_len = buf[7];
-
-        let path = if path_len > 0 {
-            String::from_utf8(buf[8..8 + path_len as usize].to_vec()).unwrap()
-        } else {
-            String::new()
-        };
+        let path = MacString::try_from(&buf[7..])?;
 
         Ok(Self {
             dt_ref_num,
@@ -777,20 +743,14 @@ impl FPGetComment {
 #[derive(Debug)]
 pub struct FPRemoveComment {
     pub directory_id: u32,
-    pub path: String,
+    pub path: MacString,
 }
 
 impl FPRemoveComment {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
-        let directory_id = u32::from_be_bytes(buf[1..5].try_into().unwrap());
+        let directory_id = u32::from_be_bytes(*buf[1..5].as_array().unwrap());
         let _path_type = buf[5];
-        let path_len = buf[6];
-
-        let path = if path_len > 0 {
-            String::from_utf8(buf[7..7 + path_len as usize].to_vec()).unwrap()
-        } else {
-            String::new()
-        };
+        let path = MacString::try_from(&buf[6..])?;
 
         Ok(Self { directory_id, path })
     }
@@ -800,25 +760,23 @@ impl FPRemoveComment {
 pub struct FPAddComment {
     pub dt_ref_num: u16,
     pub directory_id: u32,
-    pub path: String,
+    pub path: MacString,
     pub comment: Vec<u8>,
 }
 
 impl FPAddComment {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
-        let dt_ref_num = u16::from_be_bytes(buf[..2].try_into().unwrap());
-        let directory_id = u32::from_be_bytes(buf[2..6].try_into().unwrap());
+        let dt_ref_num = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
         let _path_type = buf[6];
-        let path_len = buf[7];
-
-        let path = if path_len > 0 {
-            String::from_utf8_lossy(&buf[8..8 + path_len as usize]).to_string()
+        let path = if buf.len() > 7 {
+            MacString::try_from(&buf[7..])?
         } else {
-            String::new()
+            MacString::from("")
         };
 
         // Comment starts after the variable length path. It must be padded to be even.
-        let mut comment_offset = 7 + path_len as usize;
+        let mut comment_offset = 7 + path.byte_len() - 1;
         // Commands are word-aligned, so start of comment string is at an even offset from the START of the command
         // Since buf here starts from the command payload, we know DSI header was before it.
         // It's safer to just skip padding dynamically.
@@ -826,9 +784,13 @@ impl FPAddComment {
             comment_offset += 1;
         }
 
-        let comment_len = buf.get(comment_offset).copied().unwrap_or(0) as usize;
-        let comment_data = if comment_len > 0 && comment_offset + 1 + comment_len <= buf.len() {
-            buf[comment_offset + 1..comment_offset + 1 + comment_len].to_vec()
+        let comment_data = if comment_offset < buf.len() {
+            let comment_len = buf[comment_offset] as usize;
+            if comment_len > 0 && comment_offset + 1 + comment_len <= buf.len() {
+                buf[comment_offset + 1..comment_offset + 1 + comment_len].to_vec()
+            } else {
+                vec![]
+            }
         } else {
             vec![]
         };
@@ -855,9 +817,9 @@ impl FPWrite {
         if buf.len() < 10 {
             return Err(AfpError::InvalidSize);
         }
-        let fork_id = u16::from_be_bytes(buf[..2].try_into().unwrap());
-        let offset = u32::from_be_bytes(buf[2..6].try_into().unwrap());
-        let req_count_raw = u32::from_be_bytes(buf[6..10].try_into().unwrap());
+        let fork_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let offset = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
+        let req_count_raw = u32::from_be_bytes(*buf[6..10].as_array().unwrap());
 
         // High bit of req_count is the Start/End flag
         let start_end_flag = (req_count_raw & 0x8000_0000) != 0;
@@ -889,8 +851,8 @@ pub struct FPSetForkParms {
 
 impl FPSetForkParms {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
-        let fork_ref_num = u16::from_be_bytes(buf[..2].try_into().unwrap());
-        let file_bitmap = FPFileBitmap::from(u16::from_be_bytes(buf[2..4].try_into().unwrap()));
+        let fork_ref_num = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let file_bitmap = FPFileBitmap::from(u16::from_be_bytes(*buf[2..4].as_array().unwrap()));
 
         let mut offset = 4;
 
@@ -898,7 +860,7 @@ impl FPSetForkParms {
             if offset + 4 > buf.len() {
                 return Err(AfpError::InvalidSize);
             }
-            let val = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
+            let val = u32::from_be_bytes(*buf[offset..offset + 4].as_array().unwrap());
             offset += 4;
             Some(val)
         } else {
@@ -909,7 +871,7 @@ impl FPSetForkParms {
             if offset + 4 > buf.len() {
                 return Err(AfpError::InvalidSize);
             }
-            let val = u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap());
+            let val = u32::from_be_bytes(*buf[offset..offset + 4].as_array().unwrap());
             Some(val)
         } else {
             None
@@ -948,7 +910,7 @@ impl FPOpenDT {
         if buf.len() < 2 {
             return Err(AfpError::InvalidSize);
         }
-        let volume_id = u16::from_be_bytes(buf[..2].try_into().unwrap());
+        let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         Ok(Self { volume_id })
     }
 }

@@ -4,8 +4,8 @@ use tracing::error;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IconKey {
-    pub creator: String,
-    pub file_type: String,
+    pub creator: [u8; 4],
+    pub file_type: [u8; 4],
     pub icon_type: u8,
 }
 
@@ -13,14 +13,8 @@ impl IconKey {
     pub fn to_bytes(&self) -> [u8; 9] {
         let mut bytes = [0u8; 9];
         // AFP creator and file_type are exactly 4 bytes (Mac OS OSType format)
-        // Ensure they fit within 4 bytes.
-        let creator_bytes = self.creator.as_bytes();
-        let copy_len = creator_bytes.len().min(4);
-        bytes[0..copy_len].copy_from_slice(&creator_bytes[..copy_len]);
-
-        let type_bytes = self.file_type.as_bytes();
-        let copy_len = type_bytes.len().min(4);
-        bytes[4..4 + copy_len].copy_from_slice(&type_bytes[..copy_len]);
+        bytes[0..4].copy_from_slice(&self.creator);
+        bytes[4..8].copy_from_slice(&self.file_type);
 
         bytes[8] = self.icon_type;
         bytes
@@ -57,8 +51,8 @@ impl DesktopDatabase {
 
     pub fn add_icon(
         &self,
-        creator: String,
-        file_type: String,
+        creator: [u8; 4],
+        file_type: [u8; 4],
         icon_type: u8,
         icon_data: &[u8],
     ) -> Result<(), AfpError> {
@@ -82,8 +76,8 @@ impl DesktopDatabase {
 
     pub fn get_icon(
         &self,
-        creator: String,
-        file_type: String,
+        creator: [u8; 4],
+        file_type: [u8; 4],
         icon_type: u8,
         _size: u16,
     ) -> Result<Vec<u8>, AfpError> {
@@ -109,7 +103,7 @@ impl DesktopDatabase {
     }
     pub fn get_icon_info(
         &self,
-        creator: String,
+        creator: [u8; 4],
         _icon_type: u16,
     ) -> Result<(u32, u32, u16), AfpError> {
         // Since sqlite/sled stores the entire icon, we can iterate over the keys matching the creator
@@ -131,7 +125,7 @@ impl DesktopDatabase {
             {
                 let mut key_creator = [0u8; 4];
                 key_creator.copy_from_slice(&key[0..4]);
-                if key_creator == creator.as_bytes()[..creator.len().min(4)] {
+                if key_creator == creator {
                     let mut file_type = [0u8; 4];
                     file_type.copy_from_slice(&key[4..8]);
 

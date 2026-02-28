@@ -82,18 +82,15 @@ impl NbpPacket {
                 return Err("Packet too short for declared tuple count".to_string());
             }
 
-            tracing::info!("Handling first part");
             let network_number = u16::from_be_bytes([data[offset], data[offset + 1]]);
             let node_id = data[offset + 2];
             let socket_number = data[offset + 3];
             let enumerator = data[offset + 4];
             offset += 5;
 
-            tracing::info!("Handlnig second part");
             let (entity_name, name_length) = EntityName::from_bytes(&data[offset..])?;
             offset += name_length;
 
-            tracing::info!("handling third part");
             tuples.push(NbpTuple {
                 network_number,
                 node_id,

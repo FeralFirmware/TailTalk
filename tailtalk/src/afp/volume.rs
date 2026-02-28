@@ -604,7 +604,7 @@ impl Volume {
         FPVolume {
             has_password: false,
             has_config_info: false,
-            name: self.name.clone(),
+            name: self.name.clone().into(),
         }
     }
 
@@ -919,8 +919,8 @@ impl Volume {
             && db.dt_ref_num == dt_ref_num
         {
             return db.add_icon(
-                req.file_creator.clone(),
-                req.file_type.clone(),
+                req.file_creator,
+                req.file_type,
                 req.icon_type,
                 data,
             );
@@ -937,8 +937,8 @@ impl Volume {
             && db.dt_ref_num == dt_ref_num
         {
             return db.get_icon(
-                req.file_creator.clone(),
-                req.file_type.clone(),
+                req.file_creator,
+                req.file_type,
                 req.icon_type,
                 req.size,
             );
@@ -954,7 +954,7 @@ impl Volume {
         if let Some(ref db) = self.desktop_database
             && db.dt_ref_num == dt_ref_num
         {
-            return db.get_icon_info(req.file_creator.clone(), req.icon_type);
+            return db.get_icon_info(req.file_creator, req.icon_type);
         }
         Err(AfpError::ItemNotFound)
     }
@@ -1532,7 +1532,7 @@ mod tests {
             req_count: 69,
             start_index: 1,
             max_reply_size: 1024,
-            path: String::new(), // Empty path
+            path: "".into(), // Empty path
         };
 
         let mut output = [0u8; 1024];

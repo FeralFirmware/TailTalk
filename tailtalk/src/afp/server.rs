@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tailtalk_packets::afp::{
     AfpError, AfpUam, AfpVersion, CreateFlag, FPByteRangeLock, FPCloseFork, FPDelete,
     FPDirectoryBitmap, FPEnumerate, FPFileBitmap, FPFlush, FPGetSrvrInfo, FPGetSrvrParms,
-    FPGetVolParms, FPRead, FPSetDirParms, FPSetForkParms, FPVolumeBitmap, ForkType,
+    FPGetVolParms, FPRead, FPSetDirParms, FPSetForkParms, FPVolumeBitmap, ForkType, MacString,
 };
 use tailtalk_packets::nbp::EntityName;
 use tracing::{error, info, warn};
@@ -80,12 +80,12 @@ impl AfpServer {
 
         // Create server status information
         let status = FPGetSrvrInfo {
-            machine_type: config.machine_type.clone(),
+            machine_type: config.machine_type.clone().into(),
             afp_versions: config.afp_versions.clone(),
             uams: config.uams.clone(),
             volume_icon: config.volume_icon,
             flags: config.flags,
-            server_name: config.server_name.clone(),
+            server_name: config.server_name.clone().into(),
         };
 
         let status_data = status
@@ -382,12 +382,10 @@ impl AspSession {
         let _volume_id = u16::from_be_bytes(command.data[2..=3].try_into().unwrap());
         let directory_id = u32::from_be_bytes(command.data[4..=7].try_into().unwrap());
         let _path_type = command.data[8];
-        let path_name_len = command.data[9];
-        let path_name =
-            String::from_utf8_lossy(&command.data[10..10 + path_name_len as usize]).to_string();
+        let path_name = MacString::try_from(&command.data[9..]).unwrap();
 
         let dir_id = our_volume
-            .create_dir(directory_id, path_name.into())
+            .create_dir(directory_id, PathBuf::from(path_name.to_string()))
             .await
             .map_err(|e| anyhow::anyhow!("CreateDir failed: {:?}", e))?;
 
@@ -411,15 +409,13 @@ impl AspSession {
         let _volume_id = u16::from_be_bytes(command.data[2..=3].try_into().unwrap());
         let directory_id = u32::from_be_bytes(command.data[4..=7].try_into().unwrap());
         let _path_type = command.data[8];
-        let path_name_len = command.data[9];
-        let path_name =
-            String::from_utf8_lossy(&command.data[10..10 + path_name_len as usize]).to_string();
+        let path_name = MacString::try_from(&command.data[9..]).unwrap();
 
         match our_volume
             .create_file(
                 create_flag,
                 directory_id,
-                PathBuf::from(path_name.trim_matches('\0')),
+                PathBuf::from(path_name.to_string()),
             )
             .await
         {
@@ -477,20 +473,14 @@ impl AspSession {
             command.data[10..=11].try_into().unwrap(),
         ));
         let _path_type = command.data[12];
-        let path_name_len = command.data[13];
+        let path_name = MacString::try_from(&command.data[13..]).unwrap_or_default();
 
-        let path_name = if path_name_len > 0 {
-            let relative_string =
-                String::from_utf8_lossy(&command.data[14..14 + path_name_len as usize]).to_string();
-            PathBuf::from(relative_string.trim_matches('\0'))
-        } else {
-            PathBuf::new()
-        };
+        let path_name_buf = PathBuf::from(path_name.to_string());
 
-        let node_id = match our_volume.resolve_node(directory_id, &path_name) {
+        let node_id = match our_volume.resolve_node(directory_id, &path_name_buf) {
             Ok(node_id) => node_id,
             Err(e) => {
-                tracing::error!("look up for {:?} failed: {:?}", path_name, e);
+                tracing::error!("look up for {:?} failed: {:?}", path_name_buf, e);
                 command.send_reply(AspCommandResponse {
                     result: (e as u32).to_be_bytes(),
                     data: Vec::new(),
@@ -537,23 +527,17 @@ impl AspSession {
         let dir_bitmap =
             FPDirectoryBitmap::from(u16::from_be_bytes(command.data[8..=9].try_into().unwrap()));
         let _path_type = command.data[10];
-        let path_name_len = command.data[11];
+        let path_name = MacString::try_from(&command.data[11..]).unwrap_or_default();
 
-        let path_name = if path_name_len > 0 {
-            let relative_string =
-                String::from_utf8_lossy(&command.data[12..12 + path_name_len as usize]).to_string();
-            PathBuf::from(relative_string.trim_matches('\0'))
-        } else {
-            PathBuf::new()
-        };
+        let path_name_buf = PathBuf::from(path_name.to_string());
 
         // Parameters start after path name
-        let mut param_offset = 12 + path_name_len as usize;
-        if !param_offset.is_multiple_of(2) {
+        let mut param_offset = 11 + path_name.byte_len();
+        if param_offset % 2 != 0 {
             param_offset += 1;
         }
 
-        let node_id = match our_volume.resolve_node(directory_id, &path_name) {
+        let node_id = match our_volume.resolve_node(directory_id, &path_name_buf) {
             Ok(node_id) => node_id,
             Err(e) => {
                 command.send_reply(AspCommandResponse {
@@ -725,15 +709,9 @@ impl AspSession {
             FPFileBitmap::from(u16::from_be_bytes(command.data[8..=9].try_into().unwrap()));
         let _access_mode = u16::from_be_bytes(command.data[10..=11].try_into().unwrap());
         let _path_type = command.data[12];
-        let path_name_len = command.data[13];
+        let path_name = MacString::try_from(&command.data[13..]).unwrap_or_default();
 
-        let path_name = if path_name_len > 0 {
-            let relative_string =
-                String::from_utf8_lossy(&command.data[14..14 + path_name_len as usize]).to_string();
-            PathBuf::from(relative_string)
-        } else {
-            PathBuf::new()
-        };
+        let path_name_buf = PathBuf::from(path_name.to_string());
 
         let mut output_buf = [0u8; 256];
 
@@ -742,7 +720,7 @@ impl AspSession {
                 ForkType::Data, // We only support data fork
                 file_bitmap,
                 directory_id,
-                &path_name,
+                &path_name_buf,
                 &mut output_buf,
             )
             .await
@@ -1015,7 +993,7 @@ impl AspSession {
 
         match our_volume.set_comment(
             add_comment.directory_id,
-            &PathBuf::from(add_comment.path),
+            &PathBuf::from(add_comment.path.as_str()),
             &add_comment.comment,
         ) {
             Ok(_) => {
@@ -1044,7 +1022,10 @@ impl AspSession {
 
         tracing::info!("Get Comment command: {:?}", get_comment);
 
-        match our_volume.get_comment(get_comment.directory_id, &PathBuf::from(get_comment.path)) {
+        match our_volume.get_comment(
+            get_comment.directory_id,
+            &PathBuf::from(get_comment.path.as_str()),
+        ) {
             Ok(comment) => {
                 let mut data = vec![];
                 // Comment is returned as a pascal string (1 byte length + data)
@@ -1080,7 +1061,7 @@ impl AspSession {
 
         match our_volume.remove_comment(
             remove_comment.directory_id,
-            &PathBuf::from(remove_comment.path),
+            &PathBuf::from(remove_comment.path.as_str()),
         ) {
             Ok(_) => {
                 command.send_reply(AspCommandResponse {
