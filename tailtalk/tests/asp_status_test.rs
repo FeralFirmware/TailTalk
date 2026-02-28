@@ -202,12 +202,12 @@ async fn test_asp_get_status() {
 
     // 3. Bind ASP on Server
     let status_info = FPGetSrvrInfo {
-        machine_type: "Macintosh".to_string(),
+        machine_type: "Macintosh".into(),
         afp_versions: vec![AfpVersion::Version2],
         uams: vec![AfpUam::NoUserAuthent],
         volume_icon: None,
         flags: 0,
-        server_name: "TestASP".to_string(),
+        server_name: "TestASP".into(),
     };
     let status_data = status_info.to_bytes().expect("failed to serialize status");
 

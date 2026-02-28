@@ -248,6 +248,17 @@ impl Volume {
             desktop_database: None,
         };
 
+        // Initialize Vol Node (Parent of Root)
+        let vol_node = Node {
+            id: 1,
+            parent_id: 1, // Doesn't matter
+            name: new_self.name.clone(),
+            is_dir: true,
+            path: PathBuf::new(),
+            data_fork: None,
+        };
+        new_self.nodes.insert(1, vol_node);
+
         // Initialize root node
         // ID 2 is the root of the volume. Parent is 1.
         let root_node = Node {
@@ -293,6 +304,16 @@ impl Volume {
                 .as_os_str()
                 .to_str()
                 .is_some_and(|s| s.chars().all(|c| c == '\0'));
+
+        if directory_id == 1 {
+            if is_empty_path {
+                return Ok(1);
+            }
+            if path_name == Path::new(&self.name) {
+                return Ok(2);
+            }
+            return Err(AfpError::ObjectNotFound);
+        }
 
         let base_path = if directory_id == 2 {
             PathBuf::new() // Root
@@ -918,12 +939,7 @@ impl Volume {
         if let Some(ref db) = self.desktop_database
             && db.dt_ref_num == dt_ref_num
         {
-            return db.add_icon(
-                req.file_creator,
-                req.file_type,
-                req.icon_type,
-                data,
-            );
+            return db.add_icon(req.file_creator, req.file_type, req.icon_type, data);
         }
         Err(AfpError::ItemNotFound)
     }
@@ -936,12 +952,7 @@ impl Volume {
         if let Some(ref db) = self.desktop_database
             && db.dt_ref_num == dt_ref_num
         {
-            return db.get_icon(
-                req.file_creator,
-                req.file_type,
-                req.icon_type,
-                req.size,
-            );
+            return db.get_icon(req.file_creator, req.file_type, req.icon_type, req.size);
         }
         Err(AfpError::ItemNotFound)
     }

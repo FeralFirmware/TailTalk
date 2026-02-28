@@ -40,7 +40,6 @@ impl TestHub {
 
 struct TestClient {
     _mac: [u8; 6],
-    #[allow(dead_code)]
     addressing: tailtalk::addressing::AddressingHandle,
     ddp: tailtalk::ddp::DdpHandle,
 }

@@ -100,7 +100,6 @@ impl NbpPacket {
             });
         }
 
-        tracing::info!("returning packet");
         Ok(NbpPacket {
             operation,
             transaction_id,
