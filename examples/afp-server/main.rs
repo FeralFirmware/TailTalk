@@ -8,7 +8,6 @@ use tailtalk::{
     echo::Echo,
     nbp::Nbp,
 };
-use tailtalk_packets::aarp::AppleTalkAddress;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -30,14 +29,7 @@ async fn main() {
 
     let (processor, handle) =
         PacketProcessor::spawn(&args.interface).expect("failed to spawn sockets");
-    let addressing = Addressing::spawn(
-        processor.get_mac(),
-        handle.clone(),
-        Some(AppleTalkAddress {
-            network_number: 1,
-            node_number: 50,
-        }),
-    );
+    let addressing = Addressing::spawn(processor.get_mac(), handle.clone(), None);
 
     let processor_addressing = addressing.clone();
 

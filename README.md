@@ -51,6 +51,13 @@ Beyond unit tests I have found the best way to test this software is with real h
 - Macintosh SE/30 running System 7.1 via AsanteTalk
 - Macintosh Classic running System 6.0.8 via AsanteTalk
 
+### AsanteTalk
+
+When the AsanteTalk is first powered on it "listens" for incoming packets on the Ethernet
+side before choosing what EtherTalk phase to operate under. If it doesn't see any EtherTalk Phase 2 packets it will default to
+Phase 1. TailTalk supports Phase 1 and this works just fine for LaserWriters, NBP and some basic operations but does
+not work with AFP (The Mac will discover the AFP TailTalk server but our responses appear to be dropped).
+
 ## Contributing
 
 I'd love to see this project grow into something that can be used to build more complete AppleTalk implementations. All contributions 
