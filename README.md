@@ -58,6 +58,15 @@ side before choosing what EtherTalk phase to operate under. If it doesn't see an
 Phase 1. TailTalk supports Phase 1 and this works just fine for LaserWriters, NBP and some basic operations but does
 not work with AFP (The Mac will discover the AFP TailTalk server but our responses appear to be dropped).
 
+## Known Issues
+
+* Large AFP file transfers (30+ MiB) from TailTalk to Mac clients appears to cause the Mac to hang. Still trying to debug
+what is going on with it. Smaller transfers however work just fine.
+* Files copied from us to a Mac have weird file layouts even after moving them around.
+* Macs with a connected AFP volume seem to stall when trying to do a reboot if the volume is still connected.
+* Multiple AFP sessions are not properly supported yet. After a Mac disconnects the server should be restarted.
+* AFP node IDs use a crude name hashing mechanism that can lead to collisions.
+
 ## Contributing
 
 I'd love to see this project grow into something that can be used to build more complete AppleTalk implementations. All contributions 
