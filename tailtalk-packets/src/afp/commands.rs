@@ -188,7 +188,7 @@ impl FPGetSrvrInfo {
             if offset + 1 + len > buf.len() {
                 return Err(AfpError::InvalidSize);
             }
-            Ok(MacString::try_from(&buf[offset..offset + 1 + len])?)
+            MacString::try_from(&buf[offset..offset + 1 + len])
         };
 
         // Helper to read a list of pascal strings (Count byte + Strings)

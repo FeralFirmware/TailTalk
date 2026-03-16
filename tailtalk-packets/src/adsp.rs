@@ -76,11 +76,18 @@ pub struct AdspPacket {
     pub next_recv_seq: u32,
     /// Receive window size (flow control)
     pub recv_window: u16,
+    /// Flags (Control, Ack, EOM, Attention)
+    pub flags: u8,
 }
 
 impl AdspPacket {
     /// ADSP header length in bytes
     pub const HEADER_LEN: usize = 13;
+
+    pub const FLAG_CONTROL: u8 = 0x80;
+    pub const FLAG_ACK: u8 = 0x40;
+    pub const FLAG_EOM: u8 = 0x20;
+    pub const FLAG_ATTENTION: u8 = 0x10;
 
     /// Parse an ADSP header from bytes
     ///
@@ -99,6 +106,7 @@ impl AdspPacket {
         let first_byte_seq = BigEndian::read_u32(&buf[3..7]);
         let next_recv_seq = BigEndian::read_u32(&buf[7..11]);
         let recv_window = BigEndian::read_u16(&buf[11..13]);
+        let flags = buf[0] & 0xF0; // Top 4 bits are flags on ControlPacket/Ack/etc but we'll store the whole byte since descriptor is just 0x8x
 
         Ok(Self {
             descriptor,
@@ -106,6 +114,7 @@ impl AdspPacket {
             first_byte_seq,
             next_recv_seq,
             recv_window,
+            flags,
         })
     }
 
@@ -121,13 +130,65 @@ impl AdspPacket {
             });
         }
 
-        buf[0] = self.descriptor as u8;
+        // The descriptor byte effectively contains both the control flags and the descriptor code
+        buf[0] = (self.descriptor as u8) | self.flags;
         BigEndian::write_u16(&mut buf[1..3], self.connection_id);
         BigEndian::write_u32(&mut buf[3..7], self.first_byte_seq);
         BigEndian::write_u32(&mut buf[7..11], self.next_recv_seq);
         BigEndian::write_u16(&mut buf[11..13], self.recv_window);
 
         Ok(Self::HEADER_LEN)
+    }
+}
+
+/// An ADSP Attention data packet (out-of-band message)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdspAttentionPacket<'a> {
+    pub header: AdspPacket,
+    pub attention_code: u16,
+    pub data: &'a [u8],
+}
+
+impl<'a> AdspAttentionPacket<'a> {
+    /// Parse an Attention packet from a raw ADSP payload
+    pub fn parse(buf: &'a [u8]) -> Result<Self, AdspError> {
+        let header = AdspPacket::parse(buf)?;
+
+        if header.flags & AdspPacket::FLAG_ATTENTION == 0 {
+            return Err(AdspError::UnknownDescriptor { code: buf[0] }); // Not an attention packet
+        }
+
+        let payload = &buf[AdspPacket::HEADER_LEN..];
+        if payload.len() < 2 {
+            return Err(AdspError::InvalidSize {
+                expected: AdspPacket::HEADER_LEN + 2,
+                found: buf.len(),
+            });
+        }
+
+        let attention_code = BigEndian::read_u16(&payload[0..2]);
+        let data = &payload[2..];
+
+        Ok(Self {
+            header,
+            attention_code,
+            data,
+        })
+    }
+
+    /// Write the Attention code into the buffer following the ADSP header
+    pub fn write_payload_to(&self, buf: &mut [u8]) -> Result<usize, AdspError> {
+        if buf.len() < 2 + self.data.len() {
+            return Err(AdspError::InvalidSize {
+                expected: 2 + self.data.len(),
+                found: buf.len(),
+            });
+        }
+
+        BigEndian::write_u16(&mut buf[0..2], self.attention_code);
+        buf[2..2 + self.data.len()].copy_from_slice(self.data);
+
+        Ok(2 + self.data.len())
     }
 }
 
@@ -192,6 +253,7 @@ mod tests {
             first_byte_seq: 0,
             next_recv_seq: 0,
             recv_window: 8192,
+            flags: 0,
         };
 
         let expected: &[u8] = &[
@@ -213,6 +275,7 @@ mod tests {
             first_byte_seq: 1234567,
             next_recv_seq: 7654321,
             recv_window: 0,
+            flags: 0,
         };
 
         let mut buf = [0u8; 13];
@@ -234,6 +297,7 @@ mod tests {
             first_byte_seq: 0xDEADBEEF,
             next_recv_seq: 0xCAFEBABE,
             recv_window: 0xFFFF,
+            flags: 0x80, // Descriptor is 0x86, so when parsed the top nibble (0x80) is saved as flags
         };
 
         let mut buf = [0u8; 13];
@@ -282,6 +346,7 @@ mod tests {
             first_byte_seq: 0,
             next_recv_seq: 0,
             recv_window: 1024,
+            flags: 0,
         };
 
         let mut buf = [0u8; 5]; // Too small

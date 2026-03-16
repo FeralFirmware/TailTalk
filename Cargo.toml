@@ -5,6 +5,8 @@ members = [
   "examples/nbp-lookup",
   "examples/aep-echo",
   "examples/pap-print",
-  "examples/afp-server"
+  "examples/afp-server",
+  "examples/adsp-stylewriter",
+  "tashtalk",
 ]
 resolver = "3"

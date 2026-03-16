@@ -3,15 +3,22 @@ use im::hashmap::HashMap;
 use rand::Rng;
 use std::sync::Arc;
 use std::{io::Error, time::Duration};
-use tailtalk_packets::{aarp::*, ethertalk::EtherTalkType};
+use tailtalk_packets::{aarp::*};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-use crate::{EtherTalkPacket, OutboundHandle};
+use crate::{DataLinkPacket, DataLinkProtocol, OutboundHandle};
+
+#[derive(Debug, Copy, Clone)]
+pub enum Node {
+    EtherTalkPhase1(EthernetMac),
+    EtherTalkPhase2(EthernetMac),
+    LocalTalk(u8), // Node number
+}
 
 struct AarpRequest {
     addr: AppleTalkAddress,
-    chan: oneshot::Sender<Result<EthernetMac, Error>>,
+    chan: oneshot::Sender<Result<Node, Error>>,
 }
 
 struct SelfAddress {
@@ -27,7 +34,7 @@ pub struct Addressing {
     packet_recv: mpsc::Receiver<(AarpPacket, AddressSource)>,
     request_recv: mpsc::Receiver<AarpCommand>,
     pending: HashMap<AppleTalkAddress, Vec<Arc<AarpRequest>>>,
-    cache: Arc<DashMap<AppleTalkAddress, (EthernetMac, AddressSource)>>,
+    cache: Arc<DashMap<AppleTalkAddress, Node>>,
     outbound: OutboundHandle,
     our_mac: EthernetMac,
     cancel: CancellationToken,
@@ -79,7 +86,7 @@ impl Addressing {
         our_addr: AppleTalkAddress,
         opcode: AarpOpcode,
         source_type: AddressSource,
-    ) -> EtherTalkPacket {
+    ) -> DataLinkPacket {
         let aarp_header = AarpPacket {
             hardware_type: 1,      // Ethernet
             protocol_type: 0x809b, // Appletalk LLAP Bridging
@@ -94,11 +101,17 @@ impl Addressing {
         let mut payload = [0u8; AarpPacket::LEN];
         aarp_header.to_bytes(&mut payload);
 
-        EtherTalkPacket {
-            dst_mac: target_mac, // Use requester's MAC for responses
-            protocol: EtherTalkType::Aarp,
+        let dest_node = match source_type {
+            AddressSource::EtherTalkPhase2 => Node::EtherTalkPhase2(target_mac),
+            AddressSource::EtherTalkPhase1 => Node::EtherTalkPhase1(target_mac),
+            AddressSource::LocalTalk => unimplemented!("AARP not used on LocalTalk"),
+        };
+
+        DataLinkPacket {
+            dest_node,
+            protocol: DataLinkProtocol::Aarp,
             payload: payload.into(),
-            source_type,
+            src_node_id: 0, // AARP is never sent to LocalTalk destinations
         }
     }
 
@@ -129,7 +142,7 @@ impl Addressing {
                     Self::BROADCAST_MAC,
                     addr,
                     AarpOpcode::Probe,
-                    AddressSource::EtherTalk,
+                    AddressSource::EtherTalkPhase2,
                 );
                 self.outbound
                     .send(probe)
@@ -171,10 +184,23 @@ impl Addressing {
                                 if let Some(reqs) = self.pending.remove(&pkt.sender_protocol) {
                                     for req in reqs {
                                         let inner_req = Arc::<AarpRequest>::into_inner(req).unwrap();
-                                        if let Err(e) = inner_req.chan.send(Ok(pkt.sender_addr)) {
+
+                                        let node = match source {
+                                            AddressSource::EtherTalkPhase2 => {
+                                                Node::EtherTalkPhase2(pkt.sender_addr)
+                                            },
+                                            AddressSource::EtherTalkPhase1 => {
+                                                Node::EtherTalkPhase1(pkt.sender_addr)
+                                            }
+                                            AddressSource::LocalTalk => {
+                                                continue;
+                                            },
+                                        };
+
+                                        if let Err(e) = inner_req.chan.send(Ok(node)) {
                                             tracing::error!("error responding to AarpRequest: {e:?}");
                                         }
-                                        self.cache.insert(pkt.sender_protocol, (pkt.sender_addr, AddressSource::EtherTalk));
+                                        self.cache.insert(pkt.sender_protocol, node);
                                     }
                                 }
                             },
@@ -191,7 +217,7 @@ impl Addressing {
                     if let Some(command) = req {
                         match command {
                             AarpCommand::Lookup(lookup) => {
-                                let packet = self.create_packet(lookup.addr, Self::BROADCAST_MAC, our_addr, AarpOpcode::Request, AddressSource::EtherTalk);
+                                let packet = self.create_packet(lookup.addr, Self::BROADCAST_MAC, our_addr, AarpOpcode::Request, AddressSource::EtherTalkPhase2);
                                 self.outbound.send(packet).await.expect("failed to dispatch request");
                                 self.pending.entry(lookup.addr).or_default().push(Arc::new(lookup));
                             },
@@ -233,26 +259,20 @@ impl Addressing {
 pub struct AddressingHandle {
     request_send: mpsc::Sender<AarpCommand>,
     packet_send: mpsc::Sender<(AarpPacket, AddressSource)>,
-    pub(crate) cache: Arc<DashMap<AppleTalkAddress, (EthernetMac, AddressSource)>>,
+    pub(crate) cache: Arc<DashMap<AppleTalkAddress, Node>>,
     _cancel: Arc<DropGuard>,
 }
 
 impl AddressingHandle {
-    pub fn try_lookup(&self, addr: &AppleTalkAddress) -> Option<(EthernetMac, AddressSource)> {
+    pub fn try_lookup(&self, addr: &AppleTalkAddress) -> Option<Node> {
         if addr.node_number == 255 {
-            // Broadcast - default to EtherTalk
-            return Some((
-                [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-                AddressSource::EtherTalk,
-            ));
+            // Broadcast - default to EtherTalkPhase2
+            return Some(Node::EtherTalkPhase2(Addressing::BROADCAST_MAC));
         }
         self.cache.get(addr).map(|v| *v)
     }
 
-    pub async fn lookup(
-        &self,
-        addr: AppleTalkAddress,
-    ) -> Result<(EthernetMac, AddressSource), Error> {
+    pub async fn lookup(&self, addr: AppleTalkAddress) -> Result<Node, Error> {
         if let Some(mac) = self.try_lookup(&addr) {
             return Ok(mac);
         }
@@ -266,21 +286,7 @@ impl AddressingHandle {
         }
 
         match rx.await {
-            Ok(res) => {
-                // The channel returns just the MAC, but we need the tuple
-                // Re-check the cache which should now have the full (MAC, AddressSource) tuple
-                match res {
-                    Ok(_mac) => {
-                        if let Some(cached) = self.try_lookup(&addr) {
-                            Ok(cached)
-                        } else {
-                            // Fallback shouldn't happen, but return EtherTalk default
-                            Ok((_mac, AddressSource::EtherTalk))
-                        }
-                    }
-                    Err(e) => Err(e),
-                }
-            }
+            Ok(res) => res,
             Err(e) => Err(Error::other(e)),
         }
     }
@@ -302,9 +308,12 @@ impl AddressingHandle {
     pub fn received_pkt(&self, pkt: &[u8], source: AddressSource) -> Result<(), Error> {
         let headers = AarpPacket::parse(pkt).unwrap();
 
-        // Cache the sender's address with the provided source type
-        self.cache
-            .insert(headers.sender_protocol, (headers.sender_addr, source));
+        let node = match source {
+            AddressSource::EtherTalkPhase2 => Node::EtherTalkPhase2(headers.sender_addr),
+            AddressSource::EtherTalkPhase1 => Node::EtherTalkPhase1(headers.sender_addr),
+            AddressSource::LocalTalk => return Ok(()), // Intentionally blank as AARP is not used in LocalTalk,
+        };
+        self.cache.insert(headers.sender_protocol, node);
 
         self.packet_send
             .try_send((headers, source))

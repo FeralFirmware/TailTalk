@@ -1,18 +1,19 @@
+use tailtalk::DataLinkProtocol;
 use std::sync::Arc;
 use std::time::Duration;
 use tailtalk::{
-    EtherTalkPacket, OutboundHandle,
+    DataLinkPacket, OutboundHandle,
     addressing::Addressing,
     adsp::{Adsp, AdspAddress},
     ddp::DdpProcessor,
 };
-use tailtalk_packets::{aarp::AddressSource, ethertalk::EtherTalkType};
+use tailtalk_packets::{aarp::AddressSource, ethertalk::EtherTalkPhase2Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc};
 
 #[derive(Clone, Debug)]
 struct WirePacket {
-    packet: Arc<EtherTalkPacket>,
+    packet: Arc<DataLinkPacket>,
     src_mac: [u8; 6],
 }
 
@@ -81,20 +82,20 @@ impl TestClient {
                         continue;
                     }
 
-                    let is_for_us = pkt.dst_mac == mac;
-                    let is_broadcast_std = pkt.dst_mac == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
-                    let is_zeros = pkt.dst_mac == [0, 0, 0, 0, 0, 0];
+                    let is_for_us = if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac } else { [0; 6] } == mac;
+                    let is_broadcast_std = if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff] } else { false };
+                    let is_zeros = if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac } else { [0; 6] } == [0, 0, 0, 0, 0, 0];
 
                     if is_for_us || is_broadcast_std || is_zeros {
                         match pkt.protocol {
-                            EtherTalkType::Ddp => ddp_handle.received_pkt(
+                            DataLinkProtocol::Ddp => ddp_handle.received_pkt(
                                 &pkt.payload,
-                                AddressSource::EtherTalk,
+                                AddressSource::EtherTalkPhase2,
                                 src_mac,
                             ),
-                            EtherTalkType::Aarp => {
+                            DataLinkProtocol::Aarp => {
                                 let _ = addressing_handle
-                                    .received_pkt(&pkt.payload, AddressSource::EtherTalk);
+                                    .received_pkt(&pkt.payload, AddressSource::EtherTalkPhase2);
                             }
                         }
                     }

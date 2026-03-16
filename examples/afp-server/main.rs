@@ -19,11 +19,17 @@ struct Args {
     /// Path to serve via AFP
     #[arg(short, long)]
     path: PathBuf,
+
+    /// Optional TashTalk serial port path
+    #[arg(short, long)]
+    tashtalk: Option<String>,
 }
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt().init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
 
     let args = Args::parse();
 
@@ -41,11 +47,17 @@ async fn main() {
     let mut afp_config = AfpServerConfig::default();
     afp_config.volume_path = args.path.clone();
 
+    let processor = if let Some(tty) = args.tashtalk {
+        processor.with_tashtalk(&tty, addressing.clone(), ddp.clone())
+    } else {
+        processor
+    };
+
     let _afp_server = AfpServer::spawn(&ddp, &nbp, Some(254), afp_config)
         .await
         .expect("failed to spawn AFP server");
 
-    tokio::task::spawn_blocking(|| processor.run(processor_addressing, ddp));
+    tokio::spawn(processor.run(processor_addressing, ddp));
 
     tracing::info!("AFP server serving {:?} on {}", args.path, args.interface);
     tracing::info!("Press Ctrl+C to exit");

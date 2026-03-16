@@ -4,17 +4,17 @@ use thiserror::Error;
 // EtherTalk frames can be one of two types - Aarp, which has an OUI of 0 and a protocol ID of
 // 0x80F3, or DDP with an OUI of 08:00:07 and protocol ID of 0x809B.
 #[derive(Debug, PartialEq, Eq)]
-pub enum EtherTalkType {
+pub enum EtherTalkPhase2Type {
     Aarp,
     Ddp,
 }
 
 #[derive(Debug)]
-pub struct EtherTalkFrame {
+pub struct EtherTalkPhase2Frame {
     pub dst_mac: [u8; 6],
     pub src_mac: [u8; 6],
     pub len: u16,
-    pub protocol: EtherTalkType,
+    pub protocol: EtherTalkPhase2Type,
 }
 
 #[derive(Error, Debug)]
@@ -27,7 +27,7 @@ pub enum EtherTalkError {
     UnknownHeader,
 }
 
-impl EtherTalkFrame {
+impl EtherTalkPhase2Frame {
     pub const LLC_LEN: usize = 8;
     const FRAME_LEN: usize = 22;
     const SNAP_MARKER: [u8; 3] = [0xAA, 0xAA, 0x03];
@@ -54,12 +54,12 @@ impl EtherTalkFrame {
             .copy_from_slice(&Self::SNAP_MARKER);
 
         match self.protocol {
-            EtherTalkType::Aarp => {
+            EtherTalkPhase2Type::Aarp => {
                 buf[Self::OUI_OFF..(Self::OUI_OFF + Self::AARP_OUI.len())]
                     .copy_from_slice(&Self::AARP_OUI);
                 Ok(Self::FRAME_LEN)
             }
-            EtherTalkType::Ddp => {
+            EtherTalkPhase2Type::Ddp => {
                 buf[Self::OUI_OFF..(Self::OUI_OFF + Self::DDP_OUI.len())]
                     .copy_from_slice(&Self::DDP_OUI);
                 Ok(Self::FRAME_LEN)
@@ -90,14 +90,14 @@ impl EtherTalkFrame {
                 dst_mac: *dst_mac.as_array().unwrap(),
                 src_mac: *src_mac.as_array().unwrap(),
                 len: 10,
-                protocol: EtherTalkType::Aarp,
+                protocol: EtherTalkPhase2Type::Aarp,
             });
         } else if buf[Self::OUI_OFF..(Self::OUI_OFF + Self::DDP_OUI.len())] == Self::DDP_OUI {
             return Ok(Self {
                 dst_mac: *dst_mac.as_array().unwrap(),
                 src_mac: *src_mac.as_array().unwrap(),
                 len: 10,
-                protocol: EtherTalkType::Ddp,
+                protocol: EtherTalkPhase2Type::Ddp,
             });
         }
 
@@ -121,7 +121,7 @@ mod tests {
         let dst_mac: [u8; 6] = [0x00, 0x0c, 0x29, 0x0d, 0x56, 0xe3];
         let src_mac: [u8; 6] = [0x00, 0x0c, 0x29, 0x0d, 0x56, 0xe4];
 
-        let packet = EtherTalkFrame::parse(test_data).expect("failed to parse");
+        let packet = EtherTalkPhase2Frame::parse(test_data).expect("failed to parse");
 
         assert_eq_hex!(
             packet.dst_mac,
@@ -131,7 +131,7 @@ mod tests {
         assert_eq_hex!(packet.src_mac, src_mac, "Source MAC did not match expected");
 
         match packet.protocol {
-            EtherTalkType::Aarp => {}
+            EtherTalkPhase2Type::Aarp => {}
             _ => panic!("parsed as wrong type"),
         };
     }
@@ -144,9 +144,9 @@ mod tests {
             0xff, 0x1e, 0xff, 0xf8, 0x06, 0x06, 0x06, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
 
-        let packet = EtherTalkFrame::parse(test_data).expect("failed to parse");
+        let packet = EtherTalkPhase2Frame::parse(test_data).expect("failed to parse");
 
-        if EtherTalkType::Ddp != packet.protocol {
+        if EtherTalkPhase2Type::Ddp != packet.protocol {
             panic!("parsed as wrong type");
         }
     }

@@ -159,6 +159,22 @@ impl DdpPacket {
 
         Ok(13)
     }
+
+    pub fn to_bytes_short(&self, buf: &mut [u8]) -> Result<usize, DdpError> {
+        if buf.len() < 5 {
+            return Err(DdpError::InvalidSize {
+                expected: 5,
+                found: buf.len(),
+            });
+        }
+
+        BigEndian::write_u16(buf, self.len as u16 & 0x3FF);
+        buf[2] = self.dest_sock_num;
+        buf[3] = self.src_sock_num;
+        buf[4] = self.protocol_typ as u8;
+
+        Ok(5)
+    }
 }
 
 #[cfg(test)]

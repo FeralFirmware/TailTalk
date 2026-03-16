@@ -3,7 +3,7 @@ use crate::{
     aep::{AepError, AepPacket},
     atp::{AtpError, AtpPacket},
     ddp::{DdpError, DdpPacket, DdpProtocolType},
-    ethertalk::{EtherTalkError, EtherTalkFrame, EtherTalkType},
+    ethertalk::{EtherTalkError, EtherTalkPhase2Frame, EtherTalkPhase2Type},
 };
 use thiserror::Error;
 
@@ -21,7 +21,7 @@ pub enum TransportHeader {
 
 #[derive(Debug)]
 pub struct AppleTalkHeaders {
-    pub link: EtherTalkFrame,
+    pub link: EtherTalkPhase2Frame,
     pub net: NetHeader,
     pub transport: Option<TransportHeader>,
     pub payload: Option<Box<[u8]>>,
@@ -56,7 +56,7 @@ impl AppleTalkHeaders {
             Some(TransportHeader::Atp(_)) => AtpPacket::HEADER_LEN,
             None => 0,
         };
-        let total_len = EtherTalkFrame::LLC_LEN
+        let total_len = EtherTalkPhase2Frame::LLC_LEN
             + net_size
             + transport_size
             + self.payload.as_ref().map_or(0, |p| p.len());
@@ -103,16 +103,16 @@ impl AppleTalkHeaders {
     }
 
     pub fn decode(pkt: &[u8]) -> Result<AppleTalkHeaders, AppleTalkError> {
-        let link = EtherTalkFrame::parse(pkt).map_err(AppleTalkError::LinkHeaderError)?;
+        let link = EtherTalkPhase2Frame::parse(pkt).map_err(AppleTalkError::LinkHeaderError)?;
 
         let net = match link.protocol {
-            EtherTalkType::Ddp => {
-                let ddp_pkt = DdpPacket::parse(&pkt[EtherTalkFrame::len()..])
+            EtherTalkPhase2Type::Ddp => {
+                let ddp_pkt = DdpPacket::parse(&pkt[EtherTalkPhase2Frame::len()..])
                     .map_err(AppleTalkError::DdpError)?;
                 NetHeader::Ddp(ddp_pkt)
             }
-            EtherTalkType::Aarp => {
-                let aarp_pkt = AarpPacket::parse(&pkt[EtherTalkFrame::len()..])
+            EtherTalkPhase2Type::Aarp => {
+                let aarp_pkt = AarpPacket::parse(&pkt[EtherTalkPhase2Frame::len()..])
                     .map_err(AppleTalkError::AarpError)?;
                 NetHeader::Aarp(aarp_pkt)
             }
@@ -122,13 +122,13 @@ impl AppleTalkHeaders {
             NetHeader::Ddp(ref ddp) => match ddp.protocol_typ {
                 DdpProtocolType::Aep => (
                     Some(TransportHeader::Aep(
-                        AepPacket::parse(&pkt[EtherTalkFrame::len() + DdpPacket::LEN..])
+                        AepPacket::parse(&pkt[EtherTalkPhase2Frame::len() + DdpPacket::LEN..])
                             .map_err(AppleTalkError::AepError)?,
                     )),
                     None,
                 ),
                 DdpProtocolType::Atp => {
-                    let offset = EtherTalkFrame::len() + DdpPacket::LEN;
+                    let offset = EtherTalkPhase2Frame::len() + DdpPacket::LEN;
                     let atp_pkt = AtpPacket::parse(&pkt[offset..])
                         .map_err(AppleTalkError::AtpError)?;
                     let payload_offset = offset + AtpPacket::HEADER_LEN;

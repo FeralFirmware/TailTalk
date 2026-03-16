@@ -45,14 +45,16 @@ impl AppleTalkAddress {
     pub fn matches(&self, other: &AppleTalkAddress, source: AddressSource) -> bool {
         match source {
             AddressSource::LocalTalk => self.node_number == other.node_number,
-            AddressSource::EtherTalk => self == other,
+            AddressSource::EtherTalkPhase1 => self.node_number == other.node_number,
+            AddressSource::EtherTalkPhase2 => self == other,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressSource {
-    EtherTalk,
+    EtherTalkPhase2,
+    EtherTalkPhase1,
     LocalTalk,
 }
 

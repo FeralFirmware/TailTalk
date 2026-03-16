@@ -6,14 +6,16 @@ use std::{
 use tailtalk_packets::{
     aarp::{AddressSource as AppleTalkAddressSource, AppleTalkAddress},
     ddp::{DdpPacket as DdpHeaders, DdpProtocolType},
-    ethertalk::EtherTalkType,
 };
 use tokio::sync::{
     mpsc::{self, error::TrySendError},
     oneshot,
 };
 
-use crate::{EtherTalkPacket, OutboundHandle, addressing::AddressingHandle};
+use crate::{
+    DataLinkPacket, DataLinkProtocol, OutboundHandle,
+    addressing::{AddressingHandle, Node},
+};
 
 pub struct Packet {
     pub headers: DdpHeaders,
@@ -194,15 +196,19 @@ impl DdpProcessor {
                 packet.source_mac[4],
                 packet.source_mac[5],
                 match packet.source {
-                    AppleTalkAddressSource::EtherTalk => "EtherTalk",
+                    AppleTalkAddressSource::EtherTalkPhase2 => "EtherTalkPhase2",
+                    AppleTalkAddressSource::EtherTalkPhase1 => "EtherTalkPhase1",
                     AppleTalkAddressSource::LocalTalk => "LocalTalk",
                 }
             );
             // Cache it using the addressing handle's internal cache
             // We need to use the internal cache directly since try_lookup uses it
-            self.addressing
-                .cache
-                .insert(source_addr, (packet.source_mac, packet.source));
+            let node = match packet.source {
+                AppleTalkAddressSource::EtherTalkPhase2 => Node::EtherTalkPhase2(packet.source_mac),
+                AppleTalkAddressSource::EtherTalkPhase1 => Node::EtherTalkPhase1(packet.source_mac),
+                AppleTalkAddressSource::LocalTalk => Node::LocalTalk(packet.headers.src_node_id),
+            };
+            self.addressing.cache.insert(source_addr, node);
         }
 
         // Accept packets addressed to us or broadcast (node 255)
@@ -245,14 +251,18 @@ impl DdpProcessor {
             .addr()
             .await
             .expect("failed to get our addr");
-        let (dst_mac, source_type) = self
+        let dest_node = self
             .addressing
             .lookup(packet.dest.addr)
             .await
             .expect("unknown addr");
+        let is_short = packet.dest.addr.network_number == 0
+            || packet.dest.addr.network_number == our_addr.network_number;
+
+        let header_len = if is_short { 5 } else { DdpHeaders::LEN };
         let headers = DdpHeaders {
             hop_count: 0,
-            len: DdpHeaders::calc_len(&packet.payload) + 1,
+            len: packet.payload.len() + header_len,
             chksum: 0,
             dest_network_num: packet.dest.addr.network_number,
             dest_sock_num: packet.dest.sock,
@@ -263,23 +273,32 @@ impl DdpProcessor {
             protocol_typ: packet.protocol,
         };
 
-        let payload_len = DdpHeaders::LEN + packet.payload.len();
+        let payload_len = header_len + packet.payload.len();
         let mut payload = vec![0u8; payload_len].into_boxed_slice();
-        let header_size = headers
-            .to_bytes(&mut payload)
-            .expect("failed to encode headers");
+
+        let header_size = if is_short {
+            headers
+                .to_bytes_short(&mut payload)
+                .expect("failed to encode short headers")
+        } else {
+            let size = headers
+                .to_bytes(&mut payload)
+                .expect("failed to encode headers");
+            payload[2] = 0;
+            payload[3] = 0;
+            size
+        };
 
         payload[header_size..].copy_from_slice(&packet.payload);
 
-        payload[2] = 0;
-        payload[3] = 0;
+        tracing::info!("DDP: Sending packet with headers {:?}", headers);
 
         self.ethertalk
-            .send(EtherTalkPacket {
-                dst_mac,
-                protocol: EtherTalkType::Ddp,
+            .send(DataLinkPacket {
+                dest_node,
+                protocol: DataLinkProtocol::Ddp,
                 payload,
-                source_type,
+                src_node_id: our_addr.node_number,
             })
             .await
             .expect("failed to send");

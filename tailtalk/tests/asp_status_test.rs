@@ -1,19 +1,20 @@
+use tailtalk::DataLinkProtocol;
 use std::sync::Arc;
 use std::time::Duration;
 use tailtalk::{
-    EtherTalkPacket, OutboundHandle, addressing::Addressing, asp::Asp, atp::Atp, ddp::DdpProcessor,
+    DataLinkPacket, OutboundHandle, addressing::Addressing, asp::Asp, atp::Atp, ddp::DdpProcessor,
     echo::Echo, nbp::Nbp,
 };
 use tailtalk_packets::{
     aarp::AddressSource,
     afp::{AfpUam, AfpVersion, FPGetSrvrInfo},
-    ethertalk::EtherTalkType,
+    ethertalk::EtherTalkPhase2Type,
 };
 use tokio::sync::{broadcast, mpsc};
 
 #[derive(Clone, Debug)]
 struct WirePacket {
-    packet: Arc<EtherTalkPacket>,
+    packet: Arc<DataLinkPacket>,
     src_mac: [u8; 6],
 }
 
@@ -102,20 +103,20 @@ impl TestClient {
                     }
 
                     // Accept packets for us, broadcast, or [0; 6]
-                    let is_for_us = pkt.dst_mac == mac;
-                    let is_broadcast_std = pkt.dst_mac == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
-                    let is_zeros = pkt.dst_mac == [0, 0, 0, 0, 0, 0];
+                    let is_for_us = if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac } else { [0; 6] } == mac;
+                    let is_broadcast_std = if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff] } else { false };
+                    let is_zeros = if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac } else { [0; 6] } == [0, 0, 0, 0, 0, 0];
 
                     if is_for_us || is_broadcast_std || is_zeros {
                         match pkt.protocol {
-                            EtherTalkType::Ddp => ddp_handle.received_pkt(
+                            DataLinkProtocol::Ddp => ddp_handle.received_pkt(
                                 &pkt.payload,
-                                AddressSource::EtherTalk,
+                                AddressSource::EtherTalkPhase2,
                                 src_mac,
                             ),
-                            EtherTalkType::Aarp => {
+                            DataLinkProtocol::Aarp => {
                                 let _ = addressing_handle
-                                    .received_pkt(&pkt.payload, AddressSource::EtherTalk);
+                                    .received_pkt(&pkt.payload, AddressSource::EtherTalkPhase2);
                             }
                         }
                     }
@@ -185,14 +186,14 @@ async fn test_asp_get_status() {
                     continue;
                 }
                 let pkt = &wire_pkt.packet;
-                if pkt.dst_mac == mac_server || pkt.dst_mac == [0xff; 6] || pkt.dst_mac == [0; 6] {
+                if if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac } else { [0; 6] } == mac_server || if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac } else { [0; 6] } == [0xff; 6] || if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac } else { [0; 6] } == [0; 6] {
                     match pkt.protocol {
-                        EtherTalkType::Ddp => {
-                            ddp_handle_s.received_pkt(&pkt.payload, AddressSource::EtherTalk, src)
+                        DataLinkProtocol::Ddp => {
+                            ddp_handle_s.received_pkt(&pkt.payload, AddressSource::EtherTalkPhase2, src)
                         }
-                        EtherTalkType::Aarp => {
+                        DataLinkProtocol::Aarp => {
                             let _ =
-                                addr_handle_s.received_pkt(&pkt.payload, AddressSource::EtherTalk);
+                                addr_handle_s.received_pkt(&pkt.payload, AddressSource::EtherTalkPhase2);
                         }
                     }
                 }
