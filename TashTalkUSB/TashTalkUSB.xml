@@ -1,0 +1,1140 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<export version="E">
+  <design>
+    <source>/home/ravenminion/TashTalkUSB/TashTalkUSB.kicad_sch</source>
+    <date>2026-04-05T14:36:01-0700</date>
+    <tool>Eeschema 9.0.8+dfsg-1</tool>
+    <sheet number="1" name="/" tstamps="/">
+      <title_block>
+        <title/>
+        <company/>
+        <rev/>
+        <date/>
+        <source>TashTalkUSB.kicad_sch</source>
+        <comment number="1" value=""/>
+        <comment number="2" value=""/>
+        <comment number="3" value=""/>
+        <comment number="4" value=""/>
+        <comment number="5" value=""/>
+        <comment number="6" value=""/>
+        <comment number="7" value=""/>
+        <comment number="8" value=""/>
+        <comment number="9" value=""/>
+      </title_block>
+    </sheet>
+  </design>
+  <components>
+    <comp ref="C1">
+      <value>0.1uF</value>
+      <footprint>Capacitor_SMD:C_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Unpolarized capacitor, small symbol</description>
+      <fields>
+        <field name="LCSC">C1591</field>
+        <field name="Footprint">Capacitor_SMD:C_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Unpolarized capacitor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="C_Small" description="Unpolarized capacitor, small symbol"/>
+      <property name="LCSC" value="C1591"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="capacitor cap"/>
+      <property name="ki_fp_filters" value="C_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>fef60754-4ce3-4b87-8927-161ab625967c</tstamps>
+    </comp>
+    <comp ref="C2">
+      <value>4.7uF</value>
+      <footprint>Capacitor_SMD:C_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Unpolarized capacitor, small symbol</description>
+      <fields>
+        <field name="LCSC">C19666</field>
+        <field name="Footprint">Capacitor_SMD:C_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Unpolarized capacitor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="C_Small" description="Unpolarized capacitor, small symbol"/>
+      <property name="LCSC" value="C19666"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="capacitor cap"/>
+      <property name="ki_fp_filters" value="C_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>38acde7a-f4ff-49cf-9786-97435e5a1e82</tstamps>
+    </comp>
+    <comp ref="C3">
+      <value>0.1uF</value>
+      <footprint>Capacitor_SMD:C_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Unpolarized capacitor, small symbol</description>
+      <fields>
+        <field name="LCSC">C1591</field>
+        <field name="Footprint">Capacitor_SMD:C_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Unpolarized capacitor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="C_Small" description="Unpolarized capacitor, small symbol"/>
+      <property name="LCSC" value="C1591"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="capacitor cap"/>
+      <property name="ki_fp_filters" value="C_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>34fc7a10-199b-4053-a708-a742f5b15907</tstamps>
+    </comp>
+    <comp ref="C4">
+      <value>4.7uF</value>
+      <footprint>Capacitor_SMD:C_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Unpolarized capacitor, small symbol</description>
+      <fields>
+        <field name="LCSC">C19666</field>
+        <field name="Footprint">Capacitor_SMD:C_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Unpolarized capacitor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="C_Small" description="Unpolarized capacitor, small symbol"/>
+      <property name="LCSC" value="C19666"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="capacitor cap"/>
+      <property name="ki_fp_filters" value="C_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>a12ab5b5-5bf5-4847-89ac-c7dba909b261</tstamps>
+    </comp>
+    <comp ref="C6">
+      <value>0.1uF</value>
+      <footprint>Capacitor_SMD:C_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Unpolarized capacitor, small symbol</description>
+      <fields>
+        <field name="LCSC">C1591</field>
+        <field name="Footprint">Capacitor_SMD:C_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Unpolarized capacitor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="C_Small" description="Unpolarized capacitor, small symbol"/>
+      <property name="LCSC" value="C1591"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="capacitor cap"/>
+      <property name="ki_fp_filters" value="C_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>6d623263-a6c2-4f61-b072-d927dc115079</tstamps>
+    </comp>
+    <comp ref="C7">
+      <value>4.7uF</value>
+      <footprint>Capacitor_SMD:C_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Unpolarized capacitor, small symbol</description>
+      <fields>
+        <field name="LCSC">C19666</field>
+        <field name="Footprint">Capacitor_SMD:C_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Unpolarized capacitor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="C_Small" description="Unpolarized capacitor, small symbol"/>
+      <property name="LCSC" value="C19666"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="capacitor cap"/>
+      <property name="ki_fp_filters" value="C_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>35386298-c195-4f3a-b465-fe632f2a968d</tstamps>
+    </comp>
+    <comp ref="C8">
+      <value>0.1uF</value>
+      <footprint>Capacitor_SMD:C_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Unpolarized capacitor, small symbol</description>
+      <fields>
+        <field name="LCSC">C1591</field>
+        <field name="Footprint">Capacitor_SMD:C_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Unpolarized capacitor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="C_Small" description="Unpolarized capacitor, small symbol"/>
+      <property name="LCSC" value="C1591"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="capacitor cap"/>
+      <property name="ki_fp_filters" value="C_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>101f346a-54d5-446d-bd18-fbe1f9cafb04</tstamps>
+    </comp>
+    <comp ref="D1">
+      <value>SP0503BAHT</value>
+      <footprint>Package_TO_SOT_SMD:SOT-143</footprint>
+      <datasheet>http://www.littelfuse.com/~/media/files/littelfuse/technical%20resources/documents/data%20sheets/sp05xxba.pdf</datasheet>
+      <description>TVS Diode Array, 5.5V Standoff, 3 Channels, SOT-143 package</description>
+      <fields>
+        <field name="LCSC">C41364459</field>
+        <field name="Footprint">Package_TO_SOT_SMD:SOT-143</field>
+        <field name="Datasheet">http://www.littelfuse.com/~/media/files/littelfuse/technical%20resources/documents/data%20sheets/sp05xxba.pdf</field>
+        <field name="Description">TVS Diode Array, 5.5V Standoff, 3 Channels, SOT-143 package</field>
+      </fields>
+      <libsource lib="Power_Protection" part="SP0503BAHT" description="TVS Diode Array, 5.5V Standoff, 3 Channels, SOT-143 package"/>
+      <property name="LCSC" value="C41364459"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="usb esd protection suppression transient"/>
+      <property name="ki_fp_filters" value="SOT?143*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>9402d7df-f393-4c09-bdd6-ccefaf116749</tstamps>
+    </comp>
+    <comp ref="D2">
+      <value>Blue</value>
+      <footprint>LED_SMD:LED_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Light emitting diode</description>
+      <fields>
+        <field name="Sim.Pins">1=K 2=A</field>
+        <field name="LCSC">C51933294</field>
+        <field name="Footprint">LED_SMD:LED_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Light emitting diode</field>
+      </fields>
+      <libsource lib="Device" part="LED" description="Light emitting diode"/>
+      <property name="Sim.Pins" value="1=K 2=A"/>
+      <property name="LCSC" value="C51933294"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="LED diode"/>
+      <property name="ki_fp_filters" value="LED* LED_SMD:* LED_THT:*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>0fdef178-1d2e-415b-af40-cb19a7697daa</tstamps>
+    </comp>
+    <comp ref="D3">
+      <value>Green</value>
+      <footprint>LED_SMD:LED_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Light emitting diode</description>
+      <fields>
+        <field name="Sim.Pins">1=K 2=A</field>
+        <field name="LCSC">C2986048</field>
+        <field name="Footprint">LED_SMD:LED_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Light emitting diode</field>
+      </fields>
+      <libsource lib="Device" part="LED" description="Light emitting diode"/>
+      <property name="Sim.Pins" value="1=K 2=A"/>
+      <property name="LCSC" value="C2986048"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="LED diode"/>
+      <property name="ki_fp_filters" value="LED* LED_SMD:* LED_THT:*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>4c4013a5-2194-4824-8f96-34cde02e8fa8</tstamps>
+    </comp>
+    <comp ref="D4">
+      <value>SM712_SOT23</value>
+      <footprint>Package_TO_SOT_SMD:SOT-23</footprint>
+      <datasheet>https://www.littelfuse.com/~/media/electronics/datasheets/tvs_diode_arrays/littelfuse_tvs_diode_array_sm712_datasheet.pdf.pdf</datasheet>
+      <description>7V/12V, 600W Asymmetrical TVS Diode Array, SOT-23</description>
+      <fields>
+        <field name="LCSC">C404012</field>
+        <field name="Footprint">Package_TO_SOT_SMD:SOT-23</field>
+        <field name="Datasheet">https://www.littelfuse.com/~/media/electronics/datasheets/tvs_diode_arrays/littelfuse_tvs_diode_array_sm712_datasheet.pdf.pdf</field>
+        <field name="Description">7V/12V, 600W Asymmetrical TVS Diode Array, SOT-23</field>
+      </fields>
+      <libsource lib="Diode" part="SM712_SOT23" description="7V/12V, 600W Asymmetrical TVS Diode Array, SOT-23"/>
+      <property name="LCSC" value="C404012"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="transient voltage suppressor thyrector transil"/>
+      <property name="ki_fp_filters" value="SOT?23*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>830844c1-2cc3-496a-b7ea-a56b21072359</tstamps>
+    </comp>
+    <comp ref="D5">
+      <value>SM712_SOT23</value>
+      <footprint>Package_TO_SOT_SMD:SOT-23</footprint>
+      <datasheet>https://www.littelfuse.com/~/media/electronics/datasheets/tvs_diode_arrays/littelfuse_tvs_diode_array_sm712_datasheet.pdf.pdf</datasheet>
+      <description>7V/12V, 600W Asymmetrical TVS Diode Array, SOT-23</description>
+      <fields>
+        <field name="LCSC">C404012</field>
+        <field name="Footprint">Package_TO_SOT_SMD:SOT-23</field>
+        <field name="Datasheet">https://www.littelfuse.com/~/media/electronics/datasheets/tvs_diode_arrays/littelfuse_tvs_diode_array_sm712_datasheet.pdf.pdf</field>
+        <field name="Description">7V/12V, 600W Asymmetrical TVS Diode Array, SOT-23</field>
+      </fields>
+      <libsource lib="Diode" part="SM712_SOT23" description="7V/12V, 600W Asymmetrical TVS Diode Array, SOT-23"/>
+      <property name="LCSC" value="C404012"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="transient voltage suppressor thyrector transil"/>
+      <property name="ki_fp_filters" value="SOT?23*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>798b64b6-ea65-45f5-ad58-4f7cabb2895e</tstamps>
+    </comp>
+    <comp ref="J2">
+      <value>~</value>
+      <footprint>TashTalk:CONN-TH_DIN-802</footprint>
+      <datasheet>https://item.szlcsc.com/datasheet/DIN-802/43215428.html</datasheet>
+      <description>Number of Pins:8P Gender:Female Mounting Type:Right Angle</description>
+      <fields>
+        <field name="Manufacturer Part">DIN-802</field>
+        <field name="Manufacturer">Legion(六钧)</field>
+        <field name="Supplier Part">C41409494</field>
+        <field name="Supplier">LCSC</field>
+        <field name="LCSC">C41409494</field>
+        <field name="Footprint">TashTalk:CONN-TH_DIN-802</field>
+        <field name="Datasheet">https://item.szlcsc.com/datasheet/DIN-802/43215428.html</field>
+        <field name="Description">Number of Pins:8P Gender:Female Mounting Type:Right Angle</field>
+      </fields>
+      <libsource lib="tashtalk" part="DIN-802_C41409494" description="Number of Pins:8P Gender:Female Mounting Type:Right Angle"/>
+      <property name="Manufacturer Part" value="DIN-802"/>
+      <property name="Manufacturer" value="Legion(六钧)"/>
+      <property name="Supplier Part" value="C41409494"/>
+      <property name="Supplier" value="LCSC"/>
+      <property name="LCSC" value="C41409494"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>2b1e116f-ab0e-4be1-a9a7-17c7de3dcb1f</tstamps>
+    </comp>
+    <comp ref="J3">
+      <value>USB_C_Receptacle_USB2.0_14P</value>
+      <footprint>Connector_USB:USB_C_Receptacle_HRO_TYPE-C-31-M-12</footprint>
+      <datasheet>https://www.usb.org/sites/default/files/documents/usb_type-c.zip</datasheet>
+      <description>USB 2.0-only 14P Type-C Receptacle connector</description>
+      <fields>
+        <field name="LCSC">C165948</field>
+        <field name="Footprint">Connector_USB:USB_C_Receptacle_HRO_TYPE-C-31-M-12</field>
+        <field name="Datasheet">https://www.usb.org/sites/default/files/documents/usb_type-c.zip</field>
+        <field name="Description">USB 2.0-only 14P Type-C Receptacle connector</field>
+      </fields>
+      <libsource lib="Connector" part="USB_C_Receptacle_USB2.0_14P" description="USB 2.0-only 14P Type-C Receptacle connector"/>
+      <property name="LCSC" value="C165948"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="usb universal serial bus type-C USB2.0"/>
+      <property name="ki_fp_filters" value="USB*C*Receptacle*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>e9baeb93-98b8-4e74-a3f5-8841d9393686</tstamps>
+    </comp>
+    <comp ref="R1">
+      <value>1K</value>
+      <footprint>Resistor_SMD:R_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Resistor, small symbol</description>
+      <fields>
+        <field name="LCSC">C22548</field>
+        <field name="Footprint">Resistor_SMD:R_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Resistor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="R_Small" description="Resistor, small symbol"/>
+      <property name="LCSC" value="C22548"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="R resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>ab534731-2dfa-4fee-beb9-e23d0ad6d560</tstamps>
+    </comp>
+    <comp ref="R2">
+      <value>5K1</value>
+      <footprint>Resistor_SMD:R_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Resistor, small symbol</description>
+      <fields>
+        <field name="LCSC">C2907044</field>
+        <field name="Footprint">Resistor_SMD:R_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Resistor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="R_Small" description="Resistor, small symbol"/>
+      <property name="LCSC" value="C2907044"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="R resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>f3357fa8-4575-4281-9614-f479a36ca968</tstamps>
+    </comp>
+    <comp ref="R3">
+      <value>5K1</value>
+      <footprint>Resistor_SMD:R_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Resistor, small symbol</description>
+      <fields>
+        <field name="LCSC">C2907044</field>
+        <field name="Footprint">Resistor_SMD:R_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Resistor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="R_Small" description="Resistor, small symbol"/>
+      <property name="LCSC" value="C2907044"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="R resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>04be7638-b4c5-4b68-8a99-aa58c5df2e7c</tstamps>
+    </comp>
+    <comp ref="R4">
+      <value>22K1</value>
+      <footprint>Resistor_SMD:R_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Resistor, small symbol</description>
+      <fields>
+        <field name="LCSC">C2960862</field>
+        <field name="Footprint">Resistor_SMD:R_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Resistor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="R_Small" description="Resistor, small symbol"/>
+      <property name="LCSC" value="C2960862"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="R resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>2aa9cdfb-0a7b-4671-82a0-7c4ee101b9b2</tstamps>
+    </comp>
+    <comp ref="R5">
+      <value>47K5</value>
+      <footprint>Resistor_SMD:R_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Resistor, small symbol</description>
+      <fields>
+        <field name="LCSC">C2933225</field>
+        <field name="Footprint">Resistor_SMD:R_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Resistor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="R_Small" description="Resistor, small symbol"/>
+      <property name="LCSC" value="C2933225"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="R resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>1a0f40bf-7fec-4d57-92fa-4960de7de816</tstamps>
+    </comp>
+    <comp ref="R6">
+      <value>300</value>
+      <footprint>Resistor_SMD:R_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Resistor, small symbol</description>
+      <fields>
+        <field name="LCSC">C2930092</field>
+        <field name="Footprint">Resistor_SMD:R_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Resistor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="R_Small" description="Resistor, small symbol"/>
+      <property name="LCSC" value="C2930092"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="R resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>3d8f33ad-fb4b-47a1-b64a-5465052b445d</tstamps>
+    </comp>
+    <comp ref="R7">
+      <value>240</value>
+      <footprint>Resistor_SMD:R_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Resistor, small symbol</description>
+      <fields>
+        <field name="LCSC">C2907130</field>
+        <field name="Footprint">Resistor_SMD:R_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Resistor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="R_Small" description="Resistor, small symbol"/>
+      <property name="LCSC" value="C2907130"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="R resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>c4d6d0e9-cbb4-4299-ae80-726d43e11e30</tstamps>
+    </comp>
+    <comp ref="R8">
+      <value>10</value>
+      <footprint>Resistor_SMD:R_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Resistor, small symbol</description>
+      <fields>
+        <field name="LCSC">C2906983</field>
+        <field name="Footprint">Resistor_SMD:R_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Resistor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="R_Small" description="Resistor, small symbol"/>
+      <property name="LCSC" value="C2906983"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="R resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>3911b18f-14a9-4336-8e13-54c7280c2034</tstamps>
+    </comp>
+    <comp ref="R9">
+      <value>10</value>
+      <footprint>Resistor_SMD:R_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Resistor, small symbol</description>
+      <fields>
+        <field name="LCSC">C2906983</field>
+        <field name="Footprint">Resistor_SMD:R_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Resistor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="R_Small" description="Resistor, small symbol"/>
+      <property name="LCSC" value="C2906983"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="R resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>4b3a3ea4-01bb-45b8-983a-74ef28d0bd2a</tstamps>
+    </comp>
+    <comp ref="R10">
+      <value>10</value>
+      <footprint>Resistor_SMD:R_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Resistor, small symbol</description>
+      <fields>
+        <field name="LCSC">C2906983</field>
+        <field name="Footprint">Resistor_SMD:R_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Resistor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="R_Small" description="Resistor, small symbol"/>
+      <property name="LCSC" value="C2906983"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="R resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>5d199d3f-3ec0-481a-b85a-f393e7ca1517</tstamps>
+    </comp>
+    <comp ref="R11">
+      <value>10</value>
+      <footprint>Resistor_SMD:R_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Resistor, small symbol</description>
+      <fields>
+        <field name="LCSC">C2906983</field>
+        <field name="Footprint">Resistor_SMD:R_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Resistor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="R_Small" description="Resistor, small symbol"/>
+      <property name="LCSC" value="C2906983"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="R resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>8f5a76e1-5e42-4ad3-9960-8e97abf1271e</tstamps>
+    </comp>
+    <comp ref="R12">
+      <value>100</value>
+      <footprint>Resistor_SMD:R_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Resistor, small symbol</description>
+      <fields>
+        <field name="LCSC">C2906981</field>
+        <field name="Footprint">Resistor_SMD:R_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Resistor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="R_Small" description="Resistor, small symbol"/>
+      <property name="LCSC" value="C2906981"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="R resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>405c8a08-f42d-46fc-b6c9-4d6edc6987da</tstamps>
+    </comp>
+    <comp ref="R13">
+      <value>100</value>
+      <footprint>Resistor_SMD:R_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Resistor, small symbol</description>
+      <fields>
+        <field name="LCSC">C2906981</field>
+        <field name="Footprint">Resistor_SMD:R_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Resistor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="R_Small" description="Resistor, small symbol"/>
+      <property name="LCSC" value="C2906981"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="R resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>0d7ddc15-1dc9-4a3d-a1e2-5648429b86df</tstamps>
+    </comp>
+    <comp ref="R14">
+      <value>10K</value>
+      <footprint>Resistor_SMD:R_0603_1608Metric</footprint>
+      <datasheet>~</datasheet>
+      <description>Resistor, small symbol</description>
+      <fields>
+        <field name="LCSC">C2930027</field>
+        <field name="Footprint">Resistor_SMD:R_0603_1608Metric</field>
+        <field name="Datasheet">~</field>
+        <field name="Description">Resistor, small symbol</field>
+      </fields>
+      <libsource lib="Device" part="R_Small" description="Resistor, small symbol"/>
+      <property name="LCSC" value="C2930027"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="R resistor"/>
+      <property name="ki_fp_filters" value="R_*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>3fe20364-6c40-4d7e-8d96-17b508879f54</tstamps>
+    </comp>
+    <comp ref="U1">
+      <value>CP2102N-Axx-xQFN20</value>
+      <footprint>Package_DFN_QFN:SiliconLabs_QFN-20-1EP_3x3mm_P0.5mm_EP1.8x1.8mm</footprint>
+      <datasheet>https://www.silabs.com/documents/public/data-sheets/cp2102n-datasheet.pdf</datasheet>
+      <description>USB to UART master bridge, QFN-20</description>
+      <fields>
+        <field name="LCSC">C969913</field>
+        <field name="Footprint">Package_DFN_QFN:SiliconLabs_QFN-20-1EP_3x3mm_P0.5mm_EP1.8x1.8mm</field>
+        <field name="Datasheet">https://www.silabs.com/documents/public/data-sheets/cp2102n-datasheet.pdf</field>
+        <field name="Description">USB to UART master bridge, QFN-20</field>
+      </fields>
+      <libsource lib="Interface_USB" part="CP2102N-Axx-xQFN20" description="USB to UART master bridge, QFN-20"/>
+      <property name="LCSC" value="C969913"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="USB UART bridge"/>
+      <property name="ki_fp_filters" value="SiliconLabs*QFN*3x3mm*P0.5mm*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>62ef3c3a-9973-4f9b-8632-f148b6442232</tstamps>
+    </comp>
+    <comp ref="U2">
+      <value>PIC12F1840-xSN</value>
+      <footprint>Package_SO:SOIC-8_3.9x4.9mm_P1.27mm</footprint>
+      <datasheet>https://ww1.microchip.com/downloads/en/DeviceDoc/41441B.pdf</datasheet>
+      <description>PIC12F1840, 4kW FLASH, 256B SRAM, 256B EEPROM, SOIC-8</description>
+      <fields>
+        <field name="LCSC">C39594</field>
+        <field name="Footprint">Package_SO:SOIC-8_3.9x4.9mm_P1.27mm</field>
+        <field name="Datasheet">https://ww1.microchip.com/downloads/en/DeviceDoc/41441B.pdf</field>
+        <field name="Description">PIC12F1840, 4kW FLASH, 256B SRAM, 256B EEPROM, SOIC-8</field>
+      </fields>
+      <libsource lib="MCU_Microchip_PIC12" part="PIC12F1840-xSN" description="PIC12F1840, 4kW FLASH, 256B SRAM, 256B EEPROM, SOIC-8"/>
+      <property name="LCSC" value="C39594"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <property name="ki_keywords" value="FLASH-Based 8-Bit CMOS Microcontroller XLP"/>
+      <property name="ki_fp_filters" value="SOIC*3.9x4.9mm*"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>cbf3ffb9-7e4b-4708-a15d-2de7d2e90edd</tstamps>
+    </comp>
+    <comp ref="U3">
+      <value>SN65HVD1473DGSR</value>
+      <footprint>Package_SO:MSOP-10_3x3mm_P0.5mm</footprint>
+      <fields>
+        <field name="LCSC">C2863381</field>
+        <field name="Footprint">Package_SO:MSOP-10_3x3mm_P0.5mm</field>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <libsource lib="tashtalk" part="SN65HVD1473DGSR" description=""/>
+      <property name="LCSC" value="C2863381"/>
+      <property name="Sheetname" value="Root"/>
+      <property name="Sheetfile" value="TashTalkUSB.kicad_sch"/>
+      <sheetpath names="/" tstamps="/"/>
+      <tstamps>c0bd269a-6bbd-4621-856b-c40c23f53f8b</tstamps>
+    </comp>
+  </components>
+  <libparts>
+    <libpart lib="Connector" part="TC2030">
+      <description>Tag-Connect’s 6-pins connector</description>
+      <docs>https://www.tag-connect.com/wp-content/uploads/bsk-pdf-manager/2019/12/TC2030-IDC-NL-Datasheet-Rev-B.pdf</docs>
+      <footprints>
+        <fp>*TC2030*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">J</field>
+        <field name="Value">TC2030</field>
+        <field name="Footprint">Connector:Tag-Connect_TC2030-IDC-NL_2x03_P1.27mm_Vertical</field>
+        <field name="Datasheet">https://www.tag-connect.com/wp-content/uploads/bsk-pdf-manager/2019/12/TC2030-IDC-NL-Datasheet-Rev-B.pdf</field>
+        <field name="Description">Tag-Connect’s 6-pins connector</field>
+      </fields>
+      <pins>
+        <pin num="1" name="" type="passive"/>
+        <pin num="2" name="" type="passive"/>
+        <pin num="3" name="" type="passive"/>
+        <pin num="4" name="" type="passive"/>
+        <pin num="5" name="" type="passive"/>
+        <pin num="6" name="" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Connector" part="USB_C_Receptacle_USB2.0_14P">
+      <description>USB 2.0-only 14P Type-C Receptacle connector</description>
+      <docs>https://www.usb.org/sites/default/files/documents/usb_type-c.zip</docs>
+      <footprints>
+        <fp>USB*C*Receptacle*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">J</field>
+        <field name="Value">USB_C_Receptacle_USB2.0_14P</field>
+        <field name="Footprint"/>
+        <field name="Datasheet">https://www.usb.org/sites/default/files/documents/usb_type-c.zip</field>
+        <field name="Description">USB 2.0-only 14P Type-C Receptacle connector</field>
+      </fields>
+      <pins>
+        <pin num="A1" name="GND" type="passive"/>
+        <pin num="A4" name="VBUS" type="passive"/>
+        <pin num="A5" name="CC1" type="bidirectional"/>
+        <pin num="A6" name="D+" type="bidirectional"/>
+        <pin num="A7" name="D-" type="bidirectional"/>
+        <pin num="A9" name="VBUS" type="passive"/>
+        <pin num="A12" name="GND" type="passive"/>
+        <pin num="B1" name="GND" type="passive"/>
+        <pin num="B4" name="VBUS" type="passive"/>
+        <pin num="B5" name="CC2" type="bidirectional"/>
+        <pin num="B6" name="D+" type="bidirectional"/>
+        <pin num="B7" name="D-" type="bidirectional"/>
+        <pin num="B9" name="VBUS" type="passive"/>
+        <pin num="B12" name="GND" type="passive"/>
+        <pin num="S1" name="SHIELD" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Device" part="C_Small">
+      <description>Unpolarized capacitor, small symbol</description>
+      <docs>~</docs>
+      <footprints>
+        <fp>C_*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">C</field>
+        <field name="Value">C_Small</field>
+        <field name="Footprint"/>
+        <field name="Datasheet">~</field>
+        <field name="Description">Unpolarized capacitor, small symbol</field>
+      </fields>
+      <pins>
+        <pin num="1" name="" type="passive"/>
+        <pin num="2" name="" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Device" part="LED">
+      <description>Light emitting diode</description>
+      <docs>~</docs>
+      <footprints>
+        <fp>LED*</fp>
+        <fp>LED_SMD:*</fp>
+        <fp>LED_THT:*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">D</field>
+        <field name="Value">LED</field>
+        <field name="Footprint"/>
+        <field name="Datasheet">~</field>
+        <field name="Description">Light emitting diode</field>
+        <field name="Sim.Pins">1=K 2=A</field>
+      </fields>
+      <pins>
+        <pin num="1" name="K" type="passive"/>
+        <pin num="2" name="A" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Device" part="R_Small">
+      <description>Resistor, small symbol</description>
+      <docs>~</docs>
+      <footprints>
+        <fp>R_*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">R</field>
+        <field name="Value">R_Small</field>
+        <field name="Footprint"/>
+        <field name="Datasheet">~</field>
+        <field name="Description">Resistor, small symbol</field>
+      </fields>
+      <pins>
+        <pin num="1" name="" type="passive"/>
+        <pin num="2" name="" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="Diode" part="SM712_SOT23">
+      <description>7V/12V, 600W Asymmetrical TVS Diode Array, SOT-23</description>
+      <docs>https://www.littelfuse.com/~/media/electronics/datasheets/tvs_diode_arrays/littelfuse_tvs_diode_array_sm712_datasheet.pdf.pdf</docs>
+      <footprints>
+        <fp>SOT?23*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">D</field>
+        <field name="Value">SM712_SOT23</field>
+        <field name="Footprint">Package_TO_SOT_SMD:SOT-23</field>
+        <field name="Datasheet">https://www.littelfuse.com/~/media/electronics/datasheets/tvs_diode_arrays/littelfuse_tvs_diode_array_sm712_datasheet.pdf.pdf</field>
+        <field name="Description">7V/12V, 600W Asymmetrical TVS Diode Array, SOT-23</field>
+      </fields>
+      <pins>
+        <pin num="1" name="A1" type="passive"/>
+        <pin num="2" name="A2" type="passive"/>
+        <pin num="3" name="common" type="input"/>
+      </pins>
+    </libpart>
+    <libpart lib="Interface_USB" part="CP2102N-Axx-xQFN20">
+      <description>USB to UART master bridge, QFN-20</description>
+      <docs>https://www.silabs.com/documents/public/data-sheets/cp2102n-datasheet.pdf</docs>
+      <footprints>
+        <fp>SiliconLabs*QFN*3x3mm*P0.5mm*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">U</field>
+        <field name="Value">CP2102N-Axx-xQFN20</field>
+        <field name="Footprint">Package_DFN_QFN:SiliconLabs_QFN-20-1EP_3x3mm_P0.5mm</field>
+        <field name="Datasheet">https://www.silabs.com/documents/public/data-sheets/cp2102n-datasheet.pdf</field>
+        <field name="Description">USB to UART master bridge, QFN-20</field>
+      </fields>
+      <pins>
+        <pin num="1" name="RS485/GPIO.1" type="bidirectional"/>
+        <pin num="2" name="CLK/GPIO.0" type="bidirectional"/>
+        <pin num="3" name="GND" type="power_in"/>
+        <pin num="4" name="D+" type="bidirectional"/>
+        <pin num="5" name="D-" type="bidirectional"/>
+        <pin num="6" name="VDD" type="power_in"/>
+        <pin num="7" name="VREGIN" type="power_in"/>
+        <pin num="8" name="VBUS" type="input"/>
+        <pin num="9" name="~{RST}" type="input"/>
+        <pin num="10" name="NC" type="no_connect"/>
+        <pin num="11" name="~{SUSPEND}" type="output"/>
+        <pin num="12" name="GND" type="passive"/>
+        <pin num="13" name="~{WAKEUP}" type="input"/>
+        <pin num="14" name="SUSPEND" type="output"/>
+        <pin num="15" name="~{CTS}" type="input"/>
+        <pin num="16" name="~{RTS}" type="output"/>
+        <pin num="17" name="RXD" type="input"/>
+        <pin num="18" name="TXD" type="output"/>
+        <pin num="19" name="~{RXT}/GPIO.3" type="bidirectional"/>
+        <pin num="20" name="~{TXT}/GPIO.2" type="bidirectional"/>
+        <pin num="21" name="GND" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="MCU_Microchip_PIC12" part="PIC12F1840-xSN">
+      <description>PIC12F1840, 4kW FLASH, 256B SRAM, 256B EEPROM, SOIC-8</description>
+      <docs>https://ww1.microchip.com/downloads/en/DeviceDoc/41441B.pdf</docs>
+      <footprints>
+        <fp>SOIC*3.9x4.9mm*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">U</field>
+        <field name="Value">PIC12F1840-xSN</field>
+        <field name="Footprint">Package_SO:SOIC-8_3.9x4.9mm_P1.27mm</field>
+        <field name="Datasheet">https://ww1.microchip.com/downloads/en/DeviceDoc/41441B.pdf</field>
+        <field name="Description">PIC12F1840, 4kW FLASH, 256B SRAM, 256B EEPROM, SOIC-8</field>
+      </fields>
+      <pins>
+        <pin num="1" name="VDD" type="power_in"/>
+        <pin num="2" name="RA5" type="bidirectional"/>
+        <pin num="3" name="RA4" type="bidirectional"/>
+        <pin num="4" name="RA3" type="input"/>
+        <pin num="5" name="RA2" type="bidirectional"/>
+        <pin num="6" name="RA1" type="bidirectional"/>
+        <pin num="7" name="RA0" type="bidirectional"/>
+        <pin num="8" name="VSS" type="power_in"/>
+      </pins>
+    </libpart>
+    <libpart lib="Power_Protection" part="SP0503BAHT">
+      <description>TVS Diode Array, 5.5V Standoff, 3 Channels, SOT-143 package</description>
+      <docs>http://www.littelfuse.com/~/media/files/littelfuse/technical%20resources/documents/data%20sheets/sp05xxba.pdf</docs>
+      <footprints>
+        <fp>SOT?143*</fp>
+      </footprints>
+      <fields>
+        <field name="Reference">D</field>
+        <field name="Value">SP0503BAHT</field>
+        <field name="Footprint">Package_TO_SOT_SMD:SOT-143</field>
+        <field name="Datasheet">http://www.littelfuse.com/~/media/files/littelfuse/technical%20resources/documents/data%20sheets/sp05xxba.pdf</field>
+        <field name="Description">TVS Diode Array, 5.5V Standoff, 3 Channels, SOT-143 package</field>
+      </fields>
+      <pins>
+        <pin num="1" name="A" type="passive"/>
+        <pin num="2" name="K" type="passive"/>
+        <pin num="3" name="K" type="passive"/>
+        <pin num="4" name="K" type="passive"/>
+      </pins>
+    </libpart>
+    <libpart lib="tashtalk" part="DIN-802_C41409494">
+      <description>Number of Pins:8P Gender:Female Mounting Type:Right Angle</description>
+      <docs>https://item.szlcsc.com/datasheet/DIN-802/43215428.html</docs>
+      <fields>
+        <field name="Reference">J</field>
+        <field name="Value"/>
+        <field name="Footprint">ProLib_pcs_2026-03-28:CONN-TH_DIN-802</field>
+        <field name="Datasheet">https://item.szlcsc.com/datasheet/DIN-802/43215428.html</field>
+        <field name="Description">Number of Pins:8P Gender:Female Mounting Type:Right Angle</field>
+        <field name="Manufacturer Part">DIN-802</field>
+        <field name="Manufacturer">Legion(六钧)</field>
+        <field name="Supplier Part">C41409494</field>
+        <field name="Supplier">LCSC</field>
+        <field name="LCSC Part Name">DIN JACK</field>
+      </fields>
+      <pins>
+        <pin num="1" name="1" type="unspecified"/>
+        <pin num="2" name="2" type="unspecified"/>
+        <pin num="3" name="3" type="unspecified"/>
+        <pin num="4" name="4" type="unspecified"/>
+        <pin num="5" name="5" type="unspecified"/>
+        <pin num="6" name="6" type="unspecified"/>
+        <pin num="7" name="7" type="unspecified"/>
+        <pin num="8" name="8" type="unspecified"/>
+        <pin num="9" name="9" type="unspecified"/>
+        <pin num="10" name="10" type="unspecified"/>
+        <pin num="11" name="11" type="unspecified"/>
+      </pins>
+    </libpart>
+    <libpart lib="tashtalk" part="SN65HVD1473DGSR">
+      <fields>
+        <field name="Reference">U?</field>
+        <field name="Value"/>
+        <field name="Footprint"/>
+        <field name="Datasheet"/>
+        <field name="Description"/>
+      </fields>
+      <pins>
+        <pin num="1" name="R" type="output"/>
+        <pin num="2" name="RE" type="input"/>
+        <pin num="3" name="DE" type="input"/>
+        <pin num="4" name="D" type="input"/>
+        <pin num="5" name="GND" type="power_in"/>
+        <pin num="6" name="Y" type="output"/>
+        <pin num="7" name="Z" type="output"/>
+        <pin num="8" name="B" type="input"/>
+        <pin num="9" name="A" type="input"/>
+        <pin num="10" name="VCC" type="power_in"/>
+      </pins>
+    </libpart>
+  </libparts>
+  <libraries>
+    <library logical="Connector">
+      <uri>/usr/share/kicad/symbols//Connector.kicad_sym</uri>
+    </library>
+    <library logical="Device">
+      <uri>/usr/share/kicad/symbols//Device.kicad_sym</uri>
+    </library>
+    <library logical="Diode">
+      <uri>/usr/share/kicad/symbols//Diode.kicad_sym</uri>
+    </library>
+    <library logical="Interface_USB">
+      <uri>/usr/share/kicad/symbols//Interface_USB.kicad_sym</uri>
+    </library>
+    <library logical="MCU_Microchip_PIC12">
+      <uri>/usr/share/kicad/symbols//MCU_Microchip_PIC12.kicad_sym</uri>
+    </library>
+    <library logical="Power_Protection">
+      <uri>/usr/share/kicad/symbols//Power_Protection.kicad_sym</uri>
+    </library>
+    <library logical="tashtalk">
+      <uri>/home/ravenminion/TashTalkUSB/tashtalk.kicad_sym</uri>
+    </library>
+  </libraries>
+  <nets>
+    <net code="1" name="+3.3V" class="Default">
+      <node ref="C3" pin="1" pintype="passive"/>
+      <node ref="C4" pin="1" pintype="passive"/>
+      <node ref="C6" pin="1" pintype="passive"/>
+      <node ref="C7" pin="1" pintype="passive"/>
+      <node ref="C8" pin="1" pintype="passive"/>
+      <node ref="R1" pin="1" pintype="passive"/>
+      <node ref="R14" pin="1" pintype="passive"/>
+      <node ref="U1" pin="6" pinfunction="VDD" pintype="power_in"/>
+      <node ref="U2" pin="1" pinfunction="VDD" pintype="power_in"/>
+      <node ref="U3" pin="10" pinfunction="VCC" pintype="power_in"/>
+    </net>
+    <net code="2" name="+5V" class="Default">
+      <node ref="C1" pin="1" pintype="passive"/>
+      <node ref="C2" pin="1" pintype="passive"/>
+      <node ref="D1" pin="2" pinfunction="K" pintype="passive"/>
+      <node ref="J3" pin="A4" pinfunction="VBUS" pintype="passive"/>
+      <node ref="J3" pin="A9" pinfunction="VBUS" pintype="passive"/>
+      <node ref="J3" pin="B4" pinfunction="VBUS" pintype="passive"/>
+      <node ref="J3" pin="B9" pinfunction="VBUS" pintype="passive"/>
+      <node ref="R4" pin="1" pintype="passive"/>
+      <node ref="R6" pin="1" pintype="passive"/>
+      <node ref="R7" pin="1" pintype="passive"/>
+      <node ref="U1" pin="7" pinfunction="VREGIN" pintype="power_in"/>
+    </net>
+    <net code="3" name="A" class="Default">
+      <node ref="D4" pin="1" pinfunction="A1" pintype="passive"/>
+      <node ref="J2" pin="5" pinfunction="5" pintype="unspecified"/>
+      <node ref="R9" pin="2" pintype="passive"/>
+    </net>
+    <net code="4" name="B" class="Default">
+      <node ref="D4" pin="2" pinfunction="A2" pintype="passive"/>
+      <node ref="J2" pin="8" pinfunction="8" pintype="unspecified"/>
+      <node ref="R10" pin="2" pintype="passive"/>
+    </net>
+    <net code="5" name="CC1" class="Default">
+      <node ref="J3" pin="A5" pinfunction="CC1" pintype="bidirectional"/>
+      <node ref="R2" pin="1" pintype="passive"/>
+    </net>
+    <net code="6" name="CC2" class="Default">
+      <node ref="J3" pin="B5" pinfunction="CC2" pintype="bidirectional"/>
+      <node ref="R3" pin="1" pintype="passive"/>
+    </net>
+    <net code="7" name="D+" class="Default">
+      <node ref="D1" pin="4" pinfunction="K" pintype="passive"/>
+      <node ref="J3" pin="A6" pinfunction="D+" pintype="bidirectional"/>
+      <node ref="J3" pin="B6" pinfunction="D+" pintype="bidirectional"/>
+      <node ref="U1" pin="4" pinfunction="D+" pintype="bidirectional"/>
+    </net>
+    <net code="8" name="D-" class="Default">
+      <node ref="D1" pin="3" pinfunction="K" pintype="passive"/>
+      <node ref="J3" pin="A7" pinfunction="D-" pintype="bidirectional"/>
+      <node ref="J3" pin="B7" pinfunction="D-" pintype="bidirectional"/>
+      <node ref="U1" pin="5" pinfunction="D-" pintype="bidirectional"/>
+    </net>
+    <net code="9" name="DE" class="Default">
+      <node ref="U2" pin="3" pinfunction="RA4" pintype="bidirectional"/>
+      <node ref="U3" pin="2" pinfunction="RE" pintype="input"/>
+      <node ref="U3" pin="3" pinfunction="DE" pintype="input"/>
+    </net>
+    <net code="10" name="GND" class="Default">
+      <node ref="C1" pin="2" pintype="passive"/>
+      <node ref="C2" pin="2" pintype="passive"/>
+      <node ref="C3" pin="2" pintype="passive"/>
+      <node ref="C4" pin="2" pintype="passive"/>
+      <node ref="C6" pin="2" pintype="passive"/>
+      <node ref="C7" pin="2" pintype="passive"/>
+      <node ref="C8" pin="2" pintype="passive"/>
+      <node ref="D1" pin="1" pinfunction="A" pintype="passive"/>
+      <node ref="D4" pin="3" pinfunction="common" pintype="input"/>
+      <node ref="D5" pin="3" pinfunction="common" pintype="input"/>
+      <node ref="J2" pin="10" pinfunction="10" pintype="unspecified"/>
+      <node ref="J2" pin="11" pinfunction="11" pintype="unspecified"/>
+      <node ref="J2" pin="4" pinfunction="4" pintype="unspecified"/>
+      <node ref="J2" pin="9" pinfunction="9" pintype="unspecified"/>
+      <node ref="J3" pin="A1" pinfunction="GND" pintype="passive"/>
+      <node ref="J3" pin="A12" pinfunction="GND" pintype="passive"/>
+      <node ref="J3" pin="B1" pinfunction="GND" pintype="passive"/>
+      <node ref="J3" pin="B12" pinfunction="GND" pintype="passive"/>
+      <node ref="J3" pin="S1" pinfunction="SHIELD" pintype="passive"/>
+      <node ref="R2" pin="2" pintype="passive"/>
+      <node ref="R3" pin="2" pintype="passive"/>
+      <node ref="R5" pin="2" pintype="passive"/>
+      <node ref="U1" pin="12" pinfunction="GND" pintype="passive"/>
+      <node ref="U1" pin="21" pinfunction="GND" pintype="passive"/>
+      <node ref="U1" pin="3" pinfunction="GND" pintype="power_in"/>
+      <node ref="U2" pin="8" pinfunction="VSS" pintype="power_in"/>
+      <node ref="U3" pin="5" pinfunction="GND" pintype="power_in"/>
+    </net>
+    <net code="11" name="ICSPCLK" class="Default">
+      <node ref="R12" pin="2" pintype="passive"/>
+      <node ref="U2" pin="6" pinfunction="RA1" pintype="bidirectional"/>
+    </net>
+    <net code="12" name="ICSPDAT" class="Default">
+      <node ref="R13" pin="2" pintype="passive"/>
+      <node ref="U2" pin="7" pinfunction="RA0" pintype="bidirectional"/>
+    </net>
+    <net code="13" name="LocalTalk" class="Default">
+      <node ref="R14" pin="2" pintype="passive"/>
+      <node ref="U2" pin="2" pinfunction="RA5" pintype="bidirectional"/>
+      <node ref="U3" pin="1" pinfunction="R" pintype="output"/>
+      <node ref="U3" pin="4" pinfunction="D" pintype="input"/>
+    </net>
+    <net code="14" name="MCLR" class="Default">
+      <node ref="U2" pin="4" pinfunction="RA3" pintype="input"/>
+    </net>
+    <net code="15" name="Net-(D2-A)" class="Default">
+      <node ref="D2" pin="2" pinfunction="A" pintype="passive"/>
+      <node ref="R6" pin="2" pintype="passive"/>
+    </net>
+    <net code="16" name="Net-(D2-K)" class="Default">
+      <node ref="D2" pin="1" pinfunction="K" pintype="passive"/>
+      <node ref="U1" pin="20" pinfunction="~{TXT}/GPIO.2" pintype="bidirectional"/>
+    </net>
+    <net code="17" name="Net-(D3-A)" class="Default">
+      <node ref="D3" pin="2" pinfunction="A" pintype="passive"/>
+      <node ref="R7" pin="2" pintype="passive"/>
+    </net>
+    <net code="18" name="Net-(D3-K)" class="Default">
+      <node ref="D3" pin="1" pinfunction="K" pintype="passive"/>
+      <node ref="U1" pin="19" pinfunction="~{RXT}/GPIO.3" pintype="bidirectional"/>
+    </net>
+    <net code="19" name="Net-(U1-RXD)" class="Default">
+      <node ref="R13" pin="1" pintype="passive"/>
+      <node ref="U1" pin="17" pinfunction="RXD" pintype="input"/>
+    </net>
+    <net code="20" name="Net-(U1-TXD)" class="Default">
+      <node ref="R12" pin="1" pintype="passive"/>
+      <node ref="U1" pin="18" pinfunction="TXD" pintype="output"/>
+    </net>
+    <net code="21" name="Net-(U1-VBUS)" class="Default">
+      <node ref="R4" pin="2" pintype="passive"/>
+      <node ref="R5" pin="1" pintype="passive"/>
+      <node ref="U1" pin="8" pinfunction="VBUS" pintype="input"/>
+    </net>
+    <net code="22" name="Net-(U1-~{CTS})" class="Default">
+      <node ref="U1" pin="15" pinfunction="~{CTS}" pintype="input"/>
+      <node ref="U2" pin="5" pinfunction="RA2" pintype="bidirectional"/>
+    </net>
+    <net code="23" name="Net-(U1-~{RST})" class="Default">
+      <node ref="R1" pin="2" pintype="passive"/>
+      <node ref="U1" pin="9" pinfunction="~{RST}" pintype="input"/>
+    </net>
+    <net code="24" name="Net-(U3-A)" class="Default">
+      <node ref="R9" pin="1" pintype="passive"/>
+      <node ref="U3" pin="9" pinfunction="A" pintype="input"/>
+    </net>
+    <net code="25" name="Net-(U3-B)" class="Default">
+      <node ref="R10" pin="1" pintype="passive"/>
+      <node ref="U3" pin="8" pinfunction="B" pintype="input"/>
+    </net>
+    <net code="26" name="Net-(U3-Y)" class="Default">
+      <node ref="R11" pin="1" pintype="passive"/>
+      <node ref="U3" pin="6" pinfunction="Y" pintype="output"/>
+    </net>
+    <net code="27" name="Net-(U3-Z)" class="Default">
+      <node ref="R8" pin="1" pintype="passive"/>
+      <node ref="U3" pin="7" pinfunction="Z" pintype="output"/>
+    </net>
+    <net code="28" name="Y" class="Default">
+      <node ref="D5" pin="2" pinfunction="A2" pintype="passive"/>
+      <node ref="J2" pin="3" pinfunction="3" pintype="unspecified"/>
+      <node ref="R11" pin="2" pintype="passive"/>
+    </net>
+    <net code="29" name="Z" class="Default">
+      <node ref="D5" pin="1" pinfunction="A1" pintype="passive"/>
+      <node ref="J2" pin="6" pinfunction="6" pintype="unspecified"/>
+      <node ref="R8" pin="2" pintype="passive"/>
+    </net>
+    <net code="31" name="unconnected-(J2-Pad1)" class="Default">
+      <node ref="J2" pin="1" pinfunction="1" pintype="unspecified"/>
+    </net>
+    <net code="32" name="unconnected-(J2-Pad2)" class="Default">
+      <node ref="J2" pin="2" pinfunction="2" pintype="unspecified"/>
+    </net>
+    <net code="33" name="unconnected-(J2-Pad7)" class="Default">
+      <node ref="J2" pin="7" pinfunction="7" pintype="unspecified"/>
+    </net>
+    <net code="34" name="unconnected-(U1-CLK/GPIO.0-Pad2)" class="Default">
+      <node ref="U1" pin="2" pinfunction="CLK/GPIO.0" pintype="bidirectional"/>
+    </net>
+    <net code="35" name="unconnected-(U1-NC-Pad10)" class="Default">
+      <node ref="U1" pin="10" pinfunction="NC" pintype="no_connect"/>
+    </net>
+    <net code="36" name="unconnected-(U1-RS485/GPIO.1-Pad1)" class="Default">
+      <node ref="U1" pin="1" pinfunction="RS485/GPIO.1" pintype="bidirectional"/>
+    </net>
+    <net code="37" name="unconnected-(U1-SUSPEND-Pad14)" class="Default">
+      <node ref="U1" pin="14" pinfunction="SUSPEND" pintype="output"/>
+    </net>
+    <net code="38" name="unconnected-(U1-~{RTS}-Pad16)" class="Default">
+      <node ref="U1" pin="16" pinfunction="~{RTS}" pintype="output"/>
+    </net>
+    <net code="39" name="unconnected-(U1-~{SUSPEND}-Pad11)" class="Default">
+      <node ref="U1" pin="11" pinfunction="~{SUSPEND}" pintype="output"/>
+    </net>
+    <net code="40" name="unconnected-(U1-~{WAKEUP}-Pad13)" class="Default">
+      <node ref="U1" pin="13" pinfunction="~{WAKEUP}" pintype="input"/>
+    </net>
+  </nets>
+</export>

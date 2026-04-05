@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "tashtalk")(type "KiCad")(uri "${KIPRJMOD}/tashtalk.kicad_sym")(options "")(descr ""))
+)
