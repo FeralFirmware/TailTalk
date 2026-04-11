@@ -256,10 +256,11 @@ impl DdpProcessor {
             .lookup(packet.dest.addr)
             .await
             .expect("unknown addr");
-        let is_short = packet.dest.addr.network_number == 0
-            || packet.dest.addr.network_number == our_addr.network_number;
 
-        let header_len = if is_short { 5 } else { DdpHeaders::LEN };
+        // Short DDP (DDP-S, 5-byte header) is LocalTalk only.
+        let use_short = matches!(dest_node, Node::LocalTalk(_));
+
+        let header_len = if use_short { 5 } else { DdpHeaders::LEN };
         let headers = DdpHeaders {
             hop_count: 0,
             len: packet.payload.len() + header_len,
@@ -276,7 +277,7 @@ impl DdpProcessor {
         let payload_len = header_len + packet.payload.len();
         let mut payload = vec![0u8; payload_len].into_boxed_slice();
 
-        let header_size = if is_short {
+        let header_size = if use_short {
             headers
                 .to_bytes_short(&mut payload)
                 .expect("failed to encode short headers")

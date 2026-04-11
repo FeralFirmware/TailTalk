@@ -1,7 +1,8 @@
-use crate::ddp::{DdpHandle, DdpSocket};
+use crate::ddp::{DdpAddress, DdpHandle, DdpSocket};
 use byteorder::ByteOrder;
 use bytes::{Buf, BytesMut};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -12,6 +13,9 @@ use tailtalk_packets::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot};
 
+const ADSP_MAX_DATA: usize = 572;
+const ADSP_RECV_WINDOW: u16 = 4096;
+
 /// ADSP network address
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AdspAddress {
@@ -20,250 +24,268 @@ pub struct AdspAddress {
     pub socket_number: u8,
 }
 
-/// Connection state for ADSP state machine
+fn ddp_dest(addr: AdspAddress) -> DdpAddress {
+    DdpAddress::new(
+        tailtalk_packets::aarp::AppleTalkAddress {
+            network_number: addr.network_number,
+            node_number: addr.node_number,
+        },
+        addr.socket_number,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum ConnectionState {
-    Closed,
-    Opening,
     Open,
     Closing,
 }
 
-/// Internal connection tracking
 struct AdspConnection {
     state: ConnectionState,
     remote_addr: AdspAddress,
     send_seq: u32,
     oldest_unacked_seq: u32,
     recv_seq: u32,
-    recv_window: u16,
     send_window: u16,
-    flight_buffer: std::collections::VecDeque<u8>,
+    /// Bytes sent but not yet ACKed by the peer.
+    flight_buffer: Vec<u8>,
     last_tx: std::time::Instant,
     retries: u8,
-    // Channel to send received data to the stream
+    /// Delivers received data to the AdspStream reader.
     data_tx: mpsc::Sender<Vec<u8>>,
-    // Channel to receive commands from the stream
-    command_rx: mpsc::Receiver<AdspCommand>,
 }
 
-/// Commands sent from AdspStream to the Adsp actor
-enum AdspCommand {
+// ── Actor command channel ─────────────────────────────────────────────────────
+//
+// All AdspStream instances share a clone of the same mpsc::Sender<ActorCmd>.
+// This replaces the old per-connection command_rx on each connection, which
+// required busy-polling every connection's channel before each select! tick.
+
+enum ActorCmd {
     SendData {
+        conn_id: u16,
         data: Vec<u8>,
         eom: bool,
-        result: oneshot::Sender<io::Result<()>>,
+        reply: oneshot::Sender<io::Result<()>>,
     },
     Close {
-        result: oneshot::Sender<io::Result<()>>,
+        conn_id: u16,
+        reply: oneshot::Sender<io::Result<()>>,
     },
 }
 
-/// ADSP protocol handler actor
+// ── Adsp actor ────────────────────────────────────────────────────────────────
+
 pub struct Adsp {
     sock: DdpSocket,
     connections: HashMap<u16, AdspConnection>,
     accept_tx: Option<mpsc::Sender<AdspStream>>,
     pending_opens: HashMap<u16, oneshot::Sender<io::Result<AdspStream>>>,
+    cmd_rx: mpsc::Receiver<ActorCmd>,
+    /// Cloned into each AdspStream so they can send commands back.
+    cmd_tx: mpsc::Sender<ActorCmd>,
 }
 
 impl Adsp {
-    /// Spawn an ADSP listener on the specified socket
-    pub async fn bind(
-        ddp: &DdpHandle,
-        socket_number: Option<u8>,
-    ) -> io::Result<(u8, AdspListener)> {
+    pub async fn bind(ddp: &DdpHandle, socket_number: Option<u8>) -> io::Result<(u8, AdspListener)> {
         let sock = ddp
             .new_sock(DdpProtocolType::Adsp, socket_number)
             .await
             .map_err(io::Error::other)?;
-
         let actual_socket = sock.socket_num();
         let (accept_tx, accept_rx) = mpsc::channel(10);
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
 
         let adsp = Adsp {
             sock,
             connections: HashMap::new(),
             accept_tx: Some(accept_tx),
             pending_opens: HashMap::new(),
+            cmd_rx,
+            cmd_tx,
         };
 
-        tokio::spawn(async move {
-            adsp.run().await;
-        });
+        tokio::spawn(async move { adsp.run().await });
 
-        let listener = AdspListener {
-            local_socket: actual_socket,
-            accept_rx,
-        };
-
-        Ok((actual_socket, listener))
+        Ok((actual_socket, AdspListener { local_socket: actual_socket, accept_rx }))
     }
 
-    /// Create a new ADSP socket for connecting to a remote endpoint
     pub async fn connect(ddp: &DdpHandle, remote_addr: AdspAddress) -> io::Result<AdspStream> {
         let sock = ddp
             .new_sock(DdpProtocolType::Adsp, None)
             .await
             .map_err(io::Error::other)?;
-
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (ready_tx, ready_rx) = oneshot::channel();
-        let connection_id = 1; // Will be assigned by actor
+        let conn_id: u16 = rand::random();
 
-        let adsp = Adsp {
+        let mut adsp = Adsp {
             sock,
             connections: HashMap::new(),
             accept_tx: None,
-            pending_opens: [(connection_id, ready_tx)].into(),
+            pending_opens: [(conn_id, ready_tx)].into(),
+            cmd_rx,
+            cmd_tx,
         };
 
-        tokio::spawn(async move {
-            let mut adsp = adsp;
-            // Send OpenConnRequest
-            adsp.initiate_connection(connection_id, remote_addr).await;
-            adsp.run().await;
-        });
+        adsp.send_open_request(conn_id, remote_addr).await;
+        tokio::spawn(async move { adsp.run().await });
 
-        // Wait for connection to be established
         ready_rx.await.map_err(io::Error::other)?
     }
 
-    async fn initiate_connection(&mut self, connection_id: u16, remote_addr: AdspAddress) {
-        let packet = AdspPacket {
-            descriptor: AdspDescriptor::OpenConnRequest,
-            connection_id,
-            first_byte_seq: 0,
-            next_recv_seq: 0,
-            recv_window: 4096,
-            flags: 0,
-        };
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
-        let mut buf = [0u8; 600];
-        if let Ok(len) = packet.to_bytes(&mut buf) {
-            let dest = crate::ddp::DdpAddress::new(
-                tailtalk_packets::aarp::AppleTalkAddress {
-                    network_number: remote_addr.network_number,
-                    node_number: remote_addr.node_number,
-                },
-                remote_addr.socket_number,
-            );
-
-            if let Err(e) = self.sock.send_to(&buf[..len], dest).await {
-                tracing::error!("Failed to send OpenConnRequest: {}", e);
-            } else {
-                tracing::info!("Sent ADSP OpenConnRequest to {:?}", remote_addr);
-            }
+    fn make_stream(
+        &self,
+        conn_id: u16,
+        remote_addr: AdspAddress,
+        data_rx: mpsc::Receiver<Vec<u8>>,
+    ) -> AdspStream {
+        AdspStream {
+            conn_id,
+            remote_addr,
+            cmd_tx: self.cmd_tx.clone(),
+            data_rx,
+            read_buf: BytesMut::new(),
+            write_buf: BytesMut::new(),
+            pending_flush: None,
         }
     }
 
+    /// Register a new open connection and return the user-facing stream.
+    fn open_connection(
+        &mut self,
+        conn_id: u16,
+        remote_addr: AdspAddress,
+        peer_window: u16,
+    ) -> AdspStream {
+        let (data_tx, data_rx) = mpsc::channel(32);
+        self.connections.insert(conn_id, AdspConnection {
+            state: ConnectionState::Open,
+            remote_addr,
+            send_seq: 0,
+            oldest_unacked_seq: 0,
+            recv_seq: 0,
+            send_window: peer_window,
+            flight_buffer: Vec::new(),
+            last_tx: std::time::Instant::now(),
+            retries: 0,
+            data_tx,
+        });
+        self.make_stream(conn_id, remote_addr, data_rx)
+    }
+
+    // ── Event loop ────────────────────────────────────────────────────────────
+
     async fn run(mut self) {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
-            // Collect commands from all connections
-            let mut commands_to_process = Vec::new();
-            for (conn_id, conn) in &mut self.connections {
-                while let Ok(cmd) = conn.command_rx.try_recv() {
-                    commands_to_process.push((*conn_id, cmd));
-                }
-            }
-
-            // Process collected commands
-            for (conn_id, cmd) in commands_to_process {
-                self.handle_command(conn_id, cmd).await;
-            }
-
             tokio::select! {
-                sock_recv = self.sock.recv() => {
-                    match sock_recv {
-                        Ok(mut pkt) => {
-                            self.handle_packet(pkt.headers, &mut pkt.payload).await;
-                        }
+                pkt = self.sock.recv() => {
+                    match pkt {
+                        Ok(mut p) => self.handle_packet(p.headers, &mut p.payload).await,
                         Err(e) => {
-                            tracing::error!("ADSP socket error: {}", e);
+                            tracing::error!("ADSP socket error: {e}");
                             break;
                         }
                     }
                 }
-                _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
-                    // Periodic tick for command processing and retransmission
+                cmd = self.cmd_rx.recv() => {
+                    match cmd {
+                        Some(c) => self.handle_cmd(c).await,
+                        None => break,
+                    }
+                }
+                _ = tick.tick() => {
                     self.tick().await;
                 }
             }
         }
     }
 
-    async fn tick(&mut self) {
-        let now = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(3); // lpstyl waits a few seconds
-
-        for (conn_id, conn) in &mut self.connections {
-            if conn.state != ConnectionState::Open {
-                continue;
+    async fn handle_cmd(&mut self, cmd: ActorCmd) {
+        match cmd {
+            ActorCmd::SendData { conn_id, data, eom, reply } => {
+                let result = self.send_data(conn_id, &data, eom).await;
+                let _ = reply.send(result);
             }
-
-            // Do we have unacknowledged data sitting in the flight buffer?
-            if !conn.flight_buffer.is_empty()
-                && now.duration_since(conn.last_tx) > timeout {
-                    tracing::warn!("ADSP timeout on conn {}, retransmitting", conn_id);
-                    conn.retries += 1;
-                    if conn.retries > 5 {
-                        tracing::error!("ADSP conn {} max retries reached, closing", conn_id);
-                        conn.state = ConnectionState::Closed;
-                        continue;
-                    }
-
-                    // Force an ACK request probe
-                    let probe = AdspPacket {
-                        descriptor: AdspDescriptor::ControlPacket,
-                        connection_id: *conn_id,
-                        first_byte_seq: conn.send_seq,
-                        next_recv_seq: conn.recv_seq,
-                        recv_window: conn.recv_window,
-                        flags: AdspPacket::FLAG_ACK,
-                    };
-                    let mut probe_buf = [0u8; AdspPacket::HEADER_LEN];
-                    if probe.to_bytes(&mut probe_buf).is_ok() {
-                        let dest = crate::ddp::DdpAddress::new(
-                            tailtalk_packets::aarp::AppleTalkAddress {
-                                network_number: conn.remote_addr.network_number,
-                                node_number: conn.remote_addr.node_number,
-                            },
-                            conn.remote_addr.socket_number,
-                        );
-                        let _ = self.sock.send_to(&probe_buf, dest).await;
-                    }
-
-                    // Grab the whole unacked buffer and re-transmit it
-                    // TODO: Chunk this correctly if it exceeds ADSP_MAX_DATA_SIZE (572)
-                    let data: Vec<u8> = conn.flight_buffer.iter().copied().collect();
-                    let packet = AdspPacket {
-                        descriptor: AdspDescriptor::ControlPacket,
-                        connection_id: *conn_id,
-                        first_byte_seq: conn.oldest_unacked_seq,
-                        next_recv_seq: conn.recv_seq,
-                        recv_window: conn.recv_window,
-                        flags: 0,
-                    };
-
-                    let mut buf = vec![0u8; AdspPacket::HEADER_LEN + data.len()];
-                    if packet.to_bytes(&mut buf).is_ok() {
-                        buf[AdspPacket::HEADER_LEN..].copy_from_slice(&data);
-                        let dest = crate::ddp::DdpAddress::new(
-                            tailtalk_packets::aarp::AppleTalkAddress {
-                                network_number: conn.remote_addr.network_number,
-                                node_number: conn.remote_addr.node_number,
-                            },
-                            conn.remote_addr.socket_number,
-                        );
-                        let _ = self.sock.send_to(&buf, dest).await;
-                    }
-
-                    conn.last_tx = now;
-                }
+            ActorCmd::Close { conn_id, reply } => {
+                let result = self.close_connection(conn_id).await;
+                let _ = reply.send(result);
+            }
         }
     }
 
-    async fn handle_packet(&mut self, ddp: tailtalk_packets::ddp::DdpPacket, payload: &mut [u8]) {
+    // ── Retransmit tick ───────────────────────────────────────────────────────
+
+    async fn tick(&mut self) {
+        let now = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(3);
+
+        let conn_ids: Vec<u16> = self.connections.keys().copied().collect();
+        for conn_id in conn_ids {
+            let conn = match self.connections.get_mut(&conn_id) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            if conn.flight_buffer.is_empty()
+                || now.duration_since(conn.last_tx) <= timeout
+            {
+                continue;
+            }
+
+            conn.retries += 1;
+            if conn.retries > 5 {
+                tracing::error!("ADSP conn {} max retries reached, closing", conn_id);
+                conn.state = ConnectionState::Closing;
+                continue;
+            }
+
+            tracing::warn!(
+                "ADSP retransmit on conn {}, attempt {}",
+                conn_id,
+                conn.retries
+            );
+
+            let data: Vec<u8> = conn.flight_buffer.clone();
+            let remote_addr = conn.remote_addr;
+            let oldest_seq = conn.oldest_unacked_seq;
+            let recv_seq = conn.recv_seq;
+
+            for (i, chunk) in data.chunks(ADSP_MAX_DATA).enumerate() {
+                let chunk_seq = oldest_seq.wrapping_add((i * ADSP_MAX_DATA) as u32);
+                let pkt = AdspPacket {
+                    descriptor: AdspDescriptor::ControlPacket,
+                    connection_id: conn_id,
+                    first_byte_seq: chunk_seq,
+                    next_recv_seq: recv_seq,
+                    recv_window: ADSP_RECV_WINDOW,
+                    flags: 0,
+                };
+                let mut buf = vec![0u8; AdspPacket::HEADER_LEN + chunk.len()];
+                if pkt.to_bytes(&mut buf).is_ok() {
+                    buf[AdspPacket::HEADER_LEN..].copy_from_slice(chunk);
+                    let _ = self.sock.send_to(&buf, ddp_dest(remote_addr)).await;
+                }
+            }
+
+            if let Some(c) = self.connections.get_mut(&conn_id) {
+                c.last_tx = now;
+            }
+        }
+    }
+
+    // ── Inbound packet dispatch ───────────────────────────────────────────────
+
+    async fn handle_packet(
+        &mut self,
+        ddp: tailtalk_packets::ddp::DdpPacket,
+        payload: &mut [u8],
+    ) {
         let packet = match AdspPacket::parse(payload) {
             Ok(p) => p,
             Err(e) => {
@@ -273,15 +295,15 @@ impl Adsp {
         };
 
         tracing::debug!(
-            "ADSP received {:?} from {}.{} conn_id={}",
+            "ADSP {:?} conn={} from {}.{}",
             packet.descriptor,
+            packet.connection_id,
             ddp.src_network_num,
             ddp.src_node_id,
-            packet.connection_id
         );
 
         if packet.flags & AdspPacket::FLAG_ATTENTION != 0 {
-            self.handle_attention(ddp, payload).await;
+            self.handle_attention(packet, &payload[AdspPacket::HEADER_LEN..]).await;
             return;
         }
 
@@ -293,8 +315,7 @@ impl Adsp {
                 self.handle_open_ack(ddp, packet).await;
             }
             AdspDescriptor::ControlPacket => {
-                self.handle_data(packet, &payload[AdspPacket::HEADER_LEN..])
-                    .await;
+                self.handle_data(packet, &payload[AdspPacket::HEADER_LEN..]).await;
             }
             AdspDescriptor::Acknowledgment => {
                 self.handle_ack(packet).await;
@@ -308,56 +329,37 @@ impl Adsp {
         }
     }
 
-    async fn handle_attention(
-        &mut self,
-        _ddp: tailtalk_packets::ddp::DdpPacket,
-        payload: &mut [u8],
-    ) {
-        let attention = match tailtalk_packets::adsp::AdspAttentionPacket::parse(payload) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("Failed to parse ADSP attention packet: {:?}", e);
-                return;
-            }
-        };
-
+    async fn handle_attention(&mut self, packet: AdspPacket, data: &[u8]) {
+        if data.len() < 2 {
+            return;
+        }
+        let attention_code = byteorder::BigEndian::read_u16(&data[0..2]);
         tracing::info!(
-            "ADSP received Attention code 0x{:04X} on conn_id={}",
-            attention.attention_code,
-            attention.header.connection_id
+            "ADSP attention 0x{:04X} on conn {}",
+            attention_code,
+            packet.connection_id
         );
 
-        if let Some(conn) = self.connections.get_mut(&attention.header.connection_id) {
-            // Echo back an Attention Acknowledgment
-            let ack_packet = AdspPacket {
-                descriptor: AdspDescriptor::ControlPacket,
-                connection_id: attention.header.connection_id,
-                first_byte_seq: conn.send_seq,
-                next_recv_seq: conn.recv_seq,
-                recv_window: conn.recv_window,
-                flags: AdspPacket::FLAG_ATTENTION | AdspPacket::FLAG_ACK,
-            };
+        let Some(conn) = self.connections.get(&packet.connection_id) else { return };
+        let remote_addr = conn.remote_addr;
+        let send_seq = conn.send_seq;
+        let recv_seq = conn.recv_seq;
 
-            let mut ack_buf = vec![0u8; AdspPacket::HEADER_LEN + 2];
-            if ack_packet.to_bytes(&mut ack_buf).is_ok() {
-                // Return the same attention code in the ack payload per spec
-                byteorder::BigEndian::write_u16(
-                    &mut ack_buf[AdspPacket::HEADER_LEN..],
-                    attention.attention_code,
-                );
-
-                let dest = crate::ddp::DdpAddress::new(
-                    tailtalk_packets::aarp::AppleTalkAddress {
-                        network_number: conn.remote_addr.network_number,
-                        node_number: conn.remote_addr.node_number,
-                    },
-                    conn.remote_addr.socket_number,
-                );
-
-                let _ = self.sock.send_to(&ack_buf, dest).await;
-            }
-
-            // In a real application, we should surface this attention code to the user layer via AdspStream
+        let ack = AdspPacket {
+            descriptor: AdspDescriptor::ControlPacket,
+            connection_id: packet.connection_id,
+            first_byte_seq: send_seq,
+            next_recv_seq: recv_seq,
+            recv_window: ADSP_RECV_WINDOW,
+            flags: AdspPacket::FLAG_ATTENTION | AdspPacket::FLAG_ACK,
+        };
+        let mut buf = vec![0u8; AdspPacket::HEADER_LEN + 2];
+        if ack.to_bytes(&mut buf).is_ok() {
+            byteorder::BigEndian::write_u16(
+                &mut buf[AdspPacket::HEADER_LEN..],
+                attention_code,
+            );
+            let _ = self.sock.send_to(&buf, ddp_dest(remote_addr)).await;
         }
     }
 
@@ -366,409 +368,306 @@ impl Adsp {
         ddp: tailtalk_packets::ddp::DdpPacket,
         packet: AdspPacket,
     ) {
-        // Server side: accept incoming connection
-        let connection_id = packet.connection_id;
+        let conn_id = packet.connection_id;
         let remote_addr = AdspAddress {
             network_number: ddp.src_network_num,
             node_number: ddp.src_node_id,
             socket_number: ddp.src_sock_num,
         };
 
-        tracing::info!("ADSP accepting connection from {:?}", remote_addr);
+        tracing::info!("ADSP accepting conn {} from {:?}", conn_id, remote_addr);
 
-        // Create channels for this connection
-        let (data_tx, data_rx) = mpsc::channel(100);
-        let (command_tx, command_rx) = mpsc::channel(10);
+        let stream = self.open_connection(conn_id, remote_addr, packet.recv_window);
 
-        // Create connection state
-        let connection = AdspConnection {
-            state: ConnectionState::Open,
-            remote_addr,
-            send_seq: 0,
-            oldest_unacked_seq: 0,
-            recv_seq: 0,
-            recv_window: 4096,
-            send_window: packet.recv_window,
-            flight_buffer: std::collections::VecDeque::new(),
-            last_tx: std::time::Instant::now(),
-            retries: 0,
-            data_tx,
-            command_rx,
-        };
-
-        self.connections.insert(connection_id, connection);
-
-        // Send OpenConnAck
-        let ack_packet = AdspPacket {
+        let ack = AdspPacket {
             descriptor: AdspDescriptor::OpenConnAck,
-            connection_id,
+            connection_id: conn_id,
             first_byte_seq: 0,
             next_recv_seq: 0,
-            recv_window: 4096,
+            recv_window: ADSP_RECV_WINDOW,
             flags: 0,
         };
-
-        let mut buf = [0u8; 600];
-        if let Ok(len) = ack_packet.to_bytes(&mut buf) {
-            let dest = crate::ddp::DdpAddress::new(
-                tailtalk_packets::aarp::AppleTalkAddress {
-                    network_number: remote_addr.network_number,
-                    node_number: remote_addr.node_number,
-                },
-                remote_addr.socket_number,
-            );
-
-            let _ = self.sock.send_to(&buf[..len], dest).await;
+        let mut buf = [0u8; AdspPacket::HEADER_LEN];
+        if ack.to_bytes(&mut buf).is_ok() {
+            let _ = self.sock.send_to(&buf, ddp_dest(remote_addr)).await;
         }
 
-        // Create stream and send to listener
-        let stream = AdspStream {
-            connection_id,
-            remote_addr,
-            command_tx,
-            data_rx,
-            read_buf: BytesMut::new(),
-            write_buf: BytesMut::new(),
-        };
-
-        if let Some(accept_tx) = &self.accept_tx {
-            let _ = accept_tx.send(stream).await;
+        if let Some(tx) = &self.accept_tx {
+            let _ = tx.send(stream).await;
         }
     }
 
-    async fn handle_open_ack(&mut self, ddp: tailtalk_packets::ddp::DdpPacket, packet: AdspPacket) {
-        // Client side: connection established
-        let connection_id = packet.connection_id;
+    async fn handle_open_ack(
+        &mut self,
+        ddp: tailtalk_packets::ddp::DdpPacket,
+        packet: AdspPacket,
+    ) {
+        let conn_id = packet.connection_id;
+        let Some(ready_tx) = self.pending_opens.remove(&conn_id) else { return };
 
-        if let Some(ready_tx) = self.pending_opens.remove(&connection_id) {
-            let remote_addr = AdspAddress {
-                network_number: ddp.src_network_num,
-                node_number: ddp.src_node_id,
-                socket_number: ddp.src_sock_num,
-            };
+        let remote_addr = AdspAddress {
+            network_number: ddp.src_network_num,
+            node_number: ddp.src_node_id,
+            socket_number: ddp.src_sock_num,
+        };
 
-            tracing::info!("ADSP connection established to {:?}", remote_addr);
+        tracing::info!("ADSP conn {} established to {:?}", conn_id, remote_addr);
 
-            let (data_tx, data_rx) = mpsc::channel(100);
-            let (command_tx, command_rx) = mpsc::channel(10);
-
-            let connection = AdspConnection {
-                state: ConnectionState::Open,
-                remote_addr,
-                send_seq: 0,
-                oldest_unacked_seq: 0,
-                recv_seq: 0,
-                recv_window: 4096,
-                send_window: packet.recv_window,
-                flight_buffer: std::collections::VecDeque::new(),
-                last_tx: std::time::Instant::now(),
-                retries: 0,
-                data_tx,
-                command_rx,
-            };
-
-            self.connections.insert(connection_id, connection);
-
-            let stream = AdspStream {
-                connection_id,
-                remote_addr,
-                command_tx,
-                data_rx,
-                read_buf: BytesMut::new(),
-                write_buf: BytesMut::new(),
-            };
-
-            let _ = ready_tx.send(Ok(stream));
-        }
+        let stream = self.open_connection(conn_id, remote_addr, packet.recv_window);
+        let _ = ready_tx.send(Ok(stream));
     }
 
     async fn handle_data(&mut self, packet: AdspPacket, data: &[u8]) {
-        if let Some(conn) = self.connections.get_mut(&packet.connection_id) {
-            // Update sequence numbers
+        let Some(conn) = self.connections.get_mut(&packet.connection_id) else { return };
+
+        if !data.is_empty() {
             conn.recv_seq = packet.first_byte_seq.wrapping_add(data.len() as u32);
-
-            // Send data to stream
-            if !data.is_empty() {
-                let _ = conn.data_tx.send(data.to_vec()).await;
+            if conn.data_tx.try_send(data.to_vec()).is_err() {
+                tracing::warn!("ADSP conn {} receive buffer full, dropping data", packet.connection_id);
             }
-
-            // Send acknowledgment
-            let _ = self.send_ack(packet.connection_id).await;
         }
+
+        let _ = self.send_ack(packet.connection_id).await;
     }
 
     async fn handle_ack(&mut self, packet: AdspPacket) {
-        if let Some(conn) = self.connections.get_mut(&packet.connection_id) {
-            // Update send window
-            conn.send_window = packet.recv_window;
-            tracing::debug!("ADSP ack recv_window={}", packet.recv_window);
+        let Some(conn) = self.connections.get_mut(&packet.connection_id) else { return };
 
-            // Shifting the window: pop bytes from flight_buffer
-            let acked_bytes = packet.next_recv_seq.wrapping_sub(conn.oldest_unacked_seq) as i32;
-            if acked_bytes > 0 && acked_bytes <= conn.flight_buffer.len() as i32 {
-                conn.flight_buffer.drain(..(acked_bytes as usize));
-                conn.oldest_unacked_seq = packet.next_recv_seq;
-                conn.retries = 0;
-            }
+        conn.send_window = packet.recv_window;
+
+        let acked = packet
+            .next_recv_seq
+            .wrapping_sub(conn.oldest_unacked_seq) as usize;
+        if acked > 0 && acked <= conn.flight_buffer.len() {
+            conn.flight_buffer.drain(..acked);
+            conn.oldest_unacked_seq = packet.next_recv_seq;
+            conn.retries = 0;
         }
     }
 
     async fn handle_close(&mut self, packet: AdspPacket) {
-        if let Some(mut conn) = self.connections.remove(&packet.connection_id) {
-            conn.state = ConnectionState::Closed;
-            tracing::info!("ADSP connection {} closed by peer", packet.connection_id);
+        if let Some(conn) = self.connections.remove(&packet.connection_id) {
+            tracing::info!("ADSP conn {} closed by peer", packet.connection_id);
+            drop(conn.data_tx); // causes the reader to see EOF
         }
     }
 
-    async fn handle_command(&mut self, connection_id: u16, command: AdspCommand) {
-        match command {
-            AdspCommand::SendData { data, eom, result } => {
-                let res = self.send_data(connection_id, &data, eom).await;
-                let _ = result.send(res);
-            }
-            AdspCommand::Close { result } => {
-                let res = self.close_connection(connection_id).await;
-                let _ = result.send(res);
-            }
+    // ── Outbound helpers ──────────────────────────────────────────────────────
+
+    async fn send_open_request(&mut self, conn_id: u16, remote_addr: AdspAddress) {
+        let pkt = AdspPacket {
+            descriptor: AdspDescriptor::OpenConnRequest,
+            connection_id: conn_id,
+            first_byte_seq: 0,
+            next_recv_seq: 0,
+            recv_window: ADSP_RECV_WINDOW,
+            flags: 0,
+        };
+        let mut buf = [0u8; AdspPacket::HEADER_LEN];
+        if pkt.to_bytes(&mut buf).is_ok() {
+            let _ = self.sock.send_to(&buf, ddp_dest(remote_addr)).await;
         }
     }
 
-    async fn send_data(&mut self, connection_id: u16, data: &[u8], eom: bool) -> io::Result<()> {
+    async fn send_data(
+        &mut self,
+        conn_id: u16,
+        data: &[u8],
+        eom: bool,
+    ) -> io::Result<()> {
         let conn = self
             .connections
-            .get_mut(&connection_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection closed"))?;
+            .get_mut(&conn_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no such connection"))?;
 
-        // 1. Queue it in the flight buffer.
-        conn.flight_buffer.extend(data.iter());
-
-        // 2. See how much of the unacked buffer we can send right now.
-        // For simplicity, we just send up to 572 bytes at a time starting from our oldest sequence.
-        // Note: Production implementations should loop if flight_buffer > 572
-        let to_send_len = std::cmp::min(data.len(), 572);
-        let mut buf = vec![0u8; AdspPacket::HEADER_LEN + to_send_len];
-
-        let to_send_data: Vec<u8> = conn
-            .flight_buffer
-            .iter()
-            .take(to_send_len)
-            .copied()
-            .collect();
-
-        // Propagate EOM flag to the constructed packet if requested
-        let mut flags = 0;
-        if eom {
-            flags |= AdspPacket::FLAG_EOM;
+        if conn.state != ConnectionState::Open {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "connection closing"));
         }
 
-        let packet = AdspPacket {
-            descriptor: AdspDescriptor::ControlPacket,
-            connection_id,
-            first_byte_seq: conn.send_seq,
-            next_recv_seq: conn.recv_seq,
-            recv_window: conn.recv_window,
-            flags,
-        };
+        // Empty EOM flush (just a control packet with EOM set, no data).
+        if data.is_empty() && eom {
+            let pkt = AdspPacket {
+                descriptor: AdspDescriptor::ControlPacket,
+                connection_id: conn_id,
+                first_byte_seq: conn.send_seq,
+                next_recv_seq: conn.recv_seq,
+                recv_window: ADSP_RECV_WINDOW,
+                flags: AdspPacket::FLAG_EOM,
+            };
+            let mut buf = [0u8; AdspPacket::HEADER_LEN];
+            pkt.to_bytes(&mut buf)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            return self
+                .sock
+                .send_to(&buf, ddp_dest(conn.remote_addr))
+                .await
+                .map_err(io::Error::other);
+        }
 
-        let header_len = packet
-            .to_bytes(&mut buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let chunks: Vec<&[u8]> = data.chunks(ADSP_MAX_DATA).collect();
+        let last_idx = chunks.len().saturating_sub(1);
 
-        buf[header_len..header_len + to_send_len].copy_from_slice(&to_send_data);
+        for (i, chunk) in chunks.iter().enumerate() {
+            let flags = if eom && i == last_idx { AdspPacket::FLAG_EOM } else { 0 };
 
-        let dest = crate::ddp::DdpAddress::new(
-            tailtalk_packets::aarp::AppleTalkAddress {
-                network_number: conn.remote_addr.network_number,
-                node_number: conn.remote_addr.node_number,
-            },
-            conn.remote_addr.socket_number,
-        );
+            let pkt = AdspPacket {
+                descriptor: AdspDescriptor::ControlPacket,
+                connection_id: conn_id,
+                first_byte_seq: conn.send_seq,
+                next_recv_seq: conn.recv_seq,
+                recv_window: ADSP_RECV_WINDOW,
+                flags,
+            };
 
-        self.sock
-            .send_to(&buf[..header_len + to_send_len], dest)
-            .await
-            .map_err(io::Error::other)?;
+            let mut buf = vec![0u8; AdspPacket::HEADER_LEN + chunk.len()];
+            pkt.to_bytes(&mut buf)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            buf[AdspPacket::HEADER_LEN..].copy_from_slice(chunk);
 
-        conn.send_seq = conn.send_seq.wrapping_add(to_send_len as u32);
+            self.sock
+                .send_to(&buf, ddp_dest(conn.remote_addr))
+                .await
+                .map_err(io::Error::other)?;
+
+            conn.flight_buffer.extend_from_slice(chunk);
+            conn.send_seq = conn.send_seq.wrapping_add(chunk.len() as u32);
+        }
         conn.last_tx = std::time::Instant::now();
 
         Ok(())
     }
 
-    async fn send_ack(&mut self, connection_id: u16) -> io::Result<()> {
+    async fn send_ack(&mut self, conn_id: u16) -> io::Result<()> {
         let conn = self
             .connections
-            .get(&connection_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection closed"))?;
+            .get(&conn_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no such connection"))?;
 
-        let packet = AdspPacket {
+        let pkt = AdspPacket {
             descriptor: AdspDescriptor::Acknowledgment,
-            connection_id,
+            connection_id: conn_id,
             first_byte_seq: conn.send_seq,
             next_recv_seq: conn.recv_seq,
-            recv_window: conn.recv_window,
+            recv_window: ADSP_RECV_WINDOW,
             flags: 0,
         };
 
-        let mut buf = [0u8; 600];
-        let len = packet
-            .to_bytes(&mut buf)
+        let remote_addr = conn.remote_addr;
+        let mut buf = [0u8; AdspPacket::HEADER_LEN];
+        pkt.to_bytes(&mut buf)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-
-        let dest = crate::ddp::DdpAddress::new(
-            tailtalk_packets::aarp::AppleTalkAddress {
-                network_number: conn.remote_addr.network_number,
-                node_number: conn.remote_addr.node_number,
-            },
-            conn.remote_addr.socket_number,
-        );
-
         self.sock
-            .send_to(&buf[..len], dest)
+            .send_to(&buf, ddp_dest(remote_addr))
             .await
-            .map_err(io::Error::other)?;
-
-        Ok(())
+            .map_err(io::Error::other)
     }
 
-    async fn close_connection(&mut self, connection_id: u16) -> io::Result<()> {
-        let conn = self
-            .connections
-            .get(&connection_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "connection closed"))?;
+    async fn close_connection(&mut self, conn_id: u16) -> io::Result<()> {
+        let Some(conn) = self.connections.get(&conn_id) else {
+            return Ok(()); // already gone
+        };
 
-        let packet = AdspPacket {
+        let pkt = AdspPacket {
             descriptor: AdspDescriptor::CloseAdvice,
-            connection_id,
+            connection_id: conn_id,
             first_byte_seq: conn.send_seq,
             next_recv_seq: conn.recv_seq,
             recv_window: 0,
             flags: 0,
         };
+        let remote_addr = conn.remote_addr;
 
-        let mut buf = [0u8; 600];
-        let len = packet
-            .to_bytes(&mut buf)
+        let mut buf = [0u8; AdspPacket::HEADER_LEN];
+        pkt.to_bytes(&mut buf)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-
-        let dest = crate::ddp::DdpAddress::new(
-            tailtalk_packets::aarp::AppleTalkAddress {
-                network_number: conn.remote_addr.network_number,
-                node_number: conn.remote_addr.node_number,
-            },
-            conn.remote_addr.socket_number,
-        );
-
         self.sock
-            .send_to(&buf[..len], dest)
+            .send_to(&buf, ddp_dest(remote_addr))
             .await
             .map_err(io::Error::other)?;
 
-        self.connections.remove(&connection_id);
-
+        self.connections.remove(&conn_id);
         Ok(())
     }
 }
 
-/// ADSP stream - similar to TcpStream
+// ── AdspStream ────────────────────────────────────────────────────────────────
+//
+// AdspStream: Unpin — all fields are Unpin (Box<T>: Unpin unconditionally, so
+// Pin<Box<dyn Future>>: Unpin), which lets us use Pin::get_mut() freely in the
+// poll_* impls and store a boxed future across poll_flush invocations.
+
 pub struct AdspStream {
-    connection_id: u16,
+    conn_id: u16,
     remote_addr: AdspAddress,
-    command_tx: mpsc::Sender<AdspCommand>,
+    cmd_tx: mpsc::Sender<ActorCmd>,
     data_rx: mpsc::Receiver<Vec<u8>>,
     read_buf: BytesMut,
     write_buf: BytesMut,
+    /// Boxed future for an in-progress flush. Stored so poll_flush can be
+    /// called repeatedly until the actor has processed the send command.
+    pending_flush: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send>>>,
 }
 
 impl AdspStream {
-    /// Get the local connection ID
-    pub fn local_addr(&self) -> u16 {
-        self.connection_id
-    }
-
-    /// Get the remote address
-    pub fn peer_addr(&self) -> AdspAddress {
+    pub fn remote_addr(&self) -> AdspAddress {
         self.remote_addr
     }
 
-    /// Close the connection gracefully
-    pub async fn close(self) -> io::Result<()> {
-        let (tx, rx) = oneshot::channel();
-        // If sending fails, the actor is already gone (connection closed)
-        if self
-            .command_tx
-            .send(AdspCommand::Close { result: tx })
-            .await
-            .is_err()
-        {
-            // Actor is gone, connection already closed - this is OK
-            return Ok(());
-        }
-        // Wait for response - if it fails, connection was already closed
-        match rx.await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) if e.kind() == io::ErrorKind::NotConnected => {
-                // Connection already closed - this is OK
-                Ok(())
-            }
-            Ok(Err(e)) => Err(e),
-            Err(_) => {
-                // Channel dropped - connection already closed
-                Ok(())
-            }
-        }
-    }
-
-    /// Explicitly send the contents of the internal write_buf and flag the packet with End-of-Message
+    /// Flush the write buffer and mark the message boundary with the EOM flag.
+    /// This is the ADSP-specific alternative to a bare flush — use it when the
+    /// peer expects record-oriented framing (e.g. PAP / StyleWriter).
     pub async fn write_eom(&mut self) -> io::Result<()> {
         let data = self.write_buf.split().to_vec();
         let (tx, rx) = oneshot::channel();
-
-        self.command_tx
-            .send(AdspCommand::SendData {
+        self.cmd_tx
+            .send(ActorCmd::SendData {
+                conn_id: self.conn_id,
                 data,
                 eom: true,
-                result: tx,
+                reply: tx,
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "adsp actor died"))?;
-
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "adsp actor dead"))?;
         rx.await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "adsp actor died"))?
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "adsp actor dead"))?
+    }
+
+    /// Send a CloseAdvice and shut down the connection.
+    pub async fn close(self) -> io::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .cmd_tx
+            .send(ActorCmd::Close { conn_id: self.conn_id, reply: tx })
+            .await;
+        rx.await.unwrap_or(Ok(()))
     }
 }
 
 impl AsyncRead for AdspStream {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // First, drain any buffered data
-        if !self.read_buf.is_empty() {
-            let to_read = std::cmp::min(self.read_buf.len(), buf.remaining());
-            buf.put_slice(&self.read_buf[..to_read]);
-            self.read_buf.advance(to_read);
+        let this = self.get_mut();
+
+        if !this.read_buf.is_empty() {
+            let to_copy = this.read_buf.len().min(buf.remaining());
+            buf.put_slice(&this.read_buf[..to_copy]);
+            this.read_buf.advance(to_copy);
             return Poll::Ready(Ok(()));
         }
 
-        // Try to receive new data
-        match self.data_rx.poll_recv(cx) {
+        match this.data_rx.poll_recv(cx) {
             Poll::Ready(Some(data)) => {
-                let to_read = std::cmp::min(data.len(), buf.remaining());
-                buf.put_slice(&data[..to_read]);
-
-                // Buffer any remaining data
-                if to_read < data.len() {
-                    self.read_buf.extend_from_slice(&data[to_read..]);
+                let to_copy = data.len().min(buf.remaining());
+                buf.put_slice(&data[..to_copy]);
+                if to_copy < data.len() {
+                    this.read_buf.extend_from_slice(&data[to_copy..]);
                 }
-
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(None) => {
-                // Channel closed - EOF
-                Poll::Ready(Ok(()))
-            }
+            Poll::Ready(None) => Poll::Ready(Ok(())), // EOF — data_tx was dropped
             Poll::Pending => Poll::Pending,
         }
     }
@@ -776,67 +675,70 @@ impl AsyncRead for AdspStream {
 
 impl AsyncWrite for AdspStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // Add data to write buffer
-        self.write_buf.extend_from_slice(buf);
-
-        // Try to flush
-        match self.poll_flush(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Ready(Ok(buf.len())), // Buffered for later
-        }
+        self.get_mut().write_buf.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.write_buf.is_empty() {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+
+        // If a send is already in-flight, poll it to completion.
+        if let Some(fut) = this.pending_flush.as_mut() {
+            let result = fut.as_mut().poll(cx);
+            if result.is_ready() {
+                this.pending_flush = None;
+            }
+            return result;
+        }
+
+        if this.write_buf.is_empty() {
             return Poll::Ready(Ok(()));
         }
 
-        // Send all buffered data
-        let data = self.write_buf.split().to_vec();
-        let (tx, _rx) = oneshot::channel();
+        // Drain the write buffer and ship it to the actor.
+        let data = this.write_buf.split().to_vec();
+        let cmd_tx = this.cmd_tx.clone();
+        let conn_id = this.conn_id;
 
-        let command_tx = self.command_tx.clone();
-        tokio::spawn(async move {
-            let _ = command_tx
-                .send(AdspCommand::SendData {
-                    data,
-                    eom: false,
-                    result: tx,
-                })
-                .await;
+        let fut: Pin<Box<dyn Future<Output = io::Result<()>> + Send>> = Box::pin(async move {
+            let (tx, rx) = oneshot::channel();
+            cmd_tx
+                .send(ActorCmd::SendData { conn_id, data, eom: false, reply: tx })
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "adsp actor dead"))?;
+            rx.await
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "adsp actor dead"))?
         });
 
-        // For simplicity, assume it completes immediately
-        // In a real implementation, we'd need to track pending writes
-        Poll::Ready(Ok(()))
+        this.pending_flush = Some(fut);
+
+        // Poll it immediately — will often complete in one shot.
+        let fut = this.pending_flush.as_mut().unwrap();
+        let result = fut.as_mut().poll(cx);
+        if result.is_ready() {
+            this.pending_flush = None;
+        }
+        result
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Flush any pending data, then close
-        match self.poll_flush(cx) {
-            Poll::Ready(Ok(())) => {
-                // Connection will be closed when AdspStream is dropped
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
+        // Flush any buffered data, then the actor will handle the close.
+        self.poll_flush(cx)
     }
 }
 
-/// ADSP listener - similar to TcpListener
+// ── AdspListener ──────────────────────────────────────────────────────────────
+
 pub struct AdspListener {
     local_socket: u8,
     accept_rx: mpsc::Receiver<AdspStream>,
 }
 
 impl AdspListener {
-    /// Accept an incoming connection
     pub async fn accept(&mut self) -> io::Result<AdspStream> {
         self.accept_rx
             .recv()
@@ -844,7 +746,6 @@ impl AdspListener {
             .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "listener closed"))
     }
 
-    /// Get the local socket number
     pub fn local_addr(&self) -> u8 {
         self.local_socket
     }

@@ -42,9 +42,11 @@ async fn main() -> anyhow::Result<()> {
         .try_into()
         .map_err(|e| anyhow::anyhow!("Invalid printer name: {}", e))?;
 
-    let (processor, handle) =
-        PacketProcessor::spawn(&args.interface).expect("failed to spawn sockets");
-    let addressing = Addressing::spawn(processor.get_mac(), handle.clone(), None);
+    let (processor, handle) = PacketProcessor::builder()
+        .ethernet(&args.interface)
+        .build()
+        .expect("failed to build PacketProcessor");
+    let addressing = Addressing::spawn(processor.get_mac().expect("ethernet transport required"), handle.clone(), None);
     let ddp = DdpProcessor::spawn(addressing.clone(), handle.clone());
     let nbp = Nbp::spawn(&ddp, addressing.clone()).await;
 

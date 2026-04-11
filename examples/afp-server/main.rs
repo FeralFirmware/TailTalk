@@ -33,9 +33,12 @@ async fn main() {
 
     let args = Args::parse();
 
-    let (processor, handle) =
-        PacketProcessor::spawn(&args.interface).expect("failed to spawn sockets");
-    let addressing = Addressing::spawn(processor.get_mac(), handle.clone(), None);
+    let mut builder = PacketProcessor::builder().ethernet(&args.interface);
+    if let Some(ref tty) = args.tashtalk {
+        builder = builder.localtalk(tty);
+    }
+    let (processor, handle) = builder.build().expect("failed to build PacketProcessor");
+    let addressing = Addressing::spawn(processor.get_mac().expect("ethernet transport required"), handle.clone(), None);
 
     let processor_addressing = addressing.clone();
 
@@ -46,12 +49,6 @@ async fn main() {
     // Start AFP server
     let mut afp_config = AfpServerConfig::default();
     afp_config.volume_path = args.path.clone();
-
-    let processor = if let Some(tty) = args.tashtalk {
-        processor.with_tashtalk(&tty, addressing.clone(), ddp.clone())
-    } else {
-        processor
-    };
 
     let _afp_server = AfpServer::spawn(&ddp, &nbp, Some(254), afp_config)
         .await

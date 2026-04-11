@@ -49,286 +49,243 @@ struct BoundSocket {
 pub struct PacketProcessor {
     sockets: Vec<BoundSocket>,
     outbound_rx: mpsc::Receiver<DataLinkPacket>,
-    our_mac: [u8; 6],
-    tashtalk_tx: Option<mpsc::Sender<Vec<u8>>>,
+    our_mac: Option<[u8; 6]>,
+    /// Opened TashTalk instance, stored here and handed to the async task in `run()`.
+    tashtalk: Option<TashTalk<tokio_serial::SerialStream>>,
 }
 
-impl PacketProcessor {
-    pub fn spawn(intf: &str) -> Result<(Self, OutboundHandle), Error> {
-        let c_intf = CString::new(intf).expect("failed to parse intf name");
-        let mut ifreq = unsafe { MaybeUninit::<libc::ifreq>::zeroed().assume_init() };
+// ── Builder ───────────────────────────────────────────────────────────────────
 
-        // Open a temporary socket to get interface index and MAC
-        let tmp_sock = Socket::new(
-            libc::AF_PACKET.into(),
-            libc::SOCK_RAW.into(),
-            Some(libc::ETH_P_ALL.into()),
-        )?;
+/// Builder for [`PacketProcessor`].
+///
+/// At least one transport must be configured before calling [`build`](PacketProcessorBuilder::build).
+///
+/// # Example – EtherTalk only
+/// ```no_run
+/// let (processor, handle) = PacketProcessor::builder()
+///     .ethernet("eth0")
+///     .build()?;
+/// ```
+///
+/// # Example – LocalTalk only
+/// ```no_run
+/// let (processor, handle) = PacketProcessor::builder()
+///     .localtalk("/dev/ttyUSB0")
+///     .build()?;
+/// ```
+///
+/// # Example – both transports
+/// ```no_run
+/// let (processor, handle) = PacketProcessor::builder()
+///     .ethernet("eth0")
+///     .localtalk("/dev/ttyUSB0")
+///     .build()?;
+/// ```
+pub struct PacketProcessorBuilder {
+    ethernet_intf: Option<String>,
+    localtalk_serial_path: Option<String>,
+}
 
-        unsafe {
-            c_intf.as_ptr().copy_to(
-                ifreq.ifr_name.as_mut_ptr(),
-                c_intf.as_bytes_with_nul().len(),
-            );
-            let res = libc::ioctl(
-                tmp_sock.as_raw_fd(),
-                libc::SIOCGIFHWADDR,
-                &ifreq as *const _,
-            );
-
-            if res < 0 {
-                panic!("res was -1!");
-            }
+impl PacketProcessorBuilder {
+    fn new() -> Self {
+        Self {
+            ethernet_intf: None,
+            localtalk_serial_path: None,
         }
-
-        let our_mac: [u8; 6] = unsafe {
-            let mac_data = ifreq.ifr_ifru.ifru_hwaddr.sa_data;
-            [
-                mac_data[0] as u8,
-                mac_data[1] as u8,
-                mac_data[2] as u8,
-                mac_data[3] as u8,
-                mac_data[4] as u8,
-                mac_data[5] as u8,
-            ]
-        };
-
-        unsafe {
-            let res = libc::ioctl(tmp_sock.as_raw_fd(), libc::SIOCGIFINDEX, &ifreq as *const _);
-
-            if res < 0 {
-                panic!("res was -1!");
-            }
-        }
-
-        let if_index = unsafe { ifreq.ifr_ifru.ifru_ifindex };
-        drop(tmp_sock);
-
-        // ETH_P_ATALK and ETH_P_AARP for LLAP (Phase 1)
-        // ETH_P_802_2 to capture 802.3 LLC/SNAP frames (EtherTalkPhase2 Phase 2)
-        let protocols = [libc::ETH_P_ATALK, libc::ETH_P_AARP, libc::ETH_P_802_2];
-        let mut sockets = Vec::new();
-
-        for proto in protocols {
-            tracing::info!("Creating socket for protocol: 0x{:04x}", proto);
-            let sock = Socket::new(
-                libc::AF_PACKET.into(),
-                libc::SOCK_RAW.into(),
-                Some(proto.into()),
-            )?;
-
-            // Enable promiscuous mode to receive broadcast packets (e.g., Apple's 09:00:07:FF:FF:FF)
-            // TODO: Is this actually needed? Added during debugging but never got around to testing if the below multicast
-            // does the trick.
-            let mreq = libc::packet_mreq {
-                mr_ifindex: if_index,
-                mr_type: libc::PACKET_MR_PROMISC as u16,
-                mr_alen: 0,
-                mr_address: [0; 8],
-            };
-
-            if unsafe {
-                libc::setsockopt(
-                    sock.as_raw_fd(),
-                    libc::SOL_PACKET,
-                    libc::PACKET_ADD_MEMBERSHIP,
-                    &mreq as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&mreq) as libc::socklen_t,
-                )
-            } < 0
-            {
-                bail!("failed to set promiscuous mode on sock");
-            }
-
-            // Also explicitly add Apple's multicast broadcast address
-            let apple_mcast = libc::packet_mreq {
-                mr_ifindex: if_index,
-                mr_type: libc::PACKET_MR_MULTICAST as u16,
-                mr_alen: 6,
-                mr_address: [0x09, 0x00, 0x07, 0xff, 0xff, 0xff, 0, 0],
-            };
-
-            if unsafe {
-                libc::setsockopt(
-                    sock.as_raw_fd(),
-                    libc::SOL_PACKET,
-                    libc::PACKET_ADD_MEMBERSHIP,
-                    &apple_mcast as *const _ as *const libc::c_void,
-                    std::mem::size_of_val(&apple_mcast) as libc::socklen_t,
-                )
-            } < 0
-            {
-                tracing::warn!("failed to add Apple multicast address - continuing anyway");
-            }
-
-            tracing::info!(
-                "Successfully bound socket for protocol 0x{:04x} to interface index {}",
-                proto,
-                if_index
-            );
-
-            let addr = libc::sockaddr_ll {
-                sll_family: libc::AF_PACKET as u16,
-                sll_protocol: u16::to_be(proto as u16),
-                sll_ifindex: if_index,
-                sll_hatype: 0,
-                sll_pkttype: 0,
-                sll_halen: 0,
-                sll_addr: [0; 8], // Unused for now
-            };
-
-            // Bind the socket to the interface
-            unsafe {
-                let res = libc::bind(
-                    sock.as_raw_fd(),
-                    &addr as *const _ as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_ll>() as u32,
-                );
-                if res < 0 {
-                    let err = std::io::Error::last_os_error().raw_os_error().unwrap();
-                    panic!("err was: {err}");
-                }
-            }
-            sockets.push(BoundSocket {
-                socket: sock,
-                protocol: proto as u16,
-            });
-        }
-
-        let (tx, rx) = mpsc::channel(100);
-
-        let processor = Self {
-            sockets,
-            outbound_rx: rx,
-            our_mac,
-            tashtalk_tx: None,
-        };
-        let handle = OutboundHandle { tx };
-
-        Ok((processor, handle))
     }
 
-    pub fn with_tashtalk(
-        mut self,
-        serial_path: &str,
-        _addressing_handle: addressing::AddressingHandle,
-        ddp_handle: ddp::DdpHandle,
-    ) -> Self {
-        let (tashtalk_tx, mut tashtalk_rx) = mpsc::channel(100);
-        self.tashtalk_tx = Some(tashtalk_tx);
-
-        let serial_stream = tokio_serial::new(serial_path, 1_000_000)
-            .flow_control(tokio_serial::FlowControl::Hardware)
-            .open_native_async()
-            .expect("Failed to open serial port for TashTalk");
-        let mut tashtalk_instance = TashTalk::new(serial_stream);
-
-        tokio::spawn(async move {
-            tracing::info!("Resetting TashTalk buffers...");
-            if let Err(e) = tashtalk_instance.reset().await {
-                tracing::error!("Failed to reset TashTalk: {:?}", e);
-            }
-
-            // Enable hardware CRC calculation
-            tracing::info!("Enabling TashTalk CRC calculation...");
-            if let Err(e) = tashtalk_instance
-                .set_features(tashtalk::TashTalkFeatures::new().with_crc_calculation())
-                .await
-            {
-                tracing::error!("Failed to set TashTalk features: {:?}", e);
-            }
-
-            // Register our node ID with TashTalk so it will ACK packets for us
-            match _addressing_handle.addr().await {
-                Ok(addr) => {
-                    let node_id = addr.node_number;
-                    tracing::info!("Setting TashTalk node ID bits for node {}", node_id);
-                    let mut node_bits = [0u8; 32];
-                    let byte_idx = (node_id / 8) as usize;
-                    let bit_idx = node_id % 8;
-                    node_bits[byte_idx] |= 1 << bit_idx;
-                    
-                    if let Err(e) = tashtalk_instance.set_node_ids(node_bits).await {
-                        tracing::error!("Failed to set TashTalk node IDs: {:?}", e);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to get our AppleTalk address for TashTalk setup: {:?}", e);
-                }
-            }
-
-            tracing::info!("Starting TashTalk async loop");
-            loop {
-                tokio::select! {
-                    frame_opt = tashtalk_rx.recv() => {
-                        if let Some(frame) = frame_opt {
-                            if let Err(e) = tashtalk_instance.send_frame(&frame).await {
-                                tracing::error!("TashTalk send_frame error: {:?}", e);
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    res = tashtalk_instance.receive_frame() => {
-                        match res {
-                            Ok(Some(data)) => {
-                                if data.len() < 3 { continue; }
-                                // Ensure LLAP packet is formed correctly
-                                // TashTalk frames come packed without FCS bytes if crc_checking is not turned on
-                                if let Ok(llap) = LlapPacket::parse(&data) {
-                                    match llap.type_ {
-                                        LlapType::DdpShort => {
-                                            tracing::info!("TashTalk: LocalTalk DDP Short");
-                                            if let Ok(headers) = DdpPacket::parse_short(
-                                                &data[3..],
-                                                llap.dst_node,
-                                                llap.src_node,
-                                            ) {
-                                                tracing::info!("LLAP: {:?}, DDP Short: {:?}", llap, headers);
-                                                let payload = data[8..].to_vec().into_boxed_slice();
-                                                ddp_handle.received_parsed_pkt(
-                                                    headers,
-                                                    payload,
-                                                    aarp::AddressSource::LocalTalk,
-                                                    [0; 6], // Mac is unused for LocalTalk Node
-                                                );
-                                            }
-                                        }
-                                        LlapType::DdpLong => {
-                                            tracing::info!("TashTalk: LocalTalk DDP Long");
-                                            if let Ok(headers) = DdpPacket::parse(&data[3..]) {
-                                                let payload = data[(3 + DdpPacket::LEN)..].to_vec().into_boxed_slice();
-                                                ddp_handle.received_parsed_pkt(
-                                                    headers,
-                                                    payload,
-                                                    aarp::AddressSource::LocalTalk,
-                                                    [0; 6], // Mac is unused for LocalTalk Node
-                                                );
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                tracing::error!("TashTalk receive error: {:?}", e);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
+    /// Configure an EtherTalk transport on the given network interface.
+    pub fn ethernet(mut self, intf: &str) -> Self {
+        self.ethernet_intf = Some(intf.to_string());
         self
     }
 
-    pub fn get_mac(&self) -> [u8; 6] {
+    /// Configure a LocalTalk transport via a TashTalk serial adapter.
+    ///
+    /// The serial port is opened during [`build`](Self::build). The TashTalk
+    /// async task (including node-ID registration) is started inside
+    /// [`PacketProcessor::run`], which already receives the `addressing` and
+    /// `ddp` handles needed for that setup.
+    pub fn localtalk(mut self, serial_path: &str) -> Self {
+        self.localtalk_serial_path = Some(serial_path.to_string());
+        self
+    }
+
+    /// Finalise the builder: bind Ethernet sockets and open the serial port as configured.
+    pub fn build(self) -> Result<(PacketProcessor, OutboundHandle), Error> {
+        let mut sockets: Vec<BoundSocket> = Vec::new();
+        let mut our_mac: Option<[u8; 6]> = None;
+
+        // ── EtherTalk setup ──────────────────────────────────────────────────
+        if let Some(intf) = self.ethernet_intf {
+            let c_intf = CString::new(intf.as_str()).expect("failed to parse intf name");
+            let mut ifreq = unsafe { MaybeUninit::<libc::ifreq>::zeroed().assume_init() };
+
+            // Open a temporary socket to query the interface index and MAC.
+            let tmp_sock = Socket::new(
+                libc::AF_PACKET.into(),
+                libc::SOCK_RAW.into(),
+                Some(libc::ETH_P_ALL.into()),
+            )?;
+
+            unsafe {
+                c_intf.as_ptr().copy_to(
+                    ifreq.ifr_name.as_mut_ptr(),
+                    c_intf.as_bytes_with_nul().len(),
+                );
+                let res = libc::ioctl(
+                    tmp_sock.as_raw_fd(),
+                    libc::SIOCGIFHWADDR,
+                    &ifreq as *const _,
+                );
+                if res < 0 {
+                    panic!("SIOCGIFHWADDR failed");
+                }
+            }
+
+            let mac: [u8; 6] = unsafe {
+                let d = ifreq.ifr_ifru.ifru_hwaddr.sa_data;
+                [d[0] as u8, d[1] as u8, d[2] as u8, d[3] as u8, d[4] as u8, d[5] as u8]
+            };
+            our_mac = Some(mac);
+
+            unsafe {
+                let res = libc::ioctl(tmp_sock.as_raw_fd(), libc::SIOCGIFINDEX, &ifreq as *const _);
+                if res < 0 {
+                    panic!("SIOCGIFINDEX failed");
+                }
+            }
+
+            let if_index = unsafe { ifreq.ifr_ifru.ifru_ifindex };
+            drop(tmp_sock);
+
+            // ETH_P_ATALK and ETH_P_AARP for Phase 1; ETH_P_802_2 for Phase 2 LLC/SNAP.
+            let protocols = [libc::ETH_P_ATALK, libc::ETH_P_AARP, libc::ETH_P_802_2];
+
+            for proto in protocols {
+                tracing::info!("Creating socket for protocol: 0x{:04x}", proto);
+                let sock = Socket::new(
+                    libc::AF_PACKET.into(),
+                    libc::SOCK_RAW.into(),
+                    Some(proto.into()),
+                )?;
+
+                // Enable promiscuous mode so we receive Apple's broadcast MAC.
+                let mreq = libc::packet_mreq {
+                    mr_ifindex: if_index,
+                    mr_type: libc::PACKET_MR_PROMISC as u16,
+                    mr_alen: 0,
+                    mr_address: [0; 8],
+                };
+
+                if unsafe {
+                    libc::setsockopt(
+                        sock.as_raw_fd(),
+                        libc::SOL_PACKET,
+                        libc::PACKET_ADD_MEMBERSHIP,
+                        &mreq as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&mreq) as libc::socklen_t,
+                    )
+                } < 0
+                {
+                    bail!("failed to set promiscuous mode on sock");
+                }
+
+                // Also explicitly join Apple's multicast broadcast address.
+                let apple_mcast = libc::packet_mreq {
+                    mr_ifindex: if_index,
+                    mr_type: libc::PACKET_MR_MULTICAST as u16,
+                    mr_alen: 6,
+                    mr_address: [0x09, 0x00, 0x07, 0xff, 0xff, 0xff, 0, 0],
+                };
+
+                if unsafe {
+                    libc::setsockopt(
+                        sock.as_raw_fd(),
+                        libc::SOL_PACKET,
+                        libc::PACKET_ADD_MEMBERSHIP,
+                        &apple_mcast as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&apple_mcast) as libc::socklen_t,
+                    )
+                } < 0
+                {
+                    tracing::warn!("failed to add Apple multicast address - continuing anyway");
+                }
+
+                tracing::info!(
+                    "Successfully bound socket for protocol 0x{:04x} to interface index {}",
+                    proto,
+                    if_index
+                );
+
+                let addr = libc::sockaddr_ll {
+                    sll_family: libc::AF_PACKET as u16,
+                    sll_protocol: u16::to_be(proto as u16),
+                    sll_ifindex: if_index,
+                    sll_hatype: 0,
+                    sll_pkttype: 0,
+                    sll_halen: 0,
+                    sll_addr: [0; 8],
+                };
+
+                unsafe {
+                    let res = libc::bind(
+                        sock.as_raw_fd(),
+                        &addr as *const _ as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_ll>() as u32,
+                    );
+                    if res < 0 {
+                        let err = std::io::Error::last_os_error().raw_os_error().unwrap();
+                        panic!("bind failed: {err}");
+                    }
+                }
+
+                sockets.push(BoundSocket { socket: sock, protocol: proto as u16 });
+            }
+        }
+
+        // ── LocalTalk / TashTalk setup ───────────────────────────────────────
+        // Open the serial port now so failures surface at build time.
+        // The async task is deferred to run() where addressing/ddp handles are available.
+        let tashtalk = if let Some(path) = self.localtalk_serial_path {
+            let stream = tokio_serial::new(&path, 1_000_000)
+                .flow_control(tokio_serial::FlowControl::Hardware)
+                .open_native_async()
+                .expect("Failed to open serial port for TashTalk");
+            Some(TashTalk::new(stream))
+        } else {
+            None
+        };
+
+        let (outbound_tx, outbound_rx) = mpsc::channel(100);
+
+        let processor = PacketProcessor {
+            sockets,
+            outbound_rx,
+            our_mac,
+            tashtalk,
+        };
+        let handle = OutboundHandle { tx: outbound_tx };
+
+        Ok((processor, handle))
+    }
+}
+
+// ── PacketProcessor ───────────────────────────────────────────────────────────
+
+impl PacketProcessor {
+    pub fn builder() -> PacketProcessorBuilder {
+        PacketProcessorBuilder::new()
+    }
+
+    /// Returns the Ethernet MAC address of the configured interface, or `None`
+    /// if no EtherTalk transport was added.
+    pub fn get_mac(&self) -> Option<[u8; 6]> {
         self.our_mac
     }
 
     pub async fn run(self, addressing: addressing::AddressingHandle, ddp: ddp::DdpHandle) {
-        // Spawn async receiver tasks for all ethernet sockets
+        // Spawn async receiver tasks for all Ethernet sockets.
         for bound_sock in &self.sockets {
             let sock_clone = bound_sock
                 .socket
@@ -358,7 +315,6 @@ impl PacketProcessor {
                     if read > 0 {
                         let data = &ethertalk_buf[..read as usize];
 
-                        // Check protocol type to determine parsing strategy
                         if protocol == libc::ETH_P_802_2 as u16 {
                             if data.len() >= 14 {
                                 let ethertype_or_len = u16::from_be_bytes([data[12], data[13]]);
@@ -459,9 +415,125 @@ impl PacketProcessor {
             });
         }
 
+        // ── TashTalk async task ──────────────────────────────────────────────
+        // Spawned here rather than in the builder because it needs the addressing
+        // and ddp handles, which callers construct using the OutboundHandle that
+        // build() returns.
+        let tashtalk_tx: Option<mpsc::Sender<Vec<u8>>> = if let Some(mut tashtalk_instance) = self.tashtalk {
+            let (tx, mut tashtalk_rx) = mpsc::channel::<Vec<u8>>(100);
+
+            let ddp_handle = ddp.clone();
+            let addressing_handle = addressing.clone();
+
+            tokio::spawn(async move {
+                tracing::info!("Resetting TashTalk buffers...");
+                if let Err(e) = tashtalk_instance.reset().await {
+                    tracing::error!("Failed to reset TashTalk: {:?}", e);
+                }
+
+                tracing::info!("Enabling TashTalk CRC calculation...");
+                if let Err(e) = tashtalk_instance
+                    .set_features(tashtalk::TashTalkFeatures::new().with_crc_calculation())
+                    .await
+                {
+                    tracing::error!("Failed to set TashTalk features: {:?}", e);
+                }
+
+                match addressing_handle.addr().await {
+                    Ok(addr) => {
+                        let node_id = addr.node_number;
+                        tracing::info!("Setting TashTalk node ID bits for node {}", node_id);
+                        let mut node_bits = [0u8; 32];
+                        let byte_idx = (node_id / 8) as usize;
+                        let bit_idx = node_id % 8;
+                        node_bits[byte_idx] |= 1 << bit_idx;
+                        if let Err(e) = tashtalk_instance.set_node_ids(node_bits).await {
+                            tracing::error!("Failed to set TashTalk node IDs: {:?}", e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to get our AppleTalk address for TashTalk setup: {:?}",
+                            e
+                        );
+                    }
+                }
+
+                tracing::info!("Starting TashTalk async loop");
+                loop {
+                    tokio::select! {
+                        frame_opt = tashtalk_rx.recv() => {
+                            if let Some(frame) = frame_opt {
+                                if let Err(e) = tashtalk_instance.send_frame(&frame).await {
+                                    tracing::error!("TashTalk send_frame error: {:?}", e);
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        res = tashtalk_instance.receive_frame() => {
+                            match res {
+                                Ok(Some(data)) => {
+                                    if data.len() < 3 { continue; }
+                                    if let Ok(llap) = LlapPacket::parse(&data) {
+                                        match llap.type_ {
+                                            LlapType::DdpShort => {
+                                                tracing::info!("TashTalk: LocalTalk DDP Short");
+                                                if let Ok(headers) = DdpPacket::parse_short(
+                                                    &data[3..],
+                                                    llap.dst_node,
+                                                    llap.src_node,
+                                                ) {
+                                                    tracing::info!(
+                                                        "LLAP: {:?}, DDP Short: {:?}",
+                                                        llap,
+                                                        headers
+                                                    );
+                                                    let payload = data[8..].to_vec().into_boxed_slice();
+                                                    ddp_handle.received_parsed_pkt(
+                                                        headers,
+                                                        payload,
+                                                        aarp::AddressSource::LocalTalk,
+                                                        [0; 6],
+                                                    );
+                                                }
+                                            }
+                                            LlapType::DdpLong => {
+                                                tracing::info!("TashTalk: LocalTalk DDP Long");
+                                                if let Ok(headers) = DdpPacket::parse(&data[3..]) {
+                                                    let payload =
+                                                        data[(3 + DdpPacket::LEN)..].to_vec().into_boxed_slice();
+                                                    ddp_handle.received_parsed_pkt(
+                                                        headers,
+                                                        payload,
+                                                        aarp::AddressSource::LocalTalk,
+                                                        [0; 6],
+                                                    );
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    tracing::error!("TashTalk receive error: {:?}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+
+            Some(tx)
+        } else {
+            None
+        };
+
+        // ── Outbound TX loop ─────────────────────────────────────────────────
+        let our_mac = self.our_mac.unwrap_or([0; 6]);
         let mut rx = self.outbound_rx;
         let sockets = self.sockets;
-        let tashtalk_tx = self.tashtalk_tx;
 
         while let Some(pkt) = rx.recv().await {
             let mut output_buf: [u8; 1500] = [0u8; 1500];
@@ -471,19 +543,11 @@ impl PacketProcessor {
                     match pkt.dest_node {
                         addressing::Node::EtherTalkPhase1(mac) => {
                             output_buf[0..6].copy_from_slice(&mac);
-                            output_buf[6..12].copy_from_slice(&self.our_mac);
+                            output_buf[6..12].copy_from_slice(&our_mac);
                             output_buf[12] = 0x80;
                             output_buf[13] = 0x9B;
-                            let dst_node = if pkt.payload.len() > 8 {
-                                pkt.payload[8]
-                            } else {
-                                0
-                            };
-                            let src_node = if pkt.payload.len() > 9 {
-                                pkt.payload[9]
-                            } else {
-                                0
-                            };
+                            let dst_node = if pkt.payload.len() > 8 { pkt.payload[8] } else { 0 };
+                            let src_node = if pkt.payload.len() > 9 { pkt.payload[9] } else { 0 };
                             output_buf[14] = dst_node;
                             output_buf[15] = src_node;
                             output_buf[16] = 2;
@@ -493,7 +557,7 @@ impl PacketProcessor {
                         }
                         addressing::Node::EtherTalkPhase2(mac) => {
                             output_buf[0..6].copy_from_slice(&mac);
-                            output_buf[6..12].copy_from_slice(&self.our_mac);
+                            output_buf[6..12].copy_from_slice(&our_mac);
                             let payload_len = pkt.payload.len();
                             let total_payload = 8 + payload_len;
                             output_buf[12] = (total_payload >> 8) as u8;
@@ -510,11 +574,6 @@ impl PacketProcessor {
                             14 + total_payload
                         }
                         addressing::Node::LocalTalk(node_id) => {
-                            // LocalTalk always uses DDP Short — there are no routers,
-                            // so network numbers are always 0 and the short 5-byte
-                            // header is correct per the AppleTalk spec.
-                            // src_node comes from our own LocalTalk node ID supplied
-                            // by the DDP layer via DataLinkPacket::src_node_id.
                             let llap_pkt = LlapPacket {
                                 dst_node: node_id,
                                 src_node: pkt.src_node_id,
@@ -528,10 +587,8 @@ impl PacketProcessor {
                             output_buf[header_len..header_len + payload_len]
                                 .copy_from_slice(&pkt.payload);
 
-                            // Do NOT append trailing zero CRC bytes here!
-                            // If SetFeatures Bit 7 is enabled, TashTalk expects 2 dummy
-                            // bytes at the end of the payload to overwrite with the real CRC,
-                            // AND they MUST be included in the total size sent!
+                            // TashTalk with CRC calculation (Bit 7) expects 2 dummy bytes
+                            // at the end that it overwrites with the real CRC.
                             let final_size = header_len + payload_len + 2;
                             output_buf[final_size - 2] = 0;
                             output_buf[final_size - 1] = 0;
@@ -545,7 +602,7 @@ impl PacketProcessor {
                     match pkt.dest_node {
                         addressing::Node::EtherTalkPhase1(mac) => {
                             output_buf[0..6].copy_from_slice(&mac);
-                            output_buf[6..12].copy_from_slice(&self.our_mac);
+                            output_buf[6..12].copy_from_slice(&our_mac);
                             output_buf[12] = 0x80;
                             output_buf[13] = 0xF3;
                             output_buf[14..14 + payload_len].copy_from_slice(&pkt.payload);
@@ -553,7 +610,7 @@ impl PacketProcessor {
                         }
                         addressing::Node::EtherTalkPhase2(mac) => {
                             output_buf[0..6].copy_from_slice(&mac);
-                            output_buf[6..12].copy_from_slice(&self.our_mac);
+                            output_buf[6..12].copy_from_slice(&our_mac);
                             let total_payload = 8 + payload_len;
                             output_buf[12] = (total_payload >> 8) as u8;
                             output_buf[13] = (total_payload & 0xFF) as u8;
@@ -603,7 +660,9 @@ impl PacketProcessor {
             }
         }
     }
-} // impl PacketProcessor
+}
+
+// ── OutboundHandle ────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct OutboundHandle {
@@ -617,10 +676,11 @@ impl OutboundHandle {
 
     pub async fn send(&self, packet: DataLinkPacket) -> Result<(), Error> {
         self.tx.send(packet).await?;
-
         Ok(())
     }
 }
+
+// ── AFP time helpers ──────────────────────────────────────────────────────────
 
 /// Converts a SystemTime to a 32-bit AFP date for **AFP 2.x** (seconds since Jan 1, 2000).
 ///
