@@ -375,7 +375,7 @@ impl Atp {
         // Ensure next_tid is higher than any response TID we've used
         // This maintains monotonic TID sequence across requests and responses
         if resp.tid >= self.next_tid {
-            self.next_tid = resp.tid + 1;
+            self.next_tid = resp.tid.wrapping_add(1);
         }
     }
 
