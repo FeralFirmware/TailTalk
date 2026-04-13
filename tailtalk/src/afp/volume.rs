@@ -12,6 +12,13 @@ use crate::{time_to_afp, time_to_afp_v1};
 use tracing::{error, warn};
 use xattr;
 
+/// Extended attribute name for the 32-byte Finder Info blob.
+/// macOS uses no namespace prefix; Linux requires the "user." namespace.
+#[cfg(target_os = "macos")]
+const FINDER_INFO_XATTR: &str = "com.apple.FinderInfo";
+#[cfg(not(target_os = "macos"))]
+const FINDER_INFO_XATTR: &str = "user.com.apple.FinderInfo";
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct Node {
@@ -39,10 +46,10 @@ impl Node {
         self.data_fork = None;
     }
 
-    /// Read Finder Info from xattr "user.com.apple.FinderInfo"
+    /// Read Finder Info from the platform xattr.
     pub fn get_finder_info(&self, volume_root: &Path) -> [u8; 32] {
         let absolute_path = volume_root.join(&self.path);
-        match xattr::get(&absolute_path, "user.com.apple.FinderInfo") {
+        match xattr::get(&absolute_path, FINDER_INFO_XATTR) {
             Ok(Some(data)) => {
                 let mut info = [0u8; 32];
                 if data.len() >= 32 {
@@ -55,10 +62,10 @@ impl Node {
         }
     }
 
-    /// Write Finder Info to xattr "user.com.apple.FinderInfo"
+    /// Write Finder Info to the platform xattr.
     pub fn set_finder_info(&self, volume_root: &Path, info: &[u8; 32]) -> Result<(), AfpError> {
         let absolute_path = volume_root.join(&self.path);
-        xattr::set(&absolute_path, "user.com.apple.FinderInfo", info).map_err(|e| {
+        xattr::set(&absolute_path, FINDER_INFO_XATTR, info).map_err(|e| {
             error!("Failed to set Finder Info for {:?}: {:?}", self.path, e);
             AfpError::AccessDenied
         })

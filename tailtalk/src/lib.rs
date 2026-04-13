@@ -1,15 +1,12 @@
-use anyhow::{Error, bail};
-use socket2::Socket;
-use std::ffi::CString;
-use std::mem::MaybeUninit;
-use std::os::fd::AsRawFd;
+use anyhow::Error;
+use futures::StreamExt;
+use mac_address::mac_address_by_name;
 use std::time::SystemTime;
 use tailtalk_packets::aarp;
 use tailtalk_packets::ddp::DdpPacket;
 use tailtalk_packets::ethertalk::{EtherTalkPhase2Frame, EtherTalkPhase2Type};
 use tailtalk_packets::llap::{LlapPacket, LlapType};
 use tashtalk::TashTalk;
-use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tokio_serial::SerialPortBuilderExt;
 
@@ -41,13 +38,22 @@ pub struct DataLinkPacket {
     pub src_node_id: u8,
 }
 
-struct BoundSocket {
-    socket: Socket,
-    protocol: u16,
+/// Trivial pcap codec that boxes the raw Ethernet frame bytes.
+struct EtherTalkCodec;
+
+impl pcap::PacketCodec for EtherTalkCodec {
+    type Item = Box<[u8]>;
+
+    fn decode(&mut self, packet: pcap::Packet) -> Self::Item {
+        packet.data.into()
+    }
 }
 
 pub struct PacketProcessor {
-    sockets: Vec<BoundSocket>,
+    /// RX capture, consumed into an async stream in `run()`.
+    pcap_rx: Option<pcap::Capture<pcap::Active>>,
+    /// TX capture, used for packet injection in the outbound loop.
+    pcap_tx: Option<pcap::Capture<pcap::Active>>,
     outbound_rx: mpsc::Receiver<DataLinkPacket>,
     our_mac: Option<[u8; 6]>,
     /// Opened TashTalk instance, stored here and handed to the async task in `run()`.
@@ -111,137 +117,37 @@ impl PacketProcessorBuilder {
         self
     }
 
-    /// Finalise the builder: bind Ethernet sockets and open the serial port as configured.
+    /// Finalise the builder: open pcap captures and the serial port as configured.
     pub fn build(self) -> Result<(PacketProcessor, OutboundHandle), Error> {
-        let mut sockets: Vec<BoundSocket> = Vec::new();
+        let mut pcap_rx: Option<pcap::Capture<pcap::Active>> = None;
+        let mut pcap_tx: Option<pcap::Capture<pcap::Active>> = None;
         let mut our_mac: Option<[u8; 6]> = None;
 
         // ── EtherTalk setup ──────────────────────────────────────────────────
-        if let Some(intf) = self.ethernet_intf {
-            let c_intf = CString::new(intf.as_str()).expect("failed to parse intf name");
-            let mut ifreq = unsafe { MaybeUninit::<libc::ifreq>::zeroed().assume_init() };
+        if let Some(ref intf) = self.ethernet_intf {
+            // Retrieve the interface MAC address cross-platform.
+            let mac = mac_address_by_name(intf)?
+                .ok_or_else(|| anyhow::anyhow!("no MAC address found for interface {}", intf))?;
+            our_mac = Some(mac.bytes());
 
-            // Open a temporary socket to query the interface index and MAC.
-            let tmp_sock = Socket::new(
-                libc::AF_PACKET.into(),
-                libc::SOCK_RAW.into(),
-                Some(libc::ETH_P_ALL.into()),
-            )?;
+            // BPF filter: Phase 1 AppleTalk (0x809B), Phase 1 AARP (0x80F3),
+            // and any IEEE 802.2 LLC/SNAP frame (length field ≤ 1500) for Phase 2.
+            let filter = "ether proto 0x809B or ether proto 0x80F3 or (ether[12:2] <= 1500)";
 
-            unsafe {
-                c_intf.as_ptr().copy_to(
-                    ifreq.ifr_name.as_mut_ptr(),
-                    c_intf.as_bytes_with_nul().len(),
-                );
-                let res = libc::ioctl(
-                    tmp_sock.as_raw_fd(),
-                    libc::SIOCGIFHWADDR,
-                    &ifreq as *const _,
-                );
-                if res < 0 {
-                    panic!("SIOCGIFHWADDR failed");
-                }
-            }
+            // RX capture – promiscuous mode, filter applied.
+            let mut rx = pcap::Capture::from_device(intf.as_str())?
+                .promisc(true)
+                .open()?;
+            rx.filter(filter, true)?;
+            pcap_rx = Some(rx);
 
-            let mac: [u8; 6] = unsafe {
-                let d = ifreq.ifr_ifru.ifru_hwaddr.sa_data;
-                [d[0] as u8, d[1] as u8, d[2] as u8, d[3] as u8, d[4] as u8, d[5] as u8]
-            };
-            our_mac = Some(mac);
+            // TX capture – separate handle used solely for packet injection.
+            let tx = pcap::Capture::from_device(intf.as_str())?
+                .promisc(true)
+                .open()?;
+            pcap_tx = Some(tx);
 
-            unsafe {
-                let res = libc::ioctl(tmp_sock.as_raw_fd(), libc::SIOCGIFINDEX, &ifreq as *const _);
-                if res < 0 {
-                    panic!("SIOCGIFINDEX failed");
-                }
-            }
-
-            let if_index = unsafe { ifreq.ifr_ifru.ifru_ifindex };
-            drop(tmp_sock);
-
-            // ETH_P_ATALK and ETH_P_AARP for Phase 1; ETH_P_802_2 for Phase 2 LLC/SNAP.
-            let protocols = [libc::ETH_P_ATALK, libc::ETH_P_AARP, libc::ETH_P_802_2];
-
-            for proto in protocols {
-                tracing::info!("Creating socket for protocol: 0x{:04x}", proto);
-                let sock = Socket::new(
-                    libc::AF_PACKET.into(),
-                    libc::SOCK_RAW.into(),
-                    Some(proto.into()),
-                )?;
-
-                // Enable promiscuous mode so we receive Apple's broadcast MAC.
-                let mreq = libc::packet_mreq {
-                    mr_ifindex: if_index,
-                    mr_type: libc::PACKET_MR_PROMISC as u16,
-                    mr_alen: 0,
-                    mr_address: [0; 8],
-                };
-
-                if unsafe {
-                    libc::setsockopt(
-                        sock.as_raw_fd(),
-                        libc::SOL_PACKET,
-                        libc::PACKET_ADD_MEMBERSHIP,
-                        &mreq as *const _ as *const libc::c_void,
-                        std::mem::size_of_val(&mreq) as libc::socklen_t,
-                    )
-                } < 0
-                {
-                    bail!("failed to set promiscuous mode on sock");
-                }
-
-                // Also explicitly join Apple's multicast broadcast address.
-                let apple_mcast = libc::packet_mreq {
-                    mr_ifindex: if_index,
-                    mr_type: libc::PACKET_MR_MULTICAST as u16,
-                    mr_alen: 6,
-                    mr_address: [0x09, 0x00, 0x07, 0xff, 0xff, 0xff, 0, 0],
-                };
-
-                if unsafe {
-                    libc::setsockopt(
-                        sock.as_raw_fd(),
-                        libc::SOL_PACKET,
-                        libc::PACKET_ADD_MEMBERSHIP,
-                        &apple_mcast as *const _ as *const libc::c_void,
-                        std::mem::size_of_val(&apple_mcast) as libc::socklen_t,
-                    )
-                } < 0
-                {
-                    tracing::warn!("failed to add Apple multicast address - continuing anyway");
-                }
-
-                tracing::info!(
-                    "Successfully bound socket for protocol 0x{:04x} to interface index {}",
-                    proto,
-                    if_index
-                );
-
-                let addr = libc::sockaddr_ll {
-                    sll_family: libc::AF_PACKET as u16,
-                    sll_protocol: u16::to_be(proto as u16),
-                    sll_ifindex: if_index,
-                    sll_hatype: 0,
-                    sll_pkttype: 0,
-                    sll_halen: 0,
-                    sll_addr: [0; 8],
-                };
-
-                unsafe {
-                    let res = libc::bind(
-                        sock.as_raw_fd(),
-                        &addr as *const _ as *const libc::sockaddr,
-                        std::mem::size_of::<libc::sockaddr_ll>() as u32,
-                    );
-                    if res < 0 {
-                        let err = std::io::Error::last_os_error().raw_os_error().unwrap();
-                        panic!("bind failed: {err}");
-                    }
-                }
-
-                sockets.push(BoundSocket { socket: sock, protocol: proto as u16 });
-            }
+            tracing::info!("EtherTalk pcap captures opened on {}", intf);
         }
 
         // ── LocalTalk / TashTalk setup ───────────────────────────────────────
@@ -260,7 +166,8 @@ impl PacketProcessorBuilder {
         let (outbound_tx, outbound_rx) = mpsc::channel(100);
 
         let processor = PacketProcessor {
-            sockets,
+            pcap_rx,
+            pcap_tx,
             outbound_rx,
             our_mac,
             tashtalk,
@@ -285,96 +192,91 @@ impl PacketProcessor {
     }
 
     pub async fn run(self, addressing: addressing::AddressingHandle, ddp: ddp::DdpHandle) {
-        // Spawn async receiver tasks for all Ethernet sockets.
-        for bound_sock in &self.sockets {
-            let sock_clone = bound_sock
-                .socket
-                .try_clone()
-                .expect("failed to clone socket");
-            sock_clone.set_nonblocking(true).unwrap();
-            let protocol = bound_sock.protocol;
-            let ddp = ddp.clone();
-            let addressing = addressing.clone();
+        // ── EtherTalk RX task ────────────────────────────────────────────────
+        if let Some(rx_cap) = self.pcap_rx {
+            let rx_cap = match rx_cap.setnonblock() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("Failed to set pcap nonblocking: {e}");
+                    return;
+                }
+            };
+            let stream = match rx_cap.stream(EtherTalkCodec) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Failed to create pcap stream: {e}");
+                    return;
+                }
+            };
 
-            let async_fd = AsyncFd::new(sock_clone).unwrap();
+            let ddp_rx = ddp.clone();
+            let addressing_rx = addressing.clone();
+
             tokio::spawn(async move {
-                tracing::info!("Spawned rx task for interface 0x{:04x}", protocol);
-                loop {
-                    let mut guard = async_fd.readable().await.unwrap();
-                    let mut ethertalk_buf = [0u8; 1500];
-                    let raw_fd = async_fd.get_ref().as_raw_fd();
-                    let read = unsafe {
-                        libc::recv(
-                            raw_fd,
-                            ethertalk_buf.as_mut_ptr() as *mut libc::c_void,
-                            ethertalk_buf.len(),
-                            libc::MSG_DONTWAIT,
-                        )
+                tracing::info!("EtherTalk RX task started");
+                tokio::pin!(stream);
+                while let Some(result) = stream.next().await {
+                    let data: Box<[u8]> = match result {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::error!("pcap rx error: {e}");
+                            break;
+                        }
                     };
 
-                    if read > 0 {
-                        let data = &ethertalk_buf[..read as usize];
+                    if data.len() < 14 {
+                        continue;
+                    }
 
-                        if protocol == libc::ETH_P_802_2 as u16 {
-                            if data.len() >= 14 {
-                                let ethertype_or_len = u16::from_be_bytes([data[12], data[13]]);
-                                if ethertype_or_len <= 1500
-                                    && let Ok(header) = EtherTalkPhase2Frame::parse(data) {
-                                        let payload = &ethertalk_buf
-                                            [EtherTalkPhase2Frame::len()..read as usize];
-                                        match header.protocol {
-                                            EtherTalkPhase2Type::Ddp => ddp.received_pkt(
-                                                payload,
-                                                aarp::AddressSource::EtherTalkPhase2,
-                                                header.src_mac,
-                                            ),
-                                            EtherTalkPhase2Type::Aarp => addressing
-                                                .received_pkt(
-                                                    payload,
-                                                    aarp::AddressSource::EtherTalkPhase2,
-                                                )
-                                                .expect("failed to relay aarp pkt"),
-                                        }
-                                    }
-                            }
-                        } else if let Ok(header) = EtherTalkPhase2Frame::parse(data) {
-                            let payload =
-                                &ethertalk_buf[EtherTalkPhase2Frame::len()..read as usize];
+                    let ethertype_or_len = u16::from_be_bytes([data[12], data[13]]);
+
+                    if ethertype_or_len <= 1500 {
+                        // EtherTalk Phase 2 – IEEE 802.2 LLC/SNAP encapsulation.
+                        if let Ok(header) = EtherTalkPhase2Frame::parse(&data) {
+                            let payload = &data[EtherTalkPhase2Frame::len()..];
                             match header.protocol {
-                                EtherTalkPhase2Type::Ddp => ddp.received_pkt(
+                                EtherTalkPhase2Type::Ddp => ddp_rx.received_pkt(
                                     payload,
                                     aarp::AddressSource::EtherTalkPhase2,
                                     header.src_mac,
                                 ),
-                                EtherTalkPhase2Type::Aarp => addressing
-                                    .received_pkt(payload, aarp::AddressSource::EtherTalkPhase2)
-                                    .expect("failed to relay aarp pkt"),
+                                EtherTalkPhase2Type::Aarp => {
+                                    if let Err(e) = addressing_rx.received_pkt(
+                                        payload,
+                                        aarp::AddressSource::EtherTalkPhase2,
+                                    ) {
+                                        tracing::error!("failed to relay Phase 2 AARP: {e}");
+                                    }
+                                }
                             }
-                        } else if protocol == libc::ETH_P_AARP as u16 {
-                            if data.len() > 14 {
-                                let payload = &ethertalk_buf[14..read as usize];
-                                addressing
-                                    .received_pkt(payload, aarp::AddressSource::EtherTalkPhase1)
-                                    .expect("failed to relay aarp pkt");
+                        }
+                    } else if ethertype_or_len == 0x80F3 {
+                        // EtherTalk Phase 1 AARP.
+                        if data.len() > 14 {
+                            if let Err(e) = addressing_rx.received_pkt(
+                                &data[14..],
+                                aarp::AddressSource::EtherTalkPhase1,
+                            ) {
+                                tracing::error!("failed to relay Phase 1 AARP: {e}");
                             }
-                        } else if protocol == libc::ETH_P_ATALK as u16
-                            && data.len() > 14 {
-                                let llap_data = &data[14..];
-                                if let Ok(llap) = LlapPacket::parse(llap_data) {
-                                    match llap.type_ {
-                                        LlapType::DdpShort => {
-                                            let payload = &ethertalk_buf
-                                                [(14 + LlapPacket::LEN)..read as usize];
+                        }
+                    } else if ethertype_or_len == 0x809B {
+                        // EtherTalk Phase 1 – LLAP encapsulated in Ethernet.
+                        if data.len() > 14 + LlapPacket::LEN {
+                            if let Ok(llap) = LlapPacket::parse(&data[14..]) {
+                                match llap.type_ {
+                                    LlapType::DdpShort => {
+                                        let payload = &data[(14 + LlapPacket::LEN)..];
+                                        if payload.len() >= 5 {
                                             if let Ok(headers) = DdpPacket::parse_short(
                                                 payload,
                                                 llap.dst_node,
                                                 llap.src_node,
-                                            ) && payload.len() >= 5
-                                            {
+                                            ) {
                                                 let ddp_payload = payload[5..].into();
                                                 let source_mac: [u8; 6] =
-                                                    ethertalk_buf[6..12].try_into().unwrap();
-                                                ddp.received_parsed_pkt(
+                                                    data[6..12].try_into().unwrap();
+                                                ddp_rx.received_parsed_pkt(
                                                     headers,
                                                     ddp_payload,
                                                     aarp::AddressSource::EtherTalkPhase1,
@@ -382,34 +284,28 @@ impl PacketProcessor {
                                                 );
                                             }
                                         }
-                                        LlapType::DdpLong => {
-                                            let payload = &ethertalk_buf
-                                                [(14 + LlapPacket::LEN)..read as usize];
-                                            if let Ok(headers) = DdpPacket::parse(payload)
-                                                && payload.len() >= DdpPacket::LEN {
-                                                    let ddp_payload =
-                                                        payload[DdpPacket::LEN..].into();
-                                                    let source_mac: [u8; 6] =
-                                                        ethertalk_buf[6..12].try_into().unwrap();
-                                                    ddp.received_parsed_pkt(
-                                                        headers,
-                                                        ddp_payload,
-                                                        aarp::AddressSource::EtherTalkPhase1,
-                                                        source_mac,
-                                                    );
-                                                }
-                                        }
-                                        _ => {}
                                     }
+                                    LlapType::DdpLong => {
+                                        let payload = &data[(14 + LlapPacket::LEN)..];
+                                        if payload.len() >= DdpPacket::LEN {
+                                            if let Ok(headers) = DdpPacket::parse(payload) {
+                                                let ddp_payload =
+                                                    payload[DdpPacket::LEN..].into();
+                                                let source_mac: [u8; 6] =
+                                                    data[6..12].try_into().unwrap();
+                                                ddp_rx.received_parsed_pkt(
+                                                    headers,
+                                                    ddp_payload,
+                                                    aarp::AddressSource::EtherTalkPhase1,
+                                                    source_mac,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
-                    } else {
-                        let err = std::io::Error::last_os_error();
-                        if err.kind() == std::io::ErrorKind::WouldBlock {
-                            guard.clear_ready();
-                            continue;
                         }
-                        break;
                     }
                 }
             });
@@ -533,7 +429,7 @@ impl PacketProcessor {
         // ── Outbound TX loop ─────────────────────────────────────────────────
         let our_mac = self.our_mac.unwrap_or([0; 6]);
         let mut rx = self.outbound_rx;
-        let sockets = self.sockets;
+        let mut pcap_tx = self.pcap_tx;
 
         while let Some(pkt) = rx.recv().await {
             let mut output_buf: [u8; 1500] = [0u8; 1500];
@@ -636,17 +532,10 @@ impl PacketProcessor {
 
             match pkt.dest_node {
                 addressing::Node::EtherTalkPhase1(_) | addressing::Node::EtherTalkPhase2(_) => {
-                    let target_protocol = match pkt.protocol {
-                        DataLinkProtocol::Ddp => libc::ETH_P_ATALK as u16,
-                        DataLinkProtocol::Aarp => libc::ETH_P_AARP as u16,
-                    };
-
-                    if let Some(sock) = sockets.iter().find(|s| s.protocol == target_protocol) {
-                        if let Err(e) = sock.socket.send(&output_buf[..final_size]) {
-                            tracing::error!("failed to send packet: {}", e);
+                    if let Some(ref mut tx) = pcap_tx {
+                        if let Err(e) = tx.sendpacket(&output_buf[..final_size]) {
+                            tracing::error!("failed to send packet: {e}");
                         }
-                    } else {
-                        tracing::error!("No socket found for protocol {:04x}", target_protocol);
                     }
                 }
                 addressing::Node::LocalTalk(_) => {
