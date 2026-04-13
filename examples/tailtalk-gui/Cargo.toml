@@ -1,0 +1,24 @@
+[package]
+name = "tailtalk-gui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "tailtalk-gui"
+path = "main.rs"
+
+[dependencies]
+tailtalk = { path = "../../tailtalk" }
+tailtalk-packets = { path = "../../tailtalk-packets" }
+tokio = { version = "1.40", features = ["full"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+slint = "1"
+if-addrs = "0.13"
+serialport = "4"
+rfd = "0.15"
+
+[build-dependencies]
+slint-build = "1"

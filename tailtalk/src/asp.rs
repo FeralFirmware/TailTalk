@@ -260,8 +260,12 @@ impl Asp {
                         SPFunction::CloseSess => {
                             let session_id = header.session_id;
                             if let Some(sess) = sessions.get(&session_id) {
-                                // Only allow closing from the owner address
-                                if sess.addr == req.source {
+                                // Match on node identity only (network + node number), ignoring
+                                // socket. Clients open on socket X, commands arrive from X+1
+                                // (updating sess.addr), then CloseSess arrives from X again.
+                                if sess.addr.network_number == req.source.network_number
+                                    && sess.addr.node_number == req.source.node_number
+                                {
                                     tracing::info!("ASP Closing Session {}", session_id);
                                     sessions.remove(&session_id);
 

@@ -1,0 +1,101 @@
+import { Button, ComboBox, LineEdit, GroupBox, HorizontalBox, VerticalBox } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    title: "TailTalk AFP Server";
+    min-width: 400px;
+    min-height: 200px;
+    preferred-width: 540px;
+    preferred-height: 280px;
+
+    in-out property <string> server-name: "TailTalk AFP";
+    in property <[string]> ethernet-interfaces;
+    in-out property <int> selected-ethernet: 0;
+    in property <[string]> tashtalk-ports;
+    in-out property <int> selected-tashtalk: 0;
+    in-out property <string> volume-path;
+    in property <bool> running: false;
+
+    callback start-stop();
+    callback browse-volume();
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+
+        GroupBox {
+            title: "Configuration";
+
+            VerticalBox {
+                spacing: 6px;
+
+                HorizontalBox {
+                    Text { text: "Server Name:"; min-width: 140px; vertical-alignment: center; }
+                    LineEdit {
+                        text <=> root.server-name;
+                        placeholder-text: "TailTalk AFP";
+                        horizontal-stretch: 1;
+                        enabled: !root.running;
+                    }
+                }
+
+                HorizontalBox {
+                    Text { text: "Ethernet Interface:"; min-width: 140px; vertical-alignment: center; }
+                    ComboBox {
+                        model: root.ethernet-interfaces;
+                        current-index <=> root.selected-ethernet;
+                        horizontal-stretch: 1;
+                        enabled: !root.running;
+                    }
+                }
+
+                HorizontalBox {
+                    Text { text: "TashTalk Port:"; min-width: 140px; vertical-alignment: center; }
+                    ComboBox {
+                        model: root.tashtalk-ports;
+                        current-index <=> root.selected-tashtalk;
+                        horizontal-stretch: 1;
+                        enabled: !root.running;
+                    }
+                }
+
+                HorizontalBox {
+                    Text { text: "Volume Path:"; min-width: 140px; vertical-alignment: center; }
+                    LineEdit {
+                        text <=> root.volume-path;
+                        placeholder-text: "/path/to/share";
+                        horizontal-stretch: 1;
+                        enabled: !root.running;
+                    }
+                    Button {
+                        text: "Browse…";
+                        enabled: !root.running;
+                        clicked => { root.browse-volume(); }
+                    }
+                }
+            }
+        }
+
+        HorizontalBox {
+            spacing: 8px;
+
+            Rectangle {
+                width: 10px;
+                height: 10px;
+                border-radius: 5px;
+                background: root.running ? #22c55e : #9ca3af;
+                y: (parent.height - self.height) / 2;
+            }
+
+            Text {
+                text: root.running ? "Running" : "Stopped";
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+
+            Button {
+                text: root.running ? "Stop" : "Start";
+                clicked => { root.start-stop(); }
+            }
+        }
+    }
+}
