@@ -11,8 +11,10 @@ slint::include_modules!();
 enum ServerCommand {
     Start {
         server_name: String,
-        ethernet: String,
+        ethernet: Option<String>,
         tashtalk: Option<String>,
+        tashtalk_crc_generation: bool,
+        tashtalk_crc_checking: bool,
         volume: PathBuf,
     },
     Stop,
@@ -21,23 +23,16 @@ enum ServerCommand {
 // ── Interface enumeration ─────────────────────────────────────────────────────
 
 fn enumerate_ethernet() -> Vec<String> {
-    match if_addrs::get_if_addrs() {
-        Ok(ifaces) => {
-            let mut seen = std::collections::HashSet::new();
-            ifaces
-                .into_iter()
-                .filter(|i| !i.is_loopback())
-                .filter_map(|i| {
-                    if seen.insert(i.name.clone()) {
-                        Some(i.name)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+    let mut names = vec!["None".to_string()];
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        let mut seen = std::collections::HashSet::new();
+        for iface in ifaces {
+            if !iface.is_loopback() && seen.insert(iface.name.clone()) {
+                names.push(iface.name);
+            }
         }
-        Err(_) => vec![],
     }
+    names
 }
 
 fn enumerate_serial() -> Vec<String> {
@@ -107,15 +102,20 @@ fn main() -> anyhow::Result<()> {
             let eth_idx = ui.get_selected_ethernet() as usize;
             let tash_idx = ui.get_selected_tashtalk() as usize;
 
-            let Some(ethernet) = eth_names.get(eth_idx) else {
-                tracing::error!("No ethernet interface selected");
-                return;
-            };
+            let ethernet = eth_names
+                .get(eth_idx)
+                .filter(|s| s.as_str() != "None")
+                .cloned();
 
             let tashtalk = tash_names
                 .get(tash_idx)
                 .filter(|s| s.as_str() != "None")
                 .cloned();
+
+            if ethernet.is_none() && tashtalk.is_none() {
+                tracing::error!("At least one of Ethernet or TashTalk must be selected");
+                return;
+            }
 
             let volume = PathBuf::from(ui.get_volume_path().as_str());
             if volume.as_os_str().is_empty() {
@@ -125,8 +125,10 @@ fn main() -> anyhow::Result<()> {
 
             let _ = cmd_tx.try_send(ServerCommand::Start {
                 server_name: ui.get_server_name().to_string(),
-                ethernet: ethernet.clone(),
+                ethernet,
                 tashtalk,
+                tashtalk_crc_generation: ui.get_tashtalk_crc_generation(),
+                tashtalk_crc_checking: ui.get_tashtalk_crc_checking(),
                 volume,
             });
         }
@@ -159,6 +161,8 @@ async fn server_loop(
                 server_name,
                 ethernet,
                 tashtalk,
+                tashtalk_crc_generation,
+                tashtalk_crc_checking,
                 volume,
             } => {
                 // Abort any running server first
@@ -167,8 +171,15 @@ async fn server_loop(
                 }
 
                 let ui_w = ui_weak.clone();
-                let task =
-                    tokio::spawn(run_server(server_name, ethernet, tashtalk, volume, ui_w));
+                let task = tokio::spawn(run_server(
+                    server_name,
+                    ethernet,
+                    tashtalk,
+                    tashtalk_crc_generation,
+                    tashtalk_crc_checking,
+                    volume,
+                    ui_w,
+                ));
                 abort_handle = Some(task.abort_handle());
 
                 let ui_w = ui_weak.clone();
@@ -200,8 +211,10 @@ async fn server_loop(
 
 async fn run_server(
     server_name: String,
-    ethernet: String,
+    ethernet: Option<String>,
     tashtalk: Option<String>,
+    tashtalk_crc_generation: bool,
+    tashtalk_crc_checking: bool,
     volume: PathBuf,
     ui_weak: slint::Weak<AppWindow>,
 ) {
@@ -223,9 +236,19 @@ async fn run_server(
         .ok();
     };
 
-    let mut builder = PacketProcessor::builder().ethernet(&ethernet);
+    let mut builder = PacketProcessor::builder();
+    if let Some(ref intf) = ethernet {
+        builder = builder.ethernet(intf);
+    }
     if let Some(ref tty) = tashtalk {
-        builder = builder.localtalk(tty);
+        let mut features = tailtalk::TashTalkFeatures::new();
+        if tashtalk_crc_generation {
+            features = features.with_crc_calculation();
+        }
+        if tashtalk_crc_checking {
+            features = features.with_crc_checking();
+        }
+        builder = builder.localtalk(tty).tashtalk_features(features);
     }
 
     let (processor, handle) = match builder.build() {
@@ -275,14 +298,11 @@ async fn run_server(
         }
     };
 
-    let mac = match processor.get_mac() {
-        Some(m) => m,
-        None => {
-            tracing::error!("Ethernet MAC not available — ethernet interface is required");
-            set_stopped(ui_weak);
-            return;
-        }
-    };
+    // In LocalTalk-only mode there is no Ethernet MAC; use a zero placeholder.
+    // Addressing will still probe (probes are silently dropped with no pcap),
+    // confirm an address after the timeout, and hand it to TashTalk for node-ID
+    // registration.
+    let mac = processor.get_mac().unwrap_or([0u8; 6]);
 
     let addressing = Addressing::spawn(mac, handle.clone(), None);
     let processor_addressing = addressing.clone();
@@ -303,8 +323,15 @@ async fn run_server(
         }
     };
 
+    let transport_desc = match (&ethernet, &tashtalk) {
+        (Some(eth), Some(tty)) => format!("{eth} + {tty}"),
+        (Some(eth), None) => eth.clone(),
+        (None, Some(tty)) => tty.clone(),
+        (None, None) => unreachable!(),
+    };
+
     tokio::spawn(processor.run(processor_addressing, ddp));
-    tracing::info!("AFP server running on {ethernet}");
+    tracing::info!("AFP server running on {transport_desc}");
 
     // Keep this task alive until it is aborted via Stop
     std::future::pending::<()>().await;

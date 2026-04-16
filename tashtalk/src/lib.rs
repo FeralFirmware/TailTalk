@@ -5,6 +5,9 @@ use tokio_util::codec::Framed;
 pub mod codec;
 pub use codec::{TashTalkCodec, TashTalkCommand, TashTalkError};
 
+pub mod crc;
+pub use crc::{lt_crc, CrcCalculator};
+
 /// Features that can be enabled on firmware v2.1.0+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TashTalkFeatures {

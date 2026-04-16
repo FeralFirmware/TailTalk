@@ -60,10 +60,20 @@ pub struct AtpSendRelease {
     pub tid: u16,
 }
 
+/// A fire-and-forget ALO (at-least-once) packet — no pending transaction is registered
+/// and no response is waited on. Any response that arrives will be silently discarded.
+/// Used for ASP tickles.
+#[derive(Debug)]
+pub struct AtpSendAlo {
+    pub address: AtpAddress,
+    pub user_bytes: [u8; 4],
+}
+
 pub enum AtpCommand {
     SendRequest(AtpSendRequest),
     SendResponse(AtpSendResponse),
     SendRelease(AtpSendRelease),
+    SendAlo(AtpSendAlo),
 }
 
 pub struct AtpReceivedRequest {
@@ -158,6 +168,17 @@ pub struct AtpRequestor {
 }
 
 impl AtpRequestor {
+    /// Send an ALO (at-least-once) packet with no pending transaction registered.
+    /// Returns immediately after queueing — no response is awaited.
+    pub async fn send_alo(
+        &self,
+        address: AtpAddress,
+        user_bytes: [u8; 4],
+    ) -> Result<(), io::Error> {
+        let cmd = AtpCommand::SendAlo(AtpSendAlo { address, user_bytes });
+        self.cmd_tx.send(cmd).await.map_err(io::Error::other)
+    }
+
     pub async fn send_request(
         &self,
         address: AtpAddress,
@@ -263,6 +284,7 @@ impl Atp {
                             AtpCommand::SendRequest(req) => self.handle_send_request(req).await,
                             AtpCommand::SendResponse(resp) => self.handle_send_response(resp).await,
                             AtpCommand::SendRelease(rel) => self.handle_send_release(rel).await,
+                            AtpCommand::SendAlo(alo) => self.handle_send_alo(alo).await,
                         }
                     } else {
                         tracing::info!("ATP command channel closed");
@@ -377,6 +399,39 @@ impl Atp {
         if resp.tid >= self.next_tid {
             self.next_tid = resp.tid.wrapping_add(1);
         }
+    }
+
+    async fn handle_send_alo(&mut self, alo: AtpSendAlo) {
+        let tid = self.next_tid;
+        self.next_tid = self.next_tid.wrapping_add(1);
+
+        let packet = AtpPacket {
+            function: AtpFunction::Request,
+            xo: false, // ALO — no TRelease expected
+            eom: false,
+            sts: false,
+            bitmap_seq_num: 0xff,
+            tid,
+            user_bytes: alo.user_bytes,
+        };
+
+        let mut buf = [0u8; 600];
+        let header_len = packet
+            .to_bytes(&mut buf)
+            .expect("failed to serialize ATP ALO header");
+
+        let dest = crate::ddp::DdpAddress::new(
+            tailtalk_packets::aarp::AppleTalkAddress {
+                network_number: alo.address.network_number,
+                node_number: alo.address.node_number,
+            },
+            alo.address.socket_number,
+        );
+
+        if let Err(e) = self.sock.send_to(&buf[..header_len], dest).await {
+            tracing::warn!("Failed to send ATP ALO packet: {}", e);
+        }
+        // No pending transaction registered — any response is silently discarded.
     }
 
     async fn handle_send_release(&mut self, rel: AtpSendRelease) {

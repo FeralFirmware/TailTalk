@@ -390,23 +390,18 @@ impl Asp {
                 }
                     } // end maybe_req arm
 
-                    // ── 30-second tickle timer (temporarily disabled) ────────────
+                    // ── 30-second tickle timer ───────────────────────────────────
                     _ = tickle_interval.tick() => {
-                        // TODO: re-enable tickles once session stability is confirmed
-                        // for (session_id, sess) in &sessions {
-                        //     tracing::debug!("ASP sending Tickle to session {}", session_id);
-                        //     let user_bytes = [
-                        //         SPFunction::Tickle as u8,
-                        //         *session_id,
-                        //         0,
-                        //         0,
-                        //     ];
-                        //     let req_clone = atp_req_clone.clone();
-                        //     let addr = sess.addr;
-                        //     tokio::spawn(async move {
-                        //         let _ = req_clone.send_request(addr, user_bytes, vec![]).await;
-                        //     });
-                        // }
+                        for (session_id, sess) in &sessions {
+                            tracing::debug!("ASP sending Tickle to session {}", session_id);
+                            let user_bytes = [
+                                SPFunction::Tickle as u8,
+                                *session_id,
+                                0,
+                                0,
+                            ];
+                            let _ = atp_req_clone.send_alo(sess.addr, user_bytes).await;
+                        }
                     }
                 } // end select!
             } // end loop

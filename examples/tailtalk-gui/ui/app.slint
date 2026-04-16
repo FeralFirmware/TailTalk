@@ -1,11 +1,11 @@
-import { Button, ComboBox, LineEdit, GroupBox, HorizontalBox, VerticalBox } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, GroupBox, HorizontalBox, VerticalBox } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
     title: "TailTalk AFP Server";
     min-width: 400px;
-    min-height: 200px;
+    min-height: 380px;
     preferred-width: 540px;
-    preferred-height: 280px;
+    preferred-height: 440px;
 
     in-out property <string> server-name: "TailTalk AFP";
     in property <[string]> ethernet-interfaces;
@@ -13,6 +13,8 @@ export component AppWindow inherits Window {
     in property <[string]> tashtalk-ports;
     in-out property <int> selected-tashtalk: 0;
     in-out property <string> volume-path;
+    in-out property <bool> tashtalk-crc-checking: false;
+    in-out property <bool> tashtalk-crc-generation: false;
     in property <bool> running: false;
 
     callback start-stop();
@@ -54,6 +56,20 @@ export component AppWindow inherits Window {
                         model: root.tashtalk-ports;
                         current-index <=> root.selected-tashtalk;
                         horizontal-stretch: 1;
+                        enabled: !root.running;
+                    }
+                }
+
+                HorizontalBox {
+                    Text { text: "TashTalk CRC:"; min-width: 140px; vertical-alignment: center; }
+                    CheckBox {
+                        text: "Generation";
+                        checked <=> root.tashtalk-crc-generation;
+                        enabled: !root.running;
+                    }
+                    CheckBox {
+                        text: "Checking";
+                        checked <=> root.tashtalk-crc-checking;
                         enabled: !root.running;
                     }
                 }

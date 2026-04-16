@@ -10,6 +10,8 @@ use tashtalk::TashTalk;
 use tokio::sync::mpsc;
 use tokio_serial::SerialPortBuilderExt;
 
+pub use tashtalk::TashTalkFeatures;
+
 pub mod addressing;
 pub mod adsp;
 pub mod afp;
@@ -58,6 +60,8 @@ pub struct PacketProcessor {
     our_mac: Option<[u8; 6]>,
     /// Opened TashTalk instance, stored here and handed to the async task in `run()`.
     tashtalk: Option<TashTalk<tokio_serial::SerialStream>>,
+    /// CRC features to set on the TashTalk firmware at startup.
+    tashtalk_features: tashtalk::TashTalkFeatures,
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
@@ -90,6 +94,7 @@ pub struct PacketProcessor {
 pub struct PacketProcessorBuilder {
     ethernet_intf: Option<String>,
     localtalk_serial_path: Option<String>,
+    tashtalk_features: tashtalk::TashTalkFeatures,
 }
 
 impl PacketProcessorBuilder {
@@ -97,12 +102,22 @@ impl PacketProcessorBuilder {
         Self {
             ethernet_intf: None,
             localtalk_serial_path: None,
+            tashtalk_features: tashtalk::TashTalkFeatures::new(),
         }
     }
 
     /// Configure an EtherTalk transport on the given network interface.
     pub fn ethernet(mut self, intf: &str) -> Self {
         self.ethernet_intf = Some(intf.to_string());
+        self
+    }
+
+    /// Configure which CRC features the TashTalk firmware should enable.
+    ///
+    /// By default no features are enabled.  Call this with a [`TashTalkFeatures`]
+    /// value to turn on hardware CRC generation, checking, or both.
+    pub fn tashtalk_features(mut self, features: tashtalk::TashTalkFeatures) -> Self {
+        self.tashtalk_features = features;
         self
     }
 
@@ -171,6 +186,7 @@ impl PacketProcessorBuilder {
             outbound_rx,
             our_mac,
             tashtalk,
+            tashtalk_features: self.tashtalk_features,
         };
         let handle = OutboundHandle { tx: outbound_tx };
 
@@ -315,6 +331,7 @@ impl PacketProcessor {
         // Spawned here rather than in the builder because it needs the addressing
         // and ddp handles, which callers construct using the OutboundHandle that
         // build() returns.
+        let tashtalk_features = self.tashtalk_features;
         let tashtalk_tx: Option<mpsc::Sender<Vec<u8>>> = if let Some(mut tashtalk_instance) = self.tashtalk {
             let (tx, mut tashtalk_rx) = mpsc::channel::<Vec<u8>>(100);
 
@@ -327,9 +344,9 @@ impl PacketProcessor {
                     tracing::error!("Failed to reset TashTalk: {:?}", e);
                 }
 
-                tracing::info!("Enabling TashTalk CRC calculation...");
+                tracing::info!("Setting TashTalk features: {:?}", tashtalk_features);
                 if let Err(e) = tashtalk_instance
-                    .set_features(tashtalk::TashTalkFeatures::new().with_crc_calculation())
+                    .set_features(tashtalk_features)
                     .await
                 {
                     tracing::error!("Failed to set TashTalk features: {:?}", e);
@@ -483,13 +500,12 @@ impl PacketProcessor {
                             output_buf[header_len..header_len + payload_len]
                                 .copy_from_slice(&pkt.payload);
 
-                            // TashTalk with CRC calculation (Bit 7) expects 2 dummy bytes
-                            // at the end that it overwrites with the real CRC.
-                            let final_size = header_len + payload_len + 2;
-                            output_buf[final_size - 2] = 0;
-                            output_buf[final_size - 1] = 0;
+                            let frame_end = header_len + payload_len;
+                            let crc = tashtalk::lt_crc(&output_buf[..frame_end]);
+                            output_buf[frame_end] = crc[0];
+                            output_buf[frame_end + 1] = crc[1];
 
-                            final_size
+                            frame_end + 2
                         }
                     }
                 }
