@@ -7,11 +7,10 @@ edition = "2024"
 
 [dependencies]
 bitflags = "2.6"
-byteorder = "1.5.0"
-bytes = "1.6.0"
+byteorder = { workspace = true } #unified
+bytes = { workspace = true } #unified
 encoding_rs = "0.8.33"
-thiserror = "1.0.58"
-tracing = "0.1.43"
+thiserror = { workspace = true } #unified
 
 [dev-dependencies]
 assert_hex = "0.4.1"

@@ -11,3 +11,19 @@ members = [
   "tashtalk",
 ]
 resolver = "3"
+
+[workspace.dependencies]
+anyhow = "^1.0.102" #unified
+byteorder = "^1.5.0" #unified
+bytes = "^1.11.1" #unified
+clap = { version = "^4.6.0", features = ["derive"] } #unified
+futures = "^0.3.32" #unified
+tailtalk = { path = "tailtalk", version = "^0.1.0" } #unified
+tailtalk-packets = { path = "tailtalk-packets", version = "^0.1.0" } #unified
+tashtalk = { path = "tashtalk", version = "^0.1.0" } #unified
+thiserror = "^1.0.69" #unified
+tokio = { version = "^1.51.1", features = ["full", "io-util"] } #unified
+tracing = "^0.1.44" #unified
+
+[workspace.package]
+rust-version = "1.90.0"

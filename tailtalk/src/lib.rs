@@ -1,5 +1,4 @@
 use anyhow::Error;
-use futures::StreamExt;
 use mac_address::mac_address_by_name;
 use std::time::SystemTime;
 use tailtalk_packets::aarp;
@@ -9,6 +8,7 @@ use tailtalk_packets::llap::{LlapPacket, LlapType};
 use tashtalk::TashTalk;
 use tokio::sync::mpsc;
 use tokio_serial::SerialPortBuilderExt;
+use futures::StreamExt;
 
 pub use tashtalk::TashTalkFeatures;
 
@@ -147,13 +147,16 @@ impl PacketProcessorBuilder {
 
             // BPF filter: Phase 1 AppleTalk (0x809B), Phase 1 AARP (0x80F3),
             // and any IEEE 802.2 LLC/SNAP frame (length field ≤ 1500) for Phase 2.
-            let filter = "ether proto 0x809B or ether proto 0x80F3 or (ether[12:2] <= 1500)";
+            let filter = format!("(ether proto 0x809B or ether proto 0x80F3 or (ether[12:2] <= 1500)) and not ether src {mac}");
 
+            tracing::info!("filter string: {filter}");
             // RX capture – promiscuous mode, filter applied.
             let mut rx = pcap::Capture::from_device(intf.as_str())?
                 .promisc(true)
+                .immediate_mode(true)
                 .open()?;
-            rx.filter(filter, true)?;
+            rx.filter(&filter, true)?;
+
             pcap_rx = Some(rx);
 
             // TX capture – separate handle used solely for packet injection.
@@ -210,6 +213,9 @@ impl PacketProcessor {
     pub async fn run(self, addressing: addressing::AddressingHandle, ddp: ddp::DdpHandle) {
         // ── EtherTalk RX task ────────────────────────────────────────────────
         if let Some(rx_cap) = self.pcap_rx {
+            let ddp_rx = ddp.clone();
+            let addressing_rx = addressing.clone();
+
             let rx_cap = match rx_cap.setnonblock() {
                 Ok(c) => c,
                 Err(e) => {
@@ -225,9 +231,6 @@ impl PacketProcessor {
                 }
             };
 
-            let ddp_rx = ddp.clone();
-            let addressing_rx = addressing.clone();
-
             tokio::spawn(async move {
                 tracing::info!("EtherTalk RX task started");
                 tokio::pin!(stream);
@@ -240,28 +243,31 @@ impl PacketProcessor {
                         }
                     };
 
-                    if data.len() < 14 {
-                        continue;
-                    }
-
                     let ethertype_or_len = u16::from_be_bytes([data[12], data[13]]);
 
                     if ethertype_or_len <= 1500 {
                         // EtherTalk Phase 2 – IEEE 802.2 LLC/SNAP encapsulation.
-                        if let Ok(header) = EtherTalkPhase2Frame::parse(&data) {
-                            let payload = &data[EtherTalkPhase2Frame::len()..];
-                            match header.protocol {
-                                EtherTalkPhase2Type::Ddp => ddp_rx.received_pkt(
-                                    payload,
-                                    aarp::AddressSource::EtherTalkPhase2,
-                                    header.src_mac,
-                                ),
-                                EtherTalkPhase2Type::Aarp => {
-                                    if let Err(e) = addressing_rx.received_pkt(
-                                        payload,
-                                        aarp::AddressSource::EtherTalkPhase2,
-                                    ) {
-                                        tracing::error!("failed to relay Phase 2 AARP: {e}");
+                        match EtherTalkPhase2Frame::parse(&data) {
+                            Err(e) => tracing::debug!("Phase 2 parse failed: {:?}", e),
+                            Ok(header) => {
+                                let payload = &data[EtherTalkPhase2Frame::len()..];
+                                match header.protocol {
+                                    EtherTalkPhase2Type::Ddp => {
+                                        tracing::info!("EtherTalk Phase 2 DDP received");
+                                        ddp_rx.received_pkt(
+                                            payload,
+                                            aarp::AddressSource::EtherTalkPhase2,
+                                            header.src_mac,
+                                        );
+                                    }
+                                    EtherTalkPhase2Type::Aarp => {
+                                        tracing::info!("EtherTalk Phase 2 AARP received");
+                                        if let Err(e) = addressing_rx.received_pkt(
+                                            payload,
+                                            aarp::AddressSource::EtherTalkPhase2,
+                                        ) {
+                                            tracing::error!("failed to relay Phase 2 AARP: {e}");
+                                        }
                                     }
                                 }
                             }

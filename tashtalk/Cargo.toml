@@ -7,9 +7,9 @@ repository = "https://github.com/feralfirmware/tailtalk"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-tokio = { version = "1.40", features = ["io-util"] }
+bytes = { workspace = true } #unified
+futures = { workspace = true } #unified
+thiserror = { workspace = true } #unified
+tokio = { workspace = true, features = ["full"] } #unified
 tokio-util = { version = "0.7.12", features = ["codec"] }
-futures = "0.3"
-bytes = "1"
-tracing = "0.1"
-thiserror = "1"
+tracing = { workspace = true } #unified

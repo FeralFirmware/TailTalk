@@ -9,7 +9,7 @@ use tailtalk_packets::afp::{
 };
 
 use crate::{time_to_afp, time_to_afp_v1};
-use tracing::{error, warn};
+use tracing::error;
 use xattr;
 
 /// Extended attribute name for the 32-byte Finder Info blob.

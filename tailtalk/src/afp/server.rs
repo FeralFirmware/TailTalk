@@ -1031,11 +1031,6 @@ impl AspSession {
         ) {
             Ok(comment) => {
                 let mut data = vec![];
-                // Comment is returned as a pascal string (1 byte length + data)
-                // However, AFP specs say it returns just the string without pascal length. Let's return raw bytes.
-                // Wait, Inside AppleTalk says: "The comment string is returned in the data buffer."
-                // For safety we should check if we just return the raw string bytes.
-                // Wait, it says "The String parameter is returned as a Pascal string." So we do need the length byte.
                 data.push(comment.len() as u8);
                 data.extend_from_slice(&comment);
                 command.send_reply(AspCommandResponse {

@@ -180,7 +180,15 @@ impl Asp {
                 // Parse user bytes for ASP header / command
                 // User bytes are [Function, SessionID, SequenceNumHi, SequenceNumLo]
 
-                if let Ok(header) = AspHeader::parse(&req.user_bytes) {
+                let header = match AspHeader::parse(&req.user_bytes) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::warn!("ASP: failed to parse user_bytes {:?}: {:?}", req.user_bytes, e);
+                        continue;
+                    }
+                };
+                {
+                let header = header; // shadow to keep existing match block structure
                     match header.function {
                         SPFunction::GetStatus => {
                             tracing::info!("ASP responding to GetStatus request");
@@ -274,11 +282,14 @@ impl Asp {
                                     let _ = req.send_response(vec![], response_user_bytes).await;
                                 } else {
                                     tracing::warn!(
-                                        "ASP CloseSess mismatch: Session {} owned by {:?}, req from {:?}",
+                                        "ASP CloseSess mismatch: Session {} owned by {:?}, req from {:?} — closing anyway",
                                         session_id,
                                         sess.addr,
                                         req.source
                                     );
+                                    sessions.remove(&session_id);
+                                    let response_user_bytes = [0, session_id, 0, 0];
+                                    let _ = req.send_response(vec![], response_user_bytes).await;
                                 }
                             } else {
                                 tracing::warn!("ASP CloseSess: Session {} not found", session_id);
