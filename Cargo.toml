@@ -20,7 +20,7 @@ clap = { version = "^4.6.0", features = ["derive"] } #unified
 futures = "^0.3.32" #unified
 tailtalk = { path = "tailtalk", version = "^0.1.0" } #unified
 tailtalk-packets = { path = "tailtalk-packets", version = "^0.1.0" } #unified
-tashtalk = { path = "tashtalk", version = "^0.1.0" } #unified
+tashtalk = { path = "tashtalk", version = "^0.2.0" } #unified
 thiserror = "^1.0.69" #unified
 tokio = { version = "^1.51.1", features = ["full", "io-util"] } #unified
 tracing = "^0.1.44" #unified
