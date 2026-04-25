@@ -1,5 +1,5 @@
 use clap::Parser;
-use tailtalk::{PacketProcessor, addressing::Addressing, ddp::DdpProcessor, echo::Echo, nbp::Nbp};
+use tailtalk::TalkStack;
 use tailtalk_packets::aarp::AppleTalkAddress;
 
 #[derive(Parser, Debug)]
@@ -24,17 +24,11 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let (processor, handle) = PacketProcessor::builder()
+    let stack = TalkStack::builder()
         .ethernet(&args.interface)
         .build()
-        .expect("failed to build PacketProcessor");
-    let addressing = Addressing::spawn(processor.get_mac().expect("ethernet transport required"), handle.clone(), None);
-    let ddp = DdpProcessor::spawn(addressing.clone(), handle.clone());
-    let echo = Echo::spawn(&ddp).await;
-    let _nbp = Nbp::spawn(&ddp, addressing.clone()).await;
-
-    let proc_addressing = addressing.clone();
-    tokio::task::spawn_blocking(|| processor.run(proc_addressing, ddp));
+        .await
+        .expect("failed to build AppleTalk stack");
 
     // Give AARP a moment to acquire a node address
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -45,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     println!("Sending AEP echo to {}.{}...", args.network, args.node);
-    match echo.send(addr, b"Hello, AppleTalk!").await {
+    match stack.echo.send(addr, b"Hello, AppleTalk!").await {
         Ok(rtt) => println!("Echo reply received! RTT: {}ms", rtt.as_millis()),
         Err(e) => eprintln!("Echo failed: {}", e),
     }

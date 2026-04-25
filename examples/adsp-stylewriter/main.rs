@@ -1,10 +1,7 @@
 use clap::Parser;
 use tailtalk::{
-    PacketProcessor,
-    addressing::Addressing,
+    TalkStack,
     adsp::{Adsp, AdspAddress},
-    ddp::DdpProcessor,
-    nbp::Nbp,
     stylewriter::StyleWriterEncoder,
 };
 use tailtalk_packets::nbp::EntityName;
@@ -42,24 +39,18 @@ async fn main() -> anyhow::Result<()> {
         .try_into()
         .map_err(|e| anyhow::anyhow!("Invalid printer name: {}", e))?;
 
-    let (processor, handle) = PacketProcessor::builder()
+    let stack = TalkStack::builder()
         .ethernet(&args.interface)
         .build()
-        .expect("failed to build PacketProcessor");
-    let addressing = Addressing::spawn(processor.get_mac().expect("ethernet transport required"), handle.clone(), None);
-    let ddp = DdpProcessor::spawn(addressing.clone(), handle.clone());
-    let nbp = Nbp::spawn(&ddp, addressing.clone()).await;
-
-    let proc_addressing = addressing.clone();
-    let proc_ddp = ddp.clone();
-    tokio::task::spawn_blocking(|| processor.run(proc_addressing, proc_ddp));
+        .await
+        .expect("failed to build AppleTalk stack");
 
     // Give AARP a moment to acquire a node address
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Locate the printer via NBP
     println!("Looking up printer '{}'...", entity);
-    let tuples = nbp.lookup(entity).await?;
+    let tuples = stack.nbp.lookup(entity).await?;
     let printer = tuples
         .first()
         .ok_or_else(|| anyhow::anyhow!("Printer not found on network"))?;
@@ -84,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
     let planar_scanline_len = width_pixels / 8;
 
     println!("Connecting ADSP session to printer...");
-    let mut adsp_stream = Adsp::connect(&ddp, printer_addr).await?;
+    let mut adsp_stream = Adsp::connect(&stack.ddp, printer_addr).await?;
     println!("ADSP session established!");
 
     // Send the initialization boundaries

@@ -1,12 +1,8 @@
 use clap::Parser;
 use std::path::PathBuf;
 use tailtalk::{
-    PacketProcessor,
-    addressing::Addressing,
+    TalkStack,
     afp::{AfpServer, AfpServerConfig},
-    ddp::DdpProcessor,
-    echo::Echo,
-    nbp::Nbp,
 };
 
 #[derive(Parser, Debug)]
@@ -33,28 +29,18 @@ async fn main() {
 
     let args = Args::parse();
 
-    let mut builder = PacketProcessor::builder().ethernet(&args.interface);
+    let mut builder = TalkStack::builder().ethernet(&args.interface);
     if let Some(ref tty) = args.tashtalk {
         builder = builder.localtalk(tty);
     }
-    let (processor, handle) = builder.build().expect("failed to build PacketProcessor");
-    let addressing = Addressing::spawn(processor.get_mac().expect("ethernet transport required"), handle.clone(), None);
+    let stack = builder.build().await.expect("failed to build AppleTalk stack");
 
-    let processor_addressing = addressing.clone();
-
-    let ddp = DdpProcessor::spawn(addressing.clone(), handle.clone());
-    let _echo = Echo::spawn(&ddp).await;
-    let nbp = Nbp::spawn(&ddp, addressing.clone()).await;
-
-    // Start AFP server
     let mut afp_config = AfpServerConfig::default();
     afp_config.volume_path = args.path.clone();
 
-    let _afp_server = AfpServer::spawn(&ddp, &nbp, Some(254), afp_config)
+    let _afp_server = AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), afp_config)
         .await
         .expect("failed to spawn AFP server");
-
-    tokio::spawn(processor.run(processor_addressing, ddp));
 
     tracing::info!("AFP server serving {:?} on {}", args.path, args.interface);
     tracing::info!("Press Ctrl+C to exit");

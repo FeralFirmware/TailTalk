@@ -1,11 +1,7 @@
 use clap::Parser;
 use tailtalk::{
-    PacketProcessor,
-    addressing::Addressing,
+    TalkStack,
     atp::{Atp, AtpAddress},
-    ddp::DdpProcessor,
-    echo::Echo,
-    nbp::Nbp,
     pap::PapClient,
 };
 use tailtalk_packets::nbp::EntityName;
@@ -38,28 +34,22 @@ async fn main() -> anyhow::Result<()> {
         .try_into()
         .map_err(|e| anyhow::anyhow!("Invalid printer name: {}", e))?;
 
-    let (processor, handle) = PacketProcessor::builder()
+    let stack = TalkStack::builder()
         .ethernet(&args.interface)
         .build()
-        .expect("failed to build PacketProcessor");
-    let addressing = Addressing::spawn(processor.get_mac().expect("ethernet transport required"), handle.clone(), None);
-    let ddp = DdpProcessor::spawn(addressing.clone(), handle.clone());
-    let _echo = Echo::spawn(&ddp).await;
-    let nbp = Nbp::spawn(&ddp, addressing.clone()).await;
+        .await
+        .expect("failed to build AppleTalk stack");
 
     // Two ATP sockets: one for sending requests, one for receiving printer-initiated ones
-    let (_req_sock, atp_requestor, _) = Atp::spawn(&ddp, None).await;
-    let (_resp_sock, _, atp_responder) = Atp::spawn(&ddp, None).await;
-
-    let proc_addressing = addressing.clone();
-    tokio::task::spawn_blocking(|| processor.run(proc_addressing, ddp));
+    let (_req_sock, atp_requestor, _) = Atp::spawn(&stack.ddp, None).await;
+    let (_resp_sock, _, atp_responder) = Atp::spawn(&stack.ddp, None).await;
 
     // Give AARP a moment to acquire a node address
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Locate the printer via NBP
     println!("Looking up printer '{}'...", entity);
-    let tuples = nbp.lookup(entity).await?;
+    let tuples = stack.nbp.lookup(entity).await?;
     let printer = tuples
         .first()
         .ok_or_else(|| anyhow::anyhow!("Printer not found on network"))?;

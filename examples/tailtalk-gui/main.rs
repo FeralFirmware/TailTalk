@@ -219,12 +219,8 @@ async fn run_server(
     ui_weak: slint::Weak<AppWindow>,
 ) {
     use tailtalk::{
-        PacketProcessor,
-        addressing::Addressing,
+        TalkStack,
         afp::{AfpServer, AfpServerConfig},
-        ddp::DdpProcessor,
-        echo::Echo,
-        nbp::Nbp,
     };
 
     let set_stopped = |ui_weak: slint::Weak<AppWindow>| {
@@ -236,9 +232,9 @@ async fn run_server(
         .ok();
     };
 
-    let mut builder = PacketProcessor::builder();
+    let mut stack_builder = TalkStack::builder();
     if let Some(ref intf) = ethernet {
-        builder = builder.ethernet(intf);
+        stack_builder = stack_builder.ethernet(intf);
     }
     if let Some(ref tty) = tashtalk {
         let mut features = tailtalk::TashTalkFeatures::new();
@@ -248,11 +244,11 @@ async fn run_server(
         if tashtalk_crc_checking {
             features = features.with_crc_checking();
         }
-        builder = builder.localtalk(tty).tashtalk_features(features);
+        stack_builder = stack_builder.localtalk(tty).tashtalk_features(features);
     }
 
-    let (processor, handle) = match builder.build() {
-        Ok(r) => r,
+    let stack = match stack_builder.build().await {
+        Ok(s) => s,
         Err(e) => {
             let is_perm = e.chain().any(|cause| {
                 cause
@@ -290,7 +286,7 @@ async fn run_server(
                 #[cfg(not(target_os = "linux"))]
                 tracing::error!("Permission denied opening raw socket: {e}");
             } else {
-                tracing::error!("Failed to build PacketProcessor: {e}");
+                tracing::error!("Failed to build AppleTalk stack: {e}");
             }
 
             set_stopped(ui_weak);
@@ -298,23 +294,11 @@ async fn run_server(
         }
     };
 
-    // In LocalTalk-only mode there is no Ethernet MAC; use a zero placeholder.
-    // Addressing will still probe (probes are silently dropped with no pcap),
-    // confirm an address after the timeout, and hand it to TashTalk for node-ID
-    // registration.
-    let mac = processor.get_mac().unwrap_or([0u8; 6]);
-
-    let addressing = Addressing::spawn(mac, handle.clone(), None);
-    let processor_addressing = addressing.clone();
-    let ddp = DdpProcessor::spawn(addressing.clone(), handle.clone());
-    let _echo = Echo::spawn(&ddp).await;
-    let nbp = Nbp::spawn(&ddp, addressing.clone()).await;
-
     let mut afp_config = AfpServerConfig::default();
     afp_config.volume_path = volume;
     afp_config.server_name = server_name;
 
-    let _afp = match AfpServer::spawn(&ddp, &nbp, Some(254), afp_config).await {
+    let _afp = match AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), afp_config).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("Failed to spawn AFP server: {e}");
@@ -329,8 +313,6 @@ async fn run_server(
         (None, Some(tty)) => tty.clone(),
         (None, None) => unreachable!(),
     };
-
-    tokio::spawn(processor.run(processor_addressing, ddp));
     tracing::info!("AFP server running on {transport_desc}");
 
     // Keep this task alive until it is aborted via Stop

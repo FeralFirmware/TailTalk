@@ -591,6 +591,103 @@ impl OutboundHandle {
     }
 }
 
+// ── TalkStack ─────────────────────────────────────────────────────────────────
+
+/// Handles to all mandatory AppleTalk stack layers.
+///
+/// Obtain one via [`TalkStack::builder`]. Once built, spawn services on top:
+///
+/// ```no_run
+/// # use tailtalk::{TalkStack, afp::{AfpServer, AfpServerConfig}};
+/// # async fn example() -> anyhow::Result<()> {
+/// let stack = TalkStack::builder()
+///     .ethernet("eth0")
+///     .build()
+///     .await?;
+///
+/// let _afp = AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), AfpServerConfig::default()).await?;
+/// # Ok(()) }
+/// ```
+pub struct TalkStack {
+    pub addressing: addressing::AddressingHandle,
+    pub ddp: ddp::DdpHandle,
+    pub nbp: nbp::NbpHandle,
+    pub echo: echo::EchoHandle,
+}
+
+/// Builder for [`TalkStack`].
+pub struct TalkStackBuilder {
+    ethernet_intf: Option<String>,
+    localtalk_serial_path: Option<String>,
+    tashtalk_features: tashtalk::TashTalkFeatures,
+    fixed_addr: Option<tailtalk_packets::aarp::AppleTalkAddress>,
+}
+
+impl TalkStack {
+    pub fn builder() -> TalkStackBuilder {
+        TalkStackBuilder {
+            ethernet_intf: None,
+            localtalk_serial_path: None,
+            tashtalk_features: tashtalk::TashTalkFeatures::new(),
+            fixed_addr: None,
+        }
+    }
+}
+
+impl TalkStackBuilder {
+    /// Configure an EtherTalk transport on the given network interface.
+    pub fn ethernet(mut self, intf: &str) -> Self {
+        self.ethernet_intf = Some(intf.to_string());
+        self
+    }
+
+    /// Configure a LocalTalk transport via a TashTalk serial adapter.
+    pub fn localtalk(mut self, serial_path: &str) -> Self {
+        self.localtalk_serial_path = Some(serial_path.to_string());
+        self
+    }
+
+    /// Configure which CRC features the TashTalk firmware should enable.
+    pub fn tashtalk_features(mut self, features: tashtalk::TashTalkFeatures) -> Self {
+        self.tashtalk_features = features;
+        self
+    }
+
+    /// Use a fixed AppleTalk address instead of probing via AARP.
+    pub fn fixed_address(mut self, network: u16, node: u8) -> Self {
+        self.fixed_addr = Some(tailtalk_packets::aarp::AppleTalkAddress {
+            network_number: network,
+            node_number: node,
+        });
+        self
+    }
+
+    /// Launch the full AppleTalk stack and return handles to each layer.
+    ///
+    /// Spawns actors for AARP/Addressing, DDP, AEP (Echo), and NBP in dependency
+    /// order, then starts the [`PacketProcessor`] background task.
+    pub async fn build(self) -> Result<TalkStack, Error> {
+        let mut pp = PacketProcessor::builder().tashtalk_features(self.tashtalk_features);
+        if let Some(ref intf) = self.ethernet_intf {
+            pp = pp.ethernet(intf);
+        }
+        if let Some(ref path) = self.localtalk_serial_path {
+            pp = pp.localtalk(path);
+        }
+        let (processor, outbound) = pp.build()?;
+
+        let mac = processor.get_mac().unwrap_or([0u8; 6]);
+        let addressing = addressing::Addressing::spawn(mac, outbound.clone(), self.fixed_addr);
+        let ddp = ddp::DdpProcessor::spawn(addressing.clone(), outbound);
+        let echo = echo::Echo::spawn(&ddp).await;
+        let nbp = nbp::Nbp::spawn(&ddp, addressing.clone()).await;
+
+        tokio::spawn(processor.run(addressing.clone(), ddp.clone()));
+
+        Ok(TalkStack { addressing, ddp, nbp, echo })
+    }
+}
+
 // ── AFP time helpers ──────────────────────────────────────────────────────────
 
 /// Converts a SystemTime to a 32-bit AFP date for **AFP 2.x** (seconds since Jan 1, 2000).
