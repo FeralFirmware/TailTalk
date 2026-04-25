@@ -524,18 +524,16 @@ impl AspSession {
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let directory_id = u32::from_be_bytes(command.data[4..=7].try_into().unwrap());
-        let file_bitmap =
-            FPFileBitmap::from(u16::from_be_bytes(command.data[8..=9].try_into().unwrap()));
-        let dir_bitmap = FPDirectoryBitmap::from(u16::from_be_bytes(
-            command.data[10..=11].try_into().unwrap(),
-        ));
-        let _path_type = command.data[12];
-        let path_name = MacString::try_from(&command.data[13..]).unwrap_or_default();
+        let bitmap_raw = u16::from_be_bytes(command.data[8..=9].try_into().unwrap());
+        let file_bitmap = FPFileBitmap::from(bitmap_raw);
+        let dir_bitmap = FPDirectoryBitmap::from(bitmap_raw);
+        let _path_type = command.data[10];
+        let path_name = MacString::try_from(&command.data[11..]).unwrap_or_default();
 
         let path_name_buf = PathBuf::from(path_name.to_string());
 
         // Parameters start after path name
-        let mut param_offset = 13 + path_name.byte_len();
+        let mut param_offset = 11 + path_name.byte_len();
         if param_offset % 2 != 0 {
             param_offset += 1;
         }
