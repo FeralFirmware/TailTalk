@@ -141,6 +141,22 @@ impl From<ForkType> for u8 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathType {
+    ShortName = 1,
+    LongName = 2,
+}
+
+impl From<u8> for PathType {
+    fn from(value: u8) -> Self {
+        match value {
+            2 => Self::LongName,
+            _ => Self::ShortName,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum CreateFlag {
     Soft,
     Hard,

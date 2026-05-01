@@ -5,9 +5,11 @@ use crate::nbp::NbpHandle;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tailtalk_packets::afp::{
-    AfpError, AfpUam, AfpVersion, CreateFlag, FPByteRangeLock, FPCloseFork, FPDelete,
-    FPDirectoryBitmap, FPEnumerate, FPFileBitmap, FPFlush, FPGetSrvrInfo, FPGetSrvrParms,
-    FPGetVolParms, FPRead, FPSetDirParms, FPSetForkParms, FPVolumeBitmap, ForkType, MacString,
+    AfpError, AfpUam, AfpVersion, FPByteRangeLock, FPCloseFork, FPCreateDir, FPCreateFile,
+    FPDelete, FPDirectoryBitmap, FPEnumerate, FPFlush, FPGetFileDirParms, FPGetForkParms,
+    FPGetSrvrInfo, FPGetSrvrParms, FPGetVolParms, FPMoveAndRename, FPOpenFork, FPRead,
+    FPSetDirParms, FPSetFileDirParms, FPSetForkParms, FPVolumeBitmap, ForkType, AFP_CMD_LOGOUT,
+    AFP_CMD_MOVE_AND_RENAME,
 };
 use tailtalk_packets::nbp::EntityName;
 use tracing::{error, info, warn};
@@ -336,6 +338,22 @@ impl AspSession {
                 tailtalk_packets::afp::AFP_CMD_ADD_COMMENT => {
                     self.handle_add_comment(command, &mut our_volume).await?;
                 }
+                AFP_CMD_MOVE_AND_RENAME => {
+                    self.handle_move_and_rename(command, &mut our_volume).await?;
+                }
+                AFP_CMD_LOGOUT => {
+                    command.send_reply(AspCommandResponse {
+                        result: [0u8; 4],
+                        data: vec![],
+                    })?;
+                    break;
+                }
+                tailtalk_packets::afp::AFP_CMD_CLOSE_DT => {
+                    command.send_reply(AspCommandResponse {
+                        result: [0u8; 4],
+                        data: vec![],
+                    })?;
+                }
                 _ => {
                     warn!("Session {} unsupported command: {}", self.id, cmd_code);
                     // Return error: command not supported
@@ -379,13 +397,10 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let _volume_id = u16::from_be_bytes(command.data[2..=3].try_into().unwrap());
-        let directory_id = u32::from_be_bytes(command.data[4..=7].try_into().unwrap());
-        let _path_type = command.data[8];
-        let path_name = MacString::try_from(&command.data[9..]).unwrap();
+        let cmd = FPCreateDir::parse(&command.data[2..]).unwrap();
 
         let dir_id = our_volume
-            .create_dir(directory_id, PathBuf::from(path_name.to_string()))
+            .create_dir(cmd.directory_id, PathBuf::from(cmd.path.to_string()))
             .await
             .map_err(|e| anyhow::anyhow!("CreateDir failed: {:?}", e))?;
 
@@ -402,20 +417,13 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        // Note to future readers - This does not match Inside AppleTalk's format and I dont know why.
-        // The book has the order as RefNum, Volume ID, Directory ID and Create Flag but the actual order
-        // I see from my client is as below.
-        let create_flag = CreateFlag::from(command.data[1]);
-        let _volume_id = u16::from_be_bytes(command.data[2..=3].try_into().unwrap());
-        let directory_id = u32::from_be_bytes(command.data[4..=7].try_into().unwrap());
-        let _path_type = command.data[8];
-        let path_name = MacString::try_from(&command.data[9..]).unwrap();
+        let cmd = FPCreateFile::parse(&command.data[1..]).unwrap();
 
         match our_volume
             .create_file(
-                create_flag,
-                directory_id,
-                PathBuf::from(path_name.to_string()),
+                cmd.create_flag,
+                cmd.directory_id,
+                PathBuf::from(cmd.path.to_string()),
             )
             .await
         {
@@ -465,19 +473,12 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &Volume,
     ) -> anyhow::Result<()> {
-        let _volume_id = u16::from_be_bytes(command.data[2..=3].try_into().unwrap());
-        let directory_id = u32::from_be_bytes(command.data[4..=7].try_into().unwrap());
-        let file_bitmap =
-            FPFileBitmap::from(u16::from_be_bytes(command.data[8..=9].try_into().unwrap()));
-        let dir_bitmap = FPDirectoryBitmap::from(u16::from_be_bytes(
-            command.data[10..=11].try_into().unwrap(),
-        ));
-        let _path_type = command.data[12];
-        let path_name = MacString::try_from(&command.data[13..]).unwrap_or_default();
+        let cmd = FPGetFileDirParms::parse(&command.data[2..]).unwrap();
+        let file_bitmap = cmd.file_bitmap;
+        let dir_bitmap = cmd.dir_bitmap;
+        let path_name_buf = PathBuf::from(cmd.path.to_string());
 
-        let path_name_buf = PathBuf::from(path_name.to_string());
-
-        let node_id = match our_volume.resolve_node(directory_id, &path_name_buf) {
+        let node_id = match our_volume.resolve_node(cmd.directory_id, &path_name_buf) {
             Ok(node_id) => node_id,
             Err(e) => {
                 tracing::error!("look up for {:?} failed: {:?}", path_name_buf, e);
@@ -523,22 +524,12 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let directory_id = u32::from_be_bytes(command.data[4..=7].try_into().unwrap());
-        let bitmap_raw = u16::from_be_bytes(command.data[8..=9].try_into().unwrap());
-        let file_bitmap = FPFileBitmap::from(bitmap_raw);
-        let dir_bitmap = FPDirectoryBitmap::from(bitmap_raw);
-        let _path_type = command.data[10];
-        let path_name = MacString::try_from(&command.data[11..]).unwrap_or_default();
+        let cmd = FPSetFileDirParms::parse(&command.data[2..]).unwrap();
+        let file_bitmap = cmd.file_bitmap;
+        let dir_bitmap = FPDirectoryBitmap::from(cmd.file_bitmap.bits());
+        let path_name_buf = PathBuf::from(cmd.path.to_string());
 
-        let path_name_buf = PathBuf::from(path_name.to_string());
-
-        // Parameters start after path name
-        let mut param_offset = 11 + path_name.byte_len();
-        if param_offset % 2 != 0 {
-            param_offset += 1;
-        }
-
-        let node_id = match our_volume.resolve_node(directory_id, &path_name_buf) {
+        let node_id = match our_volume.resolve_node(cmd.directory_id, &path_name_buf) {
             Ok(node_id) => node_id,
             Err(e) => {
                 command.send_reply(AspCommandResponse {
@@ -549,7 +540,7 @@ impl AspSession {
             }
         };
 
-        match our_volume.set_node_parms(node_id, file_bitmap, dir_bitmap, &command.data[param_offset..]) {
+        match our_volume.set_node_parms(node_id, file_bitmap, dir_bitmap, &cmd.params) {
             Ok(_) => {
                 command.send_reply(AspCommandResponse {
                     result: [0u8; 4],
@@ -563,6 +554,49 @@ impl AspSession {
                 })?;
             }
         };
+
+        Ok(())
+    }
+
+    async fn handle_move_and_rename(
+        &self,
+        command: crate::asp::AspCommand,
+        our_volume: &mut Volume,
+    ) -> anyhow::Result<()> {
+        let cmd = match FPMoveAndRename::parse(&command.data[2..]) {
+            Ok(c) => c,
+            Err(e) => {
+                command.send_reply(create_error_reply(e))?;
+                return Ok(());
+            }
+        };
+
+        let src_path = PathBuf::from(cmd.src_path.to_string());
+        let dst_path = PathBuf::from(cmd.dst_path.to_string());
+
+        match our_volume
+            .move_and_rename(
+                cmd.src_directory_id,
+                cmd.dst_directory_id,
+                &src_path,
+                &dst_path,
+                cmd.new_name.as_str(),
+            )
+            .await
+        {
+            Ok(()) => {
+                command.send_reply(AspCommandResponse {
+                    result: [0u8; 4],
+                    data: vec![],
+                })?;
+            }
+            Err(e) => {
+                command.send_reply(AspCommandResponse {
+                    result: (e as u32).to_be_bytes(),
+                    data: Vec::new(),
+                })?;
+            }
+        }
 
         Ok(())
     }
@@ -704,23 +738,16 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let _volume_id = u16::from_be_bytes(command.data[2..=3].try_into().unwrap());
-        let directory_id = u32::from_be_bytes(command.data[4..=7].try_into().unwrap());
-        let file_bitmap =
-            FPFileBitmap::from(u16::from_be_bytes(command.data[8..=9].try_into().unwrap()));
-        let _access_mode = u16::from_be_bytes(command.data[10..=11].try_into().unwrap());
-        let _path_type = command.data[12];
-        let path_name = MacString::try_from(&command.data[13..]).unwrap_or_default();
-
-        let path_name_buf = PathBuf::from(path_name.to_string());
+        let cmd = FPOpenFork::parse(&command.data[2..]).unwrap();
+        let path_name_buf = PathBuf::from(cmd.path.to_string());
 
         let mut output_buf = [0u8; 256];
 
         match our_volume
             .open_fork(
                 ForkType::Data, // We only support data fork
-                file_bitmap,
-                directory_id,
+                cmd.file_bitmap,
+                cmd.directory_id,
                 &path_name_buf,
                 &mut output_buf,
             )
@@ -792,15 +819,13 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let fork_id = u16::from_be_bytes(command.data[2..=3].try_into().unwrap());
-        let file_bitmap =
-            FPFileBitmap::from(u16::from_be_bytes(command.data[4..=5].try_into().unwrap()));
+        let cmd = FPGetForkParms::parse(&command.data[2..]).unwrap();
 
         let mut output_buf = [0u8; 256];
 
-        output_buf[..2].copy_from_slice(&file_bitmap.bits().to_be_bytes());
+        output_buf[..2].copy_from_slice(&cmd.file_bitmap.bits().to_be_bytes());
         match our_volume
-            .get_fork_parms(file_bitmap, fork_id, &mut output_buf[2..])
+            .get_fork_parms(cmd.file_bitmap, cmd.fork_id, &mut output_buf[2..])
             .await
         {
             Ok(offset) => Ok(command.send_reply(AspCommandResponse {

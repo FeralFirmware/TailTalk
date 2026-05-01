@@ -854,6 +854,16 @@ impl Volume {
             offset += 2;
         }
 
+        if bitmap.contains(FPDirectoryBitmap::OWNER_ID) {
+            output[offset..offset + 4].copy_from_slice(&0u32.to_be_bytes());
+            offset += 4;
+        }
+
+        if bitmap.contains(FPDirectoryBitmap::GROUP_ID) {
+            output[offset..offset + 4].copy_from_slice(&0u32.to_be_bytes());
+            offset += 4;
+        }
+
         if bitmap.contains(FPDirectoryBitmap::ACCESS_RIGHTS) {
             let summary = FPAccessRights::READ
                 | FPAccessRights::WRITE
@@ -1472,6 +1482,108 @@ impl Volume {
         }
     }
 
+    /// Moves and/or renames a file or directory.
+    ///
+    /// `src_dir_id + src_path` identifies the object to move.
+    /// `dst_dir_id + dst_path` identifies the destination directory.
+    /// `new_name` is the new name; pass an empty string to keep the original name.
+    pub async fn move_and_rename(
+        &mut self,
+        src_dir_id: u32,
+        dst_dir_id: u32,
+        src_path: &std::path::Path,
+        dst_path: &std::path::Path,
+        new_name: &str,
+    ) -> Result<(), AfpError> {
+        let src_node_id = self.resolve_node(src_dir_id, src_path)?;
+
+        if src_node_id <= 2 {
+            return Err(AfpError::AccessDenied);
+        }
+
+        let dst_node_id = self.resolve_node(dst_dir_id, dst_path)?;
+
+        // Snapshot what we need from both nodes before taking mut references.
+        let (src_old_name, src_old_relative, src_is_dir) = {
+            let n = self.nodes.get(&src_node_id).ok_or(AfpError::ObjectNotFound)?;
+            (n.name.clone(), n.path.clone(), n.is_dir)
+        };
+        let dst_relative = {
+            let n = self.nodes.get(&dst_node_id).ok_or(AfpError::ObjectNotFound)?;
+            if !n.is_dir {
+                return Err(AfpError::ObjectTypeErr);
+            }
+            n.path.clone()
+        };
+
+        let effective_name = if new_name.is_empty() {
+            src_old_name.clone()
+        } else {
+            new_name.to_string()
+        };
+
+        let new_relative = dst_relative.join(&effective_name);
+
+        // Conflict check — allow same-path (pure rename or no-op move).
+        if new_relative != src_old_relative {
+            if self.path_to_id.contains_key(&new_relative) {
+                return Err(AfpError::ObjectExists);
+            }
+        }
+
+        let old_absolute = self.path.join(&src_old_relative);
+        let new_absolute = self.path.join(&new_relative);
+
+        tokio::fs::rename(&old_absolute, &new_absolute)
+            .await
+            .map_err(|e| {
+                error!("move {:?} → {:?}: {:?}", old_absolute, new_absolute, e);
+                AfpError::AccessDenied
+            })?;
+
+        // Move resource fork sidecar for files.
+        if !src_is_dir {
+            let old_sidecar = rsrc_path(&self.path, &src_old_relative);
+            if old_sidecar.exists() {
+                let new_sidecar = rsrc_path(&self.path, &new_relative);
+                let _ = tokio::fs::rename(&old_sidecar, &new_sidecar).await;
+            }
+        }
+
+        // Update path_to_id and node entries.
+        // For directories we must also rebase every child path stored in the map.
+        self.path_to_id.remove(&src_old_relative);
+        self.path_to_id.insert(new_relative.clone(), src_node_id);
+
+        {
+            let node = self.nodes.get_mut(&src_node_id).unwrap();
+            node.parent_id = dst_node_id;
+            node.name = effective_name;
+            node.path = new_relative.clone();
+        }
+
+        if src_is_dir {
+            let child_updates: Vec<(u32, PathBuf, PathBuf)> = self
+                .nodes
+                .iter()
+                .filter(|(id, node)| **id != src_node_id && node.path.starts_with(&src_old_relative))
+                .map(|(id, node)| {
+                    let suffix = node.path.strip_prefix(&src_old_relative).unwrap();
+                    let new_child_path = new_relative.join(suffix);
+                    (*id, node.path.clone(), new_child_path)
+                })
+                .collect();
+
+            for (id, old_path, new_child_path) in child_updates {
+                self.path_to_id.remove(&old_path);
+                self.path_to_id.insert(new_child_path.clone(), id);
+                self.nodes.get_mut(&id).unwrap().path = new_child_path;
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn delete(&mut self, delete_req: &FPDelete) -> Result<(), AfpError> {
         let node_id = self.resolve_node(delete_req.directory_id, Path::new(&delete_req.path))?;
 
@@ -2016,5 +2128,138 @@ mod tests {
 
         let result = volume.resolve_node(2, Path::new("emptydir"));
         assert!(result.is_err(), "node should be removed from volume index");
+    }
+
+    // Recreates the sequence a Mac Finder performs when disconnecting from a volume:
+    // create "Network Trash Folder" at root, create a per-client "Trash Can #N" inside it,
+    // verify the DIDs returned are sane, enumerate the container, delete the trash can,
+    // then verify that both an enumerate on the now-empty container and a direct DID lookup
+    // on the deleted node return ObjectNotFound.
+    #[tokio::test]
+    async fn test_trash_folder_lifecycle() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1, true).await;
+
+        // Step 1: Finder creates "Network Trash Folder" at volume root (DID=2).
+        let network_trash_id = volume
+            .create_dir(2, PathBuf::from("Network Trash Folder"))
+            .await
+            .unwrap();
+        assert!(network_trash_id >= 3, "should receive a real DID");
+
+        // Step 2: Finder creates "Trash Can #2" inside "Network Trash Folder".
+        let trash_can_id = volume
+            .create_dir(network_trash_id, PathBuf::from("Trash Can #2"))
+            .await
+            .unwrap();
+        assert!(trash_can_id > network_trash_id, "child DID must be greater than parent DID");
+
+        // Step 3: FPGetFileDirParms on "Network Trash Folder" — verify PARENT_DIR_ID and DIR_ID.
+        let mut output = [0u8; 256];
+        let (is_dir, bytes_written) = volume
+            .get_node_parms(
+                network_trash_id,
+                FPFileBitmap::empty(),
+                FPDirectoryBitmap::PARENT_DIR_ID | FPDirectoryBitmap::DIR_ID,
+                &mut output,
+            )
+            .await
+            .unwrap();
+        assert!(is_dir, "Network Trash Folder must be reported as a directory");
+        assert_eq!(bytes_written, 8);
+        let parent_dir_id = u32::from_be_bytes(output[0..4].try_into().unwrap());
+        let dir_id = u32::from_be_bytes(output[4..8].try_into().unwrap());
+        assert_eq!(parent_dir_id, 2, "Network Trash Folder's parent should be volume root (DID=2)");
+        assert_eq!(dir_id, network_trash_id, "DIR_ID must match the ID returned by create_dir");
+
+        // Step 4: FPGetFileDirParms on "Trash Can #2" — verify PARENT_DIR_ID and DIR_ID.
+        output.fill(0);
+        let (is_dir, bytes_written) = volume
+            .get_node_parms(
+                trash_can_id,
+                FPFileBitmap::empty(),
+                FPDirectoryBitmap::PARENT_DIR_ID | FPDirectoryBitmap::DIR_ID,
+                &mut output,
+            )
+            .await
+            .unwrap();
+        assert!(is_dir, "Trash Can must be reported as a directory");
+        assert_eq!(bytes_written, 8);
+        let parent_dir_id = u32::from_be_bytes(output[0..4].try_into().unwrap());
+        let dir_id = u32::from_be_bytes(output[4..8].try_into().unwrap());
+        assert_eq!(
+            parent_dir_id, network_trash_id,
+            "Trash Can's parent should be Network Trash Folder"
+        );
+        assert_eq!(dir_id, trash_can_id, "DIR_ID must match the ID returned by create_dir");
+
+        // Step 5: FPEnumerate "Network Trash Folder" — should yield exactly "Trash Can #2".
+        let enumerate_cmd = FPEnumerate {
+            volume_id: 1,
+            directory_id: network_trash_id,
+            file_bitmap: FPFileBitmap::LONG_NAME,
+            directory_bitmap: FPDirectoryBitmap::LONG_NAME | FPDirectoryBitmap::DIR_ID | FPDirectoryBitmap::PARENT_DIR_ID,
+            req_count: 100,
+            start_index: 1,
+            max_reply_size: 2048,
+            path: "".into(),
+        };
+        let mut enum_buf = [0u8; 2048];
+        let result = volume.enumerate(enumerate_cmd, &mut enum_buf).await;
+        assert!(result.is_ok(), "enumerate should succeed: {:?}", result.err());
+        let count = u16::from_be_bytes(enum_buf[0..2].try_into().unwrap());
+        assert_eq!(count, 1, "Network Trash Folder should contain exactly Trash Can #2");
+
+        // Step 6: FPDelete "Trash Can #2" by parent DID + name (how the Finder issues it).
+        let delete_req = FPDelete {
+            volume_id: 1,
+            directory_id: network_trash_id,
+            path: "Trash Can #2".into(),
+        };
+        volume.delete(&delete_req).await.unwrap();
+        assert!(
+            !root_path.join("Network Trash Folder").join("Trash Can #2").exists(),
+            "Trash Can #2 must be gone from disk"
+        );
+
+        // Step 7: FPEnumerate "Network Trash Folder" after deletion — must return ObjectNotFound
+        // because the directory is now empty (AFP 2.x convention).
+        let enumerate_empty = FPEnumerate {
+            volume_id: 1,
+            directory_id: network_trash_id,
+            file_bitmap: FPFileBitmap::LONG_NAME,
+            directory_bitmap: FPDirectoryBitmap::LONG_NAME,
+            req_count: 100,
+            start_index: 1,
+            max_reply_size: 2048,
+            path: "".into(),
+        };
+        let result = volume.enumerate(enumerate_empty, &mut enum_buf).await;
+        assert_eq!(
+            result,
+            Err(AfpError::ObjectNotFound),
+            "empty directory enumeration should return ObjectNotFound"
+        );
+
+        // Step 8: FPGetFileDirParms by old DID — must return ObjectNotFound.
+        output.fill(0);
+        let result = volume
+            .get_node_parms(
+                trash_can_id,
+                FPFileBitmap::empty(),
+                FPDirectoryBitmap::DIR_ID,
+                &mut output,
+            )
+            .await;
+        assert_eq!(
+            result,
+            Err(AfpError::ObjectNotFound),
+            "deleted node must not be found by its old DID"
+        );
+
+        // Step 9: resolve by name in parent must also fail.
+        let result = volume.resolve_node(network_trash_id, Path::new("Trash Can #2"));
+        assert!(result.is_err(), "deleted dir must not resolve by name");
     }
 }

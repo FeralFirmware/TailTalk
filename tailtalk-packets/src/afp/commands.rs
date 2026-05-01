@@ -1,4 +1,4 @@
-use super::types::{AfpError, AfpUam, AfpVersion};
+use super::types::{AfpError, AfpUam, AfpVersion, CreateFlag, PathType};
 use crate::afp::util::MacString;
 use crate::afp::{
     FPAccessRights, FPByteRangeLockFlags, FPDirectoryBitmap, FPFileAttributes, FPFileBitmap,
@@ -18,6 +18,8 @@ pub const AFP_CMD_GET_FORK_PARMS: u8 = 14;
 pub const AFP_CMD_GET_SRVR_PARMS: u8 = 16;
 pub const AFP_CMD_GET_VOL_PARMS: u8 = 17;
 pub const AFP_CMD_LOGIN: u8 = 18;
+pub const AFP_CMD_LOGOUT: u8 = 20;
+pub const AFP_CMD_MOVE_AND_RENAME: u8 = 23;
 pub const AFP_CMD_OPEN_VOL: u8 = 24;
 pub const AFP_CMD_OPEN_FORK: u8 = 26;
 pub const AFP_CMD_READ: u8 = 27;
@@ -898,6 +900,40 @@ mod tests {
         ];
         let _enumerate = FPEnumerate::parse(&buf[2..]).unwrap();
     }
+
+    #[test]
+    fn test_fp_move_and_rename_parse() {
+        // Real packet captured from Mac Finder via Wireshark.
+        // FPMoveAndRename: move "appleshare.smi.bin" from DID=2 to DID=13, no rename.
+        #[rustfmt::skip]
+        let raw: &[u8] = &[
+            0x17, 0x00,             // command=23, pad
+            0x00, 0x01,             // volume_id=1
+            0x00, 0x00, 0x00, 0x02, // src_directory_id=2
+            0x00, 0x00, 0x00, 0x0d, // dst_directory_id=13
+            0x02,                   // src_path_type=LongName
+            0x12,                   // src_path len=18
+            b'a', b'p', b'p', b'l', b'e', b's', b'h', b'a', b'r', b'e',
+            b'.', b's', b'm', b'i', b'.', b'b', b'i', b'n', // "appleshare.smi.bin"
+            0x02,                   // dst_path_type=LongName
+            0x00,                   // dst_path len=0 (empty)
+            0x02,                   // new_name_path_type=LongName
+            0x00,                   // new_name len=0 (empty, keep original name)
+        ];
+
+        // Server passes buf[2..] (skipping command byte + pad) to parse.
+        let cmd = FPMoveAndRename::parse(&raw[2..]).expect("parse should succeed");
+
+        assert_eq!(cmd.volume_id, 1);
+        assert_eq!(cmd.src_directory_id, 2);
+        assert_eq!(cmd.dst_directory_id, 13);
+        assert_eq!(cmd.src_path_type, PathType::LongName);
+        assert_eq!(cmd.src_path.as_str(), "appleshare.smi.bin");
+        assert_eq!(cmd.dst_path_type, PathType::LongName);
+        assert_eq!(cmd.dst_path.as_str(), "");
+        assert_eq!(cmd.new_name_path_type, PathType::LongName);
+        assert_eq!(cmd.new_name.as_str(), "");
+    }
 }
 
 #[derive(Debug)]
@@ -912,5 +948,221 @@ impl FPOpenDT {
         }
         let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         Ok(Self { volume_id })
+    }
+}
+
+#[derive(Debug)]
+pub struct FPGetForkParms {
+    pub fork_id: u16,
+    pub file_bitmap: FPFileBitmap,
+}
+
+impl FPGetForkParms {
+    pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 4 {
+            return Err(AfpError::InvalidSize);
+        }
+        let fork_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let file_bitmap = FPFileBitmap::from(u16::from_be_bytes(*buf[2..4].as_array().unwrap()));
+        Ok(Self { fork_id, file_bitmap })
+    }
+}
+
+#[derive(Debug)]
+pub struct FPCreateDir {
+    pub volume_id: u16,
+    pub directory_id: u32,
+    pub path_type: PathType,
+    pub path: MacString,
+}
+
+impl FPCreateDir {
+    pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 8 {
+            return Err(AfpError::InvalidSize);
+        }
+        let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
+        let path_type = PathType::from(buf[6]);
+        let path = MacString::try_from(&buf[7..])?;
+        Ok(Self { volume_id, directory_id, path_type, path })
+    }
+}
+
+#[derive(Debug)]
+pub struct FPCreateFile {
+    pub create_flag: CreateFlag,
+    pub volume_id: u16,
+    pub directory_id: u32,
+    pub path_type: PathType,
+    pub path: MacString,
+}
+
+impl FPCreateFile {
+    pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        // Note: wire layout differs from Inside AppleTalk docs. Observed order from real client:
+        // [0]=create_flag, [1..3]=volume_id, [3..7]=directory_id, [7]=path_type, [8..]=path
+        if buf.len() < 9 {
+            return Err(AfpError::InvalidSize);
+        }
+        let create_flag = CreateFlag::from(buf[0]);
+        let volume_id = u16::from_be_bytes(*buf[1..3].as_array().unwrap());
+        let directory_id = u32::from_be_bytes(*buf[3..7].as_array().unwrap());
+        let path_type = PathType::from(buf[7]);
+        let path = MacString::try_from(&buf[8..])?;
+        Ok(Self { create_flag, volume_id, directory_id, path_type, path })
+    }
+}
+
+#[derive(Debug)]
+pub struct FPOpenFork {
+    pub volume_id: u16,
+    pub directory_id: u32,
+    pub file_bitmap: FPFileBitmap,
+    pub access_mode: u16,
+    pub path_type: PathType,
+    pub path: MacString,
+}
+
+impl FPOpenFork {
+    pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 12 {
+            return Err(AfpError::InvalidSize);
+        }
+        let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
+        let file_bitmap = FPFileBitmap::from(u16::from_be_bytes(*buf[6..8].as_array().unwrap()));
+        let access_mode = u16::from_be_bytes(*buf[8..10].as_array().unwrap());
+        let path_type = PathType::from(buf[10]);
+        let path = MacString::try_from(&buf[11..])?;
+        Ok(Self { volume_id, directory_id, file_bitmap, access_mode, path_type, path })
+    }
+}
+
+#[derive(Debug)]
+pub struct FPGetFileDirParms {
+    pub volume_id: u16,
+    pub directory_id: u32,
+    pub file_bitmap: FPFileBitmap,
+    pub dir_bitmap: FPDirectoryBitmap,
+    pub path_type: PathType,
+    pub path: MacString,
+}
+
+impl FPGetFileDirParms {
+    pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 12 {
+            return Err(AfpError::InvalidSize);
+        }
+        let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
+        let file_bitmap = FPFileBitmap::from(u16::from_be_bytes(*buf[6..8].as_array().unwrap()));
+        let dir_bitmap = FPDirectoryBitmap::from(u16::from_be_bytes(*buf[8..10].as_array().unwrap()));
+        let path_type = PathType::from(buf[10]);
+        let path = MacString::try_from(&buf[11..])?;
+        Ok(Self { volume_id, directory_id, file_bitmap, dir_bitmap, path_type, path })
+    }
+}
+
+#[derive(Debug)]
+pub struct FPSetFileDirParms {
+    pub volume_id: u16,
+    pub directory_id: u32,
+    /// Single bitmap governing both file and directory changes; common fields share bit positions.
+    pub file_bitmap: FPFileBitmap,
+    pub path_type: PathType,
+    pub path: MacString,
+    pub params: Vec<u8>,
+}
+
+impl FPSetFileDirParms {
+    pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 10 {
+            return Err(AfpError::InvalidSize);
+        }
+        let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
+        let file_bitmap = FPFileBitmap::from(u16::from_be_bytes(*buf[6..8].as_array().unwrap()));
+        let path_type = PathType::from(buf[8]);
+        let path = MacString::try_from(&buf[9..])?;
+        let mut param_offset = 9 + path.byte_len();
+        if param_offset % 2 != 0 {
+            param_offset += 1;
+        }
+        let params = buf[param_offset..].to_vec();
+        Ok(Self { volume_id, directory_id, file_bitmap, path_type, path, params })
+    }
+}
+
+/// FPMoveAndRename: atomically moves and/or renames a file or directory.
+///
+/// Wire layout (from buf[2..] — after command byte and pad):
+///   [0..2]  VolumeID
+///   [2..6]  SourceDirectoryID
+///   [6..10] DestinationDirectoryID
+///   [10]    SourcePathType
+///   [11..]  SourcePath (Pascal string)
+///   [11+src_len] DestinationPathType
+///   [11+src_len+1..] DestinationPath (Pascal string)
+///   [after dst] NewNamePathType
+///   [after dst+1] NewName (Pascal string — zero-length means keep original name)
+#[derive(Debug)]
+pub struct FPMoveAndRename {
+    pub volume_id: u16,
+    pub src_directory_id: u32,
+    pub dst_directory_id: u32,
+    pub src_path_type: PathType,
+    pub src_path: MacString,
+    pub dst_path_type: PathType,
+    pub dst_path: MacString,
+    pub new_name_path_type: PathType,
+    /// New name for the object. Empty string means keep the original name.
+    pub new_name: MacString,
+}
+
+impl FPMoveAndRename {
+    pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 12 {
+            return Err(AfpError::InvalidSize);
+        }
+        let volume_id = u16::from_be_bytes(*buf[0..2].as_array().unwrap());
+        let src_directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
+        let dst_directory_id = u32::from_be_bytes(*buf[6..10].as_array().unwrap());
+        let src_path_type = PathType::from(buf[10]);
+        let src_path = MacString::try_from(&buf[11..])?;
+
+        let dst_type_offset = 11 + src_path.byte_len();
+        if dst_type_offset >= buf.len() {
+            return Err(AfpError::InvalidSize);
+        }
+        let dst_path_type = PathType::from(buf[dst_type_offset]);
+        let dst_path = MacString::try_from(&buf[dst_type_offset + 1..])?;
+
+        // NewName has its own type byte prefix, just like src/dst paths.
+        // The whole NewName section is absent when the client sends a pure move.
+        let new_name_type_offset = dst_type_offset + 1 + dst_path.byte_len();
+        let (new_name_path_type, new_name) = if new_name_type_offset < buf.len() {
+            let new_name_path_type = PathType::from(buf[new_name_type_offset]);
+            let new_name = if new_name_type_offset + 1 < buf.len() {
+                MacString::try_from(&buf[new_name_type_offset + 1..])?
+            } else {
+                MacString::new(String::new())
+            };
+            (new_name_path_type, new_name)
+        } else {
+            (PathType::LongName, MacString::new(String::new()))
+        };
+
+        Ok(Self {
+            volume_id,
+            src_directory_id,
+            dst_directory_id,
+            src_path_type,
+            src_path,
+            dst_path_type,
+            dst_path,
+            new_name_path_type,
+            new_name,
+        })
     }
 }
