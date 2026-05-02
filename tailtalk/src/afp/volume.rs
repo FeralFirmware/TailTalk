@@ -1584,6 +1584,17 @@ impl Volume {
         Ok(())
     }
 
+    /// Renames a file or directory within its current parent directory.
+    pub async fn rename(
+        &mut self,
+        dir_id: u32,
+        src_path: &std::path::Path,
+        new_name: &str,
+    ) -> Result<(), AfpError> {
+        self.move_and_rename(dir_id, dir_id, src_path, std::path::Path::new(""), new_name)
+            .await
+    }
+
     pub async fn delete(&mut self, delete_req: &FPDelete) -> Result<(), AfpError> {
         let node_id = self.resolve_node(delete_req.directory_id, Path::new(&delete_req.path))?;
 

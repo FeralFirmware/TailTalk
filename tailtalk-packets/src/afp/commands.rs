@@ -23,6 +23,7 @@ pub const AFP_CMD_MOVE_AND_RENAME: u8 = 23;
 pub const AFP_CMD_OPEN_VOL: u8 = 24;
 pub const AFP_CMD_OPEN_FORK: u8 = 26;
 pub const AFP_CMD_READ: u8 = 27;
+pub const AFP_CMD_RENAME: u8 = 28;
 pub const AFP_CMD_SET_DIR_PARMS: u8 = 29;
 pub const AFP_CMD_SET_FORK_PARMS: u8 = 31;
 pub const AFP_CMD_WRITE: u8 = 33;
@@ -902,6 +903,32 @@ mod tests {
     }
 
     #[test]
+    fn test_fp_rename_parse() {
+        // FPRename: rename "old.txt" to "new.txt" in directory 2.
+        #[rustfmt::skip]
+        let raw: &[u8] = &[
+            0x1c, 0x00,             // command=28, pad
+            0x00, 0x01,             // volume_id=1
+            0x00, 0x00, 0x00, 0x02, // directory_id=2
+            0x02,                   // path_type=LongName
+            0x07,                   // path len=7
+            b'o', b'l', b'd', b'.', b't', b'x', b't', // "old.txt"
+            0x02,                   // new_name_path_type=LongName
+            0x07,                   // new_name len=7
+            b'n', b'e', b'w', b'.', b't', b'x', b't', // "new.txt"
+        ];
+
+        let cmd = FPRename::parse(&raw[2..]).expect("parse should succeed");
+
+        assert_eq!(cmd.volume_id, 1);
+        assert_eq!(cmd.directory_id, 2);
+        assert_eq!(cmd.path_type, PathType::LongName);
+        assert_eq!(cmd.path.as_str(), "old.txt");
+        assert_eq!(cmd.new_name_path_type, PathType::LongName);
+        assert_eq!(cmd.new_name.as_str(), "new.txt");
+    }
+
+    #[test]
     fn test_fp_move_and_rename_parse() {
         // Real packet captured from Mac Finder via Wireshark.
         // FPMoveAndRename: move "appleshare.smi.bin" from DID=2 to DID=13, no rename.
@@ -1091,6 +1118,53 @@ impl FPSetFileDirParms {
         }
         let params = buf[param_offset..].to_vec();
         Ok(Self { volume_id, directory_id, file_bitmap, path_type, path, params })
+    }
+}
+
+/// FPRename: renames a file or directory within its current parent directory.
+///
+/// Wire layout (from buf[2..] — after command byte and pad):
+///   [0..2]  VolumeID
+///   [2..6]  DirectoryID (parent directory of the object)
+///   [6]     PathType
+///   [7..]   Path (Pascal string — identifies the object to rename)
+///   [7+path_len] NewNamePathType
+///   [7+path_len+1..] NewName (Pascal string — the new name)
+#[derive(Debug)]
+pub struct FPRename {
+    pub volume_id: u16,
+    pub directory_id: u32,
+    pub path_type: PathType,
+    pub path: MacString,
+    pub new_name_path_type: PathType,
+    pub new_name: MacString,
+}
+
+impl FPRename {
+    pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 8 {
+            return Err(AfpError::InvalidSize);
+        }
+        let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
+        let path_type = PathType::from(buf[6]);
+        let path = MacString::try_from(&buf[7..])?;
+
+        let new_name_type_offset = 7 + path.byte_len();
+        if new_name_type_offset >= buf.len() {
+            return Err(AfpError::InvalidSize);
+        }
+        let new_name_path_type = PathType::from(buf[new_name_type_offset]);
+        let new_name = MacString::try_from(&buf[new_name_type_offset + 1..])?;
+
+        Ok(Self {
+            volume_id,
+            directory_id,
+            path_type,
+            path,
+            new_name_path_type,
+            new_name,
+        })
     }
 }
 

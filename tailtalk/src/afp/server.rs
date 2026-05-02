@@ -8,8 +8,8 @@ use tailtalk_packets::afp::{
     AfpError, AfpUam, AfpVersion, FPByteRangeLock, FPCloseFork, FPCreateDir, FPCreateFile,
     FPDelete, FPDirectoryBitmap, FPEnumerate, FPFlush, FPGetFileDirParms, FPGetForkParms,
     FPGetSrvrInfo, FPGetSrvrParms, FPGetVolParms, FPMoveAndRename, FPOpenFork, FPRead,
-    FPSetDirParms, FPSetFileDirParms, FPSetForkParms, FPVolumeBitmap, ForkType, AFP_CMD_LOGOUT,
-    AFP_CMD_MOVE_AND_RENAME,
+    FPRename, FPSetDirParms, FPSetFileDirParms, FPSetForkParms, FPVolumeBitmap, ForkType,
+    AFP_CMD_LOGOUT, AFP_CMD_MOVE_AND_RENAME, AFP_CMD_RENAME,
 };
 use tailtalk_packets::nbp::EntityName;
 use tracing::{error, info, warn};
@@ -341,6 +341,9 @@ impl AspSession {
                 AFP_CMD_MOVE_AND_RENAME => {
                     self.handle_move_and_rename(command, &mut our_volume).await?;
                 }
+                AFP_CMD_RENAME => {
+                    self.handle_rename(command, &mut our_volume).await?;
+                }
                 AFP_CMD_LOGOUT => {
                     command.send_reply(AspCommandResponse {
                         result: [0u8; 4],
@@ -580,6 +583,44 @@ impl AspSession {
                 cmd.dst_directory_id,
                 &src_path,
                 &dst_path,
+                cmd.new_name.as_str(),
+            )
+            .await
+        {
+            Ok(()) => {
+                command.send_reply(AspCommandResponse {
+                    result: [0u8; 4],
+                    data: vec![],
+                })?;
+            }
+            Err(e) => {
+                command.send_reply(AspCommandResponse {
+                    result: (e as u32).to_be_bytes(),
+                    data: Vec::new(),
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_rename(
+        &self,
+        command: crate::asp::AspCommand,
+        our_volume: &mut Volume,
+    ) -> anyhow::Result<()> {
+        let cmd = match FPRename::parse(&command.data[2..]) {
+            Ok(c) => c,
+            Err(e) => {
+                command.send_reply(create_error_reply(e))?;
+                return Ok(());
+            }
+        };
+
+        match our_volume
+            .rename(
+                cmd.directory_id,
+                &PathBuf::from(cmd.path.to_string()),
                 cmd.new_name.as_str(),
             )
             .await
