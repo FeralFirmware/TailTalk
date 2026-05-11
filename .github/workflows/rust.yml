@@ -1,0 +1,83 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  release:
+    types: [created]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install dependencies
+      run: |
+        if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig1-dev libudev-dev
+        elif [ "${{ matrix.os }}" = "macos-latest" ]; then
+          brew install pkg-config fontconfig
+        fi
+    - name: Build
+      run: cargo build
+    - name: Run tests
+      run: cargo test
+
+  release:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    needs: build
+    if: github.event_name == 'release'
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install dependencies
+      run: |
+        if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig1-dev
+        elif [ "${{ matrix.os }}" = "macos-latest" ]; then
+          brew install pkg-config fontconfig
+        fi
+    - name: Build release
+      if: matrix.os == 'ubuntu-latest'
+      run: cargo build --release
+    - name: Build AppImage (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: cargo packager -f appimage --release -p tailtalk-gui
+    - name: Upload AppImage to release
+      if: matrix.os == 'ubuntu-latest'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: dist/*.appimage
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build x86_64 (macOS)
+      if: matrix.os == 'macos-latest'
+      run: cargo build --release --target x86_64-apple-darwin -p tailtalk-gui
+    - name: Build aarch64 (macOS)
+      if: matrix.os == 'macos-latest'
+      run: cargo build --release --target aarch64-apple-darwin -p tailtalk-gui
+    - name: Create universal binary (macOS)
+      if: matrix.os == 'macos-latest'
+      run: lipo -create -output target/release/tailtalk-gui target/x86_64-apple-darwin/release/tailtalk-gui target/aarch64-apple-darwin/release/tailtalk-gui
+    - name: Build DMG (macOS)
+      if: matrix.os == 'macos-latest'
+      run: cargo packager --release -p tailtalk-gui
+    - name: Upload DMG to release
+      if: matrix.os == 'macos-latest'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: dist/*.dmg
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
