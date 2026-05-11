@@ -23,7 +23,7 @@ jobs:
       run: |
         if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
           sudo apt-get update
-          sudo apt-get install -y pkg-config libfontconfig1-dev libudev-dev
+          sudo apt-get install -y pkg-config libfontconfig1-dev libudev-dev libpcap-dev
         elif [ "${{ matrix.os }}" = "macos-latest" ]; then
           brew install pkg-config fontconfig
         fi
@@ -45,7 +45,7 @@ jobs:
       run: |
         if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
           sudo apt-get update
-          sudo apt-get install -y pkg-config libfontconfig1-dev
+          sudo apt-get install -y pkg-config libfontconfig1-dev libudev-dev libpcap-dev
         elif [ "${{ matrix.os }}" = "macos-latest" ]; then
           brew install pkg-config fontconfig
         fi

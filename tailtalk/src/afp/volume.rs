@@ -1291,6 +1291,10 @@ impl Volume {
             _ => a.2.cmp(&b.2),
         });
 
+        if entries.is_empty() {
+            return Err(AfpError::ObjectNotFound);
+        }
+
         let start_index = enumerate_cmd.start_index as usize;
 
         if start_index == 0 {
@@ -1886,7 +1890,7 @@ mod tests {
         File::create(&file1_path).await.unwrap();
         File::create(&file2_path).await.unwrap();
 
-        let volume = Volume::new(volume_name, root_path.clone(), 1).await;
+        let mut volume = Volume::new(volume_name, root_path.clone(), 1).await;
 
         let enumerate_cmd = FPEnumerate {
             volume_id: 1,
@@ -2158,7 +2162,7 @@ mod tests {
         File::create(subdir.join("b.txt")).await.unwrap();
         File::create(subdir.join("c.txt")).await.unwrap();
 
-        let volume = Volume::new("TestVol".to_string(), root_path, 1).await;
+        let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
         let subdir_id = volume.resolve_node(2, Path::new("subdir")).unwrap();
 
         let enumerate_cmd = FPEnumerate {

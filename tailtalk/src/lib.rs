@@ -72,24 +72,30 @@ pub struct PacketProcessor {
 ///
 /// # Example – EtherTalk only
 /// ```no_run
+/// # use tailtalk::PacketProcessor;
 /// let (processor, handle) = PacketProcessor::builder()
 ///     .ethernet("eth0")
 ///     .build()?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 ///
 /// # Example – LocalTalk only
 /// ```no_run
+/// # use tailtalk::PacketProcessor;
 /// let (processor, handle) = PacketProcessor::builder()
 ///     .localtalk("/dev/ttyUSB0")
 ///     .build()?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 ///
 /// # Example – both transports
 /// ```no_run
+/// # use tailtalk::PacketProcessor;
 /// let (processor, handle) = PacketProcessor::builder()
 ///     .ethernet("eth0")
 ///     .localtalk("/dev/ttyUSB0")
 ///     .build()?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct PacketProcessorBuilder {
     ethernet_intf: Option<String>,
