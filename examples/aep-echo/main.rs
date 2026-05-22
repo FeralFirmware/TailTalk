@@ -5,12 +5,16 @@ use tailtalk_packets::aarp::AppleTalkAddress;
 #[derive(Parser, Debug)]
 #[command(about = "Send an AppleTalk AEP (Echo Protocol) request")]
 struct Args {
-    /// Network interface to bind to
+    /// Network interface to bind to (EtherTalk)
     #[arg(short, long)]
-    interface: String,
+    interface: Option<String>,
+
+    /// TashTalk serial port path (LocalTalk)
+    #[arg(short, long)]
+    tashtalk: Option<String>,
 
     /// Destination AppleTalk network number
-    #[arg(short, long)]
+    #[arg(short = 'N', long)]
     network: u16,
 
     /// Destination AppleTalk node number
@@ -20,15 +24,27 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let args = Args::parse();
 
-    let stack = TalkStack::builder()
-        .ethernet(&args.interface)
-        .build()
-        .await
-        .expect("failed to build AppleTalk stack");
+    if args.interface.is_none() && args.tashtalk.is_none() {
+        anyhow::bail!("at least one of --interface or --tashtalk is required");
+    }
+
+    let mut builder = TalkStack::builder();
+    if let Some(ref intf) = args.interface {
+        builder = builder.ethernet(intf);
+    }
+    if let Some(ref tty) = args.tashtalk {
+        builder = builder.localtalk(tty);
+    }
+    let stack = builder.build().await.expect("failed to build AppleTalk stack");
 
     let addr = AppleTalkAddress {
         network_number: args.network,

@@ -22,6 +22,8 @@ struct PendingRequest {
     tx: oneshot::Sender<Result<Duration, Error>>,
 }
 
+const ECHO_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct Echo {
     request_rx: mpsc::Receiver<EchoRequest>,
     sock: DdpSocket,
@@ -49,6 +51,8 @@ impl Echo {
     }
 
     async fn run(mut self) {
+        let mut timeout_check = tokio::time::interval(Duration::from_millis(500));
+        timeout_check.tick().await; // first tick completes immediately
         loop {
             tokio::select! {
                 try_req = self.request_rx.recv() => {
@@ -63,6 +67,27 @@ impl Echo {
                         Err(_) => break,
                     }
                 }
+                _ = timeout_check.tick() => {
+                    self.check_timeouts();
+                }
+            }
+        }
+    }
+
+    fn check_timeouts(&mut self) {
+        let expired: Vec<AppleTalkAddress> = self
+            .pending
+            .iter()
+            .filter(|(_, req)| req.start_time.elapsed() > ECHO_TIMEOUT)
+            .map(|(addr, _)| *addr)
+            .collect();
+        for addr in expired {
+            if let Some(req) = self.pending.remove(&addr) {
+                tracing::warn!("AEP echo to {}.{} timed out", addr.network_number, addr.node_number);
+                let _ = req.tx.send(Err(Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("echo to {}.{} timed out after {}s", addr.network_number, addr.node_number, ECHO_TIMEOUT.as_secs()),
+                )));
             }
         }
     }

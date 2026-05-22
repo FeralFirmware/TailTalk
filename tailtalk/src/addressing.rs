@@ -76,6 +76,7 @@ impl Addressing {
             request_send,
             packet_send,
             cache,
+            our_mac,
         }
     }
 
@@ -259,13 +260,19 @@ pub struct AddressingHandle {
     request_send: mpsc::Sender<AarpCommand>,
     packet_send: mpsc::Sender<(AarpPacket, AddressSource)>,
     pub(crate) cache: Arc<DashMap<AppleTalkAddress, Node>>,
+    our_mac: EthernetMac,
     _cancel: Arc<DropGuard>,
 }
 
 impl AddressingHandle {
     pub fn try_lookup(&self, addr: &AppleTalkAddress) -> Option<Node> {
+        // LocalTalk-only: node IDs are the link-layer addresses, no
+        // AARP resolution needed. Route everything as LocalTalk.
+        if self.our_mac == [0; 6] {
+            return Some(Node::LocalTalk(addr.node_number));
+        }
+
         if addr.node_number == 255 {
-            // Broadcast - default to EtherTalkPhase2
             return Some(Node::EtherTalkPhase2(Addressing::BROADCAST_MAC));
         }
         self.cache.get(addr).map(|v| *v)

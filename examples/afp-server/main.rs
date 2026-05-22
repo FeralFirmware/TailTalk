@@ -8,15 +8,15 @@ use tailtalk::{
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Network interface to bind to
+    /// Network interface to bind to (EtherTalk)
     #[arg(short, long)]
-    interface: String,
+    interface: Option<String>,
 
     /// Path to serve via AFP
     #[arg(short, long)]
     path: PathBuf,
 
-    /// Optional TashTalk serial port path
+    /// TashTalk serial port path (LocalTalk)
     #[arg(short, long)]
     tashtalk: Option<String>,
 }
@@ -24,12 +24,23 @@ struct Args {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let args = Args::parse();
 
-    let mut builder = TalkStack::builder().ethernet(&args.interface);
+    if args.interface.is_none() && args.tashtalk.is_none() {
+        eprintln!("error: at least one of --interface or --tashtalk is required");
+        std::process::exit(1);
+    }
+
+    let mut builder = TalkStack::builder();
+    if let Some(ref intf) = args.interface {
+        builder = builder.ethernet(intf);
+    }
     if let Some(ref tty) = args.tashtalk {
         builder = builder.localtalk(tty);
     }
@@ -44,7 +55,8 @@ async fn main() {
         .await
         .expect("failed to spawn AFP server");
 
-    tracing::info!("AFP server serving {:?} on {}", args.path, args.interface);
+    let transport = args.interface.as_deref().unwrap_or("LocalTalk");
+    tracing::info!("AFP server serving {:?} on {}", args.path, transport);
     tracing::info!("Press Ctrl+C to exit");
 
     tokio::signal::ctrl_c()

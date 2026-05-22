@@ -250,11 +250,13 @@ impl DdpProcessor {
             .addr()
             .await
             .expect("failed to get our addr");
+        tracing::debug!("DDP outbound: dest={:?} proto={:?} len={}", packet.dest, packet.protocol, packet.payload.len());
         let dest_node = self
             .addressing
             .lookup(packet.dest.addr)
             .await
             .expect("unknown addr");
+        tracing::debug!("DDP outbound: resolved to {:?}", dest_node);
 
         // Short DDP (DDP-S, 5-byte header) is LocalTalk only.
         let use_short = matches!(dest_node, Node::LocalTalk(_));

@@ -430,12 +430,14 @@ impl PacketProcessor {
         // and ddp handles, which callers construct using the OutboundHandle that
         // build() returns.
         let tashtalk_features = self.tashtalk_features;
+        let (tashtalk_ready_tx, mut tashtalk_ready_rx) = tokio::sync::watch::channel(false);
         let tashtalk_tx: Option<mpsc::Sender<Vec<u8>>> = if let Some(mut tashtalk_instance) = self.tashtalk {
             let (tx, mut tashtalk_rx) = mpsc::channel::<Vec<u8>>(100);
 
             let ddp_handle = ddp.clone();
             let addressing_handle = addressing.clone();
             let tash_token = token.clone();
+            let ready = tashtalk_ready_tx; // moved into the spawned task
 
             tokio::spawn(async move {
                 tracing::info!("Resetting TashTalk buffers...");
@@ -472,6 +474,7 @@ impl PacketProcessor {
                 }
 
                 tracing::info!("Starting TashTalk async loop");
+                let _ = ready.send(true);
                 let mut last_receive_was_error = false;
                 loop {
                     tokio::select! {
@@ -556,6 +559,9 @@ impl PacketProcessor {
 
             Some(tx)
         } else {
+            // No TashTalk — signal ready immediately so the outbound
+            // loop doesn't block waiting for a device that doesn't exist.
+            let _ = tashtalk_ready_tx.send(true);
             None
         };
 
@@ -563,6 +569,11 @@ impl PacketProcessor {
         let our_mac = self.our_mac.unwrap_or([0; 6]);
         let mut rx = self.outbound_rx;
         let mut pcap_tx = self.pcap_tx;
+
+        // Wait for TashTalk init (reset + set_features + set_node_ids) to
+        // finish before processing outbound frames. Without this, frames
+        // queued during init would be sent before the firmware is configured.
+        let _ = tashtalk_ready_rx.wait_for(|ready| *ready).await;
 
         loop {
             let pkt = tokio::select! {
