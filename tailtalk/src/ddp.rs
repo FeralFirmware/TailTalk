@@ -104,11 +104,16 @@ pub struct DdpProcessor {
     command_rx: mpsc::Receiver<DdpCommand>,
     command_tx: mpsc::Sender<DdpCommand>,
     ethertalk: OutboundHandle,
-    addressing: AddressingHandle,
+    et_addressing: Option<AddressingHandle>,
+    lt_addressing: Option<AddressingHandle>,
 }
 
 impl DdpProcessor {
-    pub fn spawn(addressing: AddressingHandle, ethertalk: OutboundHandle) -> DdpHandle {
+    pub fn spawn(
+        et_addressing: Option<AddressingHandle>,
+        lt_addressing: Option<AddressingHandle>,
+        ethertalk: OutboundHandle,
+    ) -> DdpHandle {
         let (command_tx, command_rx) = mpsc::channel(100);
 
         let processor = Self {
@@ -116,7 +121,8 @@ impl DdpProcessor {
             command_rx,
             command_tx: command_tx.clone(),
             ethertalk,
-            addressing,
+            et_addressing,
+            lt_addressing,
         };
 
         tokio::spawn(async move { processor.run().await });
@@ -171,54 +177,49 @@ impl DdpProcessor {
     }
 
     async fn handle_packet(&mut self, packet: DdpPacket) {
-        let our_addr = self
-            .addressing
-            .addr()
-            .await
-            .expect("failed to get our addr");
-
-        // Auto-cache the source address if we don't already know it
+        // Auto-cache EtherTalk source addresses; LocalTalk is resolved directly by node number.
         let source_addr = AppleTalkAddress {
             network_number: packet.headers.src_network_num,
             node_number: packet.headers.src_node_id,
         };
 
-        if self.addressing.try_lookup(&source_addr).is_none() {
-            tracing::debug!(
-                "Learning new address from DDP packet: {}.{} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({})",
-                source_addr.network_number,
-                source_addr.node_number,
-                packet.source_mac[0],
-                packet.source_mac[1],
-                packet.source_mac[2],
-                packet.source_mac[3],
-                packet.source_mac[4],
-                packet.source_mac[5],
-                match packet.source {
-                    AppleTalkAddressSource::EtherTalkPhase2 => "EtherTalkPhase2",
-                    AppleTalkAddressSource::EtherTalkPhase1 => "EtherTalkPhase1",
-                    AppleTalkAddressSource::LocalTalk => "LocalTalk",
+        match packet.source {
+            AppleTalkAddressSource::LocalTalk => {}
+            _ => {
+                if let Some(et) = &self.et_addressing
+                    && et.try_lookup(&source_addr).is_none() {
+                        let node = match packet.source {
+                            AppleTalkAddressSource::EtherTalkPhase2 => Node::EtherTalkPhase2(packet.source_mac),
+                            AppleTalkAddressSource::EtherTalkPhase1 => Node::EtherTalkPhase1(packet.source_mac),
+                            AppleTalkAddressSource::LocalTalk => unreachable!(),
+                        };
+                        tracing::debug!(
+                            "Learning new address from DDP packet: {}.{} ({:?})",
+                            source_addr.network_number, source_addr.node_number, packet.source
+                        );
+                        et.learn(source_addr, node);
                 }
-            );
-            // Cache it using the addressing handle's internal cache
-            // We need to use the internal cache directly since try_lookup uses it
-            let node = match packet.source {
-                AppleTalkAddressSource::EtherTalkPhase2 => Node::EtherTalkPhase2(packet.source_mac),
-                AppleTalkAddressSource::EtherTalkPhase1 => Node::EtherTalkPhase1(packet.source_mac),
-                AppleTalkAddressSource::LocalTalk => Node::LocalTalk(packet.headers.src_node_id),
-            };
-            self.addressing.cache.insert(source_addr, node);
+            }
         }
 
-        // Accept packets addressed to us or broadcast (node 255)
-        let is_for_us = packet.headers.dest_node_id == 255
-            || our_addr.matches(
-                &AppleTalkAddress {
-                    network_number: packet.headers.dest_network_num,
-                    node_number: packet.headers.dest_node_id,
-                },
-                packet.source,
-            );
+        // Accept broadcast or any packet that matches one of our interface addresses.
+        let dest = AppleTalkAddress {
+            network_number: packet.headers.dest_network_num,
+            node_number: packet.headers.dest_node_id,
+        };
+        let is_for_us = packet.headers.dest_node_id == 255 || {
+            let mut matched = false;
+            if let Some(et) = &self.et_addressing
+                && let Ok(our) = et.addr().await {
+                    matched |= our.matches(&dest, packet.source);
+            }
+            if !matched
+                && let Some(lt) = &self.lt_addressing
+                && let Ok(our) = lt.addr().await {
+                    matched |= our.matches(&dest, packet.source);
+            }
+            matched
+        };
 
         if !is_for_us {
             return;
@@ -245,18 +246,32 @@ impl DdpProcessor {
     }
 
     async fn handle_outbound(&mut self, packet: OutboundPacket) {
-        let our_addr = self
-            .addressing
-            .addr()
-            .await
-            .expect("failed to get our addr");
-        tracing::debug!("DDP outbound: dest={:?} proto={:?} len={}", packet.dest, packet.protocol, packet.payload.len());
-        let dest_node = self
-            .addressing
-            .lookup(packet.dest.addr)
-            .await
-            .expect("unknown addr");
-        tracing::debug!("DDP outbound: resolved to {:?}", dest_node);
+        let dest_node = if packet.dest.addr.network_number == 0 {
+            if self.lt_addressing.is_none() {
+                tracing::error!(
+                    "DDP: dropping packet to {}.{} — LocalTalk (network 0) not configured",
+                    packet.dest.addr.network_number,
+                    packet.dest.addr.node_number,
+                );
+                return;
+            }
+            Node::LocalTalk(packet.dest.addr.node_number)
+        } else {
+            let Some(et) = &self.et_addressing else {
+                tracing::error!(
+                    "DDP: dropping packet to {}.{} — EtherTalk not configured",
+                    packet.dest.addr.network_number,
+                    packet.dest.addr.node_number,
+                );
+                return;
+            };
+            et.lookup(packet.dest.addr).await.expect("unknown addr")
+        };
+
+        let our_addr = match &dest_node {
+            Node::LocalTalk(_) => self.lt_addressing.as_ref().unwrap().addr().await.unwrap(),
+            _ => self.et_addressing.as_ref().unwrap().addr().await.unwrap(),
+        };
 
         // Short DDP (DDP-S, 5-byte header) is LocalTalk only.
         let use_short = matches!(dest_node, Node::LocalTalk(_));

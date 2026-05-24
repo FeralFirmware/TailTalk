@@ -31,6 +31,8 @@ pub mod stylewriter;
 pub enum DataLinkProtocol {
     Ddp,
     Aarp,
+    LlapEnq,
+    LlapAck,
 }
 
 #[derive(Debug)]
@@ -297,7 +299,13 @@ impl PacketProcessor {
         self.our_mac
     }
 
-    pub async fn run(self, addressing: addressing::AddressingHandle, ddp: ddp::DdpHandle, token: CancellationToken) {
+    pub async fn run(
+        self,
+        et_addressing: Option<addressing::AddressingHandle>,
+        lt_addressing: Option<addressing::AddressingHandle>,
+        ddp: ddp::DdpHandle,
+        token: CancellationToken,
+    ) {
         // Extract pcap senders before any other field moves.
         // pcap_rx_sender goes into the TashTalk receive task; pcap_tx_sender stays in the outbound loop.
         let pcap_rx_sender = self.pcap_sender.clone();
@@ -306,7 +314,7 @@ impl PacketProcessor {
         // ── EtherTalk RX task ────────────────────────────────────────────────
         if let Some(rx_cap) = self.pcap_rx {
             let ddp_rx = ddp.clone();
-            let addressing_rx = addressing.clone();
+            let addressing_rx = et_addressing.clone().expect("EtherTalk RX task requires ET addressing");
             let rx_token = token.clone();
 
             let rx_cap = match rx_cap.setnonblock() {
@@ -435,7 +443,7 @@ impl PacketProcessor {
             let (tx, mut tashtalk_rx) = mpsc::channel::<Vec<u8>>(100);
 
             let ddp_handle = ddp.clone();
-            let addressing_handle = addressing.clone();
+            let addressing_handle = lt_addressing.clone().expect("TashTalk task requires LT addressing");
             let tash_token = token.clone();
             let ready = tashtalk_ready_tx; // moved into the spawned task
 
@@ -519,6 +527,12 @@ impl PacketProcessor {
                                                         [0; 6],
                                                     );
                                                 }
+                                            }
+                                            LlapType::Enquiry => {
+                                                addressing_handle.received_llap_enq(llap.dst_node);
+                                            }
+                                            LlapType::Acknowledge => {
+                                                addressing_handle.received_llap_ack(llap.src_node);
                                             }
                                             LlapType::DdpLong => {
                                                 tracing::info!("TashTalk: LocalTalk DDP Long");
@@ -638,6 +652,30 @@ impl PacketProcessor {
 
                             frame_end + 2
                         }
+                    }
+                }
+                DataLinkProtocol::LlapEnq | DataLinkProtocol::LlapAck => {
+                    match pkt.dest_node {
+                        addressing::Node::LocalTalk(node_id) => {
+                            let type_ = if pkt.protocol == DataLinkProtocol::LlapEnq {
+                                LlapType::Enquiry
+                            } else {
+                                LlapType::Acknowledge
+                            };
+                            let llap_pkt = LlapPacket {
+                                dst_node: node_id,
+                                src_node: pkt.src_node_id,
+                                type_,
+                            };
+                            let header_len = llap_pkt
+                                .to_bytes(&mut output_buf)
+                                .expect("failed to frame LLAP control");
+                            let crc = tashtalk::lt_crc(&output_buf[..header_len]);
+                            output_buf[header_len] = crc[0];
+                            output_buf[header_len + 1] = crc[1];
+                            header_len + 2
+                        }
+                        _ => 0,
                     }
                 }
                 DataLinkProtocol::Aarp => {
@@ -769,7 +807,10 @@ impl ShutdownHandle {
 /// # Ok(()) }
 /// ```
 pub struct TalkStack {
-    pub addressing: addressing::AddressingHandle,
+    /// EtherTalk addressing handle, present when an Ethernet interface is configured.
+    pub et_addressing: Option<addressing::AddressingHandle>,
+    /// LocalTalk addressing handle, present when a TashTalk serial interface is configured.
+    pub lt_addressing: Option<addressing::AddressingHandle>,
     pub ddp: ddp::DdpHandle,
     pub nbp: nbp::NbpHandle,
     pub echo: echo::EchoHandle,
@@ -885,38 +926,48 @@ impl TalkStackBuilder {
         }
         let (processor, outbound) = pp.build()?;
 
-        // On LocalTalk-only setups, short DDP carries no network number (implying 0).
-        // If we let AARP pick network 1, NBP advertises net 1 but packets appear as
-        // net 0 — clients reject server-initiated requests (WriteContinue) due to the
-        // mismatch. Force network 0 so the address is consistent end-to-end.
-        let fixed_addr = if self.fixed_addr.is_some() {
-            self.fixed_addr
-        } else if self.ethernet_intf.is_none() && self.localtalk_serial_path.is_some() {
-            Some(tailtalk_packets::aarp::AppleTalkAddress {
-                network_number: 0,
-                node_number: rand::rng().random_range(1..=253u8),
-            })
+        // EtherTalk addressing: AARP probe (or fixed address if caller specified one).
+        let et_addressing = if self.ethernet_intf.is_some() {
+            Some(addressing::Addressing::spawn(
+                processor.get_mac(),
+                outbound.clone(),
+                self.fixed_addr,
+            ))
         } else {
             None
         };
 
-        let mac = processor.get_mac().unwrap_or([0u8; 6]);
-        let addressing = addressing::Addressing::spawn(mac, outbound.clone(), fixed_addr);
-        let ddp = ddp::DdpProcessor::spawn(addressing.clone(), outbound);
+        // LocalTalk addressing: always a fixed random address on network 0.
+        // LocalTalk short-DDP carries no network number (implying 0), so we
+        // must stay on network 0 to keep addresses consistent end-to-end.
+        let lt_addressing = if self.localtalk_serial_path.is_some() {
+            let lt_fixed = Some(tailtalk_packets::aarp::AppleTalkAddress {
+                network_number: 0,
+                node_number: rand::rng().random_range(1..=253u8),
+            });
+            Some(addressing::Addressing::spawn(None, outbound.clone(), lt_fixed))
+        } else {
+            None
+        };
+
+        let ddp = ddp::DdpProcessor::spawn(et_addressing.clone(), lt_addressing.clone(), outbound);
         let echo = echo::Echo::spawn(&ddp).await;
-        let nbp = nbp::Nbp::spawn(&ddp, addressing.clone()).await;
+        let nbp = nbp::Nbp::spawn(&ddp, et_addressing.clone(), lt_addressing.clone()).await;
 
         let service_token = CancellationToken::new();
         let transport_token = CancellationToken::new();
         let services_done = CancellationToken::new();
-        tokio::spawn(processor.run(addressing.clone(), ddp.clone(), transport_token.clone()));
+        tokio::spawn(processor.run(et_addressing.clone(), lt_addressing.clone(), ddp.clone(), transport_token.clone()));
 
-        // Wait until AARP has confirmed our node address before returning.
-        // Without this, callers could attempt to send packets before addressing
-        // is ready, especially when probing is required (no fixed address).
-        addressing.addr().await?;
+        // Wait until addressing has settled on all active interfaces.
+        if let Some(et) = &et_addressing {
+            et.addr().await?;
+        }
+        if let Some(lt) = &lt_addressing {
+            lt.addr().await?;
+        }
 
-        Ok(TalkStack { addressing, ddp, nbp, echo, service_token, transport_token, services_done })
+        Ok(TalkStack { et_addressing, lt_addressing, ddp, nbp, echo, service_token, transport_token, services_done })
     }
 }
 

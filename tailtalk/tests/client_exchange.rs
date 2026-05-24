@@ -76,8 +76,8 @@ impl TestClient {
             }
         });
 
-        let addressing = Addressing::spawn(mac, outbound_handle.clone(), None);
-        let ddp = DdpProcessor::spawn(addressing.clone(), outbound_handle.clone());
+        let addressing = Addressing::spawn(Some(mac), outbound_handle.clone(), None);
+        let ddp = DdpProcessor::spawn(Some(addressing.clone()), None, outbound_handle.clone());
 
         let echo = Echo::spawn(&ddp).await;
         let (_atp_socket, atp_req, mut atp_resp) = Atp::spawn(&ddp, atp_socket).await;
@@ -89,7 +89,7 @@ impl TestClient {
             }
         });
 
-        let nbp = Nbp::spawn(&ddp, addressing.clone()).await;
+        let nbp = Nbp::spawn(&ddp, Some(addressing.clone()), None).await;
 
         let mut rx = hub_rx;
         let ddp_handle = ddp.clone();
@@ -133,6 +133,7 @@ impl TestClient {
                                 let _ = addressing_handle
                                     .received_pkt(&pkt.payload, AddressSource::EtherTalkPhase2);
                             }
+                            DataLinkProtocol::LlapEnq | DataLinkProtocol::LlapAck => {}
                         }
                     } else {
                         tracing::info!(

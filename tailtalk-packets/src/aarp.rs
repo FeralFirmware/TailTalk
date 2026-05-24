@@ -1,8 +1,6 @@
 use byteorder::{BigEndian, ReadBytesExt};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use std::io::{Cursor, Error, Read};
-
-const AARP_MIN_LEN: usize = 28;
 
 pub type EthernetMac = [u8; 6];
 
@@ -10,6 +8,7 @@ pub type EthernetMac = [u8; 6];
 pub enum AarpError {
     InvalidSize,
     UnknownOpcode(u16),
+    UnsupportedHardwareSize(u8),
     StdIoError(Error),
 }
 
@@ -70,8 +69,8 @@ pub enum AarpOpcode {
 pub struct AarpPacket {
     pub hardware_type: u16,
     pub protocol_type: u16,
-    pub hardware_size: u8, // Always 6 for EtherTalk networks - Only case supported
-    pub protocol_size: u8, // Always 4 for typical AppleTalk networks
+    pub hardware_size: u8,
+    pub protocol_size: u8,
     pub opcode: AarpOpcode,
     pub sender_addr: EthernetMac,
     pub sender_protocol: AppleTalkAddress,
@@ -83,7 +82,7 @@ impl AarpPacket {
     pub const LEN: usize = 28;
 
     pub fn parse(buf: &[u8]) -> Result<Self, AarpError> {
-        if buf.len() < AARP_MIN_LEN {
+        if buf.len() < Self::LEN {
             return Err(AarpError::InvalidSize);
         }
 
@@ -92,29 +91,28 @@ impl AarpPacket {
         let protocol_type = cursor.read_u16::<BigEndian>()?;
         let hardware_size = cursor.read_u8()?;
         let protocol_size = cursor.read_u8()?;
-        let opcode = {
-            let opcode = cursor.read_u16::<BigEndian>()?;
-
-            match opcode {
-                1 => AarpOpcode::Request,
-                2 => AarpOpcode::Response,
-                3 => AarpOpcode::Probe,
-                _ => return Err(AarpError::UnknownOpcode(opcode)),
-            }
+        let opcode = match cursor.read_u16::<BigEndian>()? {
+            1 => AarpOpcode::Request,
+            2 => AarpOpcode::Response,
+            3 => AarpOpcode::Probe,
+            n => return Err(AarpError::UnknownOpcode(n)),
         };
 
-        let mut sender_addr: [u8; 6] = [0u8; 6];
-        cursor.read_exact(&mut sender_addr)?;
+        if hardware_size != 6 {
+            return Err(AarpError::UnsupportedHardwareSize(hardware_size));
+        }
 
-        let mut protocol: [u8; 4] = [0u8; 4];
-        cursor.read_exact(&mut protocol)?;
-        let sender_protocol = AppleTalkAddress::decode(protocol);
+        let mut proto_buf = [0u8; 4];
 
-        let mut target_addr: [u8; 6] = [0u8; 6];
-        cursor.read_exact(&mut target_addr)?;
+        let mut sender_mac = [0u8; 6];
+        cursor.read_exact(&mut sender_mac)?;
+        cursor.read_exact(&mut proto_buf)?;
+        let sender_protocol = AppleTalkAddress::decode(proto_buf);
 
-        cursor.read_exact(&mut protocol)?;
-        let target_protocol = AppleTalkAddress::decode(protocol);
+        let mut target_mac = [0u8; 6];
+        cursor.read_exact(&mut target_mac)?;
+        cursor.read_exact(&mut proto_buf)?;
+        let target_protocol = AppleTalkAddress::decode(proto_buf);
 
         Ok(Self {
             hardware_type,
@@ -122,15 +120,15 @@ impl AarpPacket {
             hardware_size,
             protocol_size,
             opcode,
-            sender_addr,
+            sender_addr: sender_mac,
             sender_protocol,
-            target_addr,
+            target_addr: target_mac,
             target_protocol,
         })
     }
 
     pub fn to_bytes(&self, buffer: &mut [u8]) -> usize {
-        let mut buf = BytesMut::with_capacity(buffer.len());
+        let mut buf = BytesMut::with_capacity(Self::LEN);
         buf.put_u16(self.hardware_type);
         buf.put_u16(self.protocol_type);
         buf.put_u8(self.hardware_size);
@@ -139,20 +137,18 @@ impl AarpPacket {
 
         buf.put_slice(&self.sender_addr);
 
-        let mut sender_protocol_encoded = [0u8; 4];
-        self.sender_protocol.encode(&mut sender_protocol_encoded);
-        buf.put_slice(&sender_protocol_encoded);
+        let mut encoded = [0u8; 4];
+        self.sender_protocol.encode(&mut encoded);
+        buf.put_slice(&encoded);
 
         buf.put_slice(&self.target_addr);
 
-        let mut target_protocol_encoded = [0u8; 4];
-        self.target_protocol.encode(&mut target_protocol_encoded);
-        buf.put_slice(&target_protocol_encoded);
+        self.target_protocol.encode(&mut encoded);
+        buf.put_slice(&encoded);
 
-        let used = buf.chunk();
-        buffer[..used.len()].copy_from_slice(used);
-
-        used.len()
+        let used = buf.len();
+        buffer[..used].copy_from_slice(&buf);
+        used
     }
 }
 
@@ -204,7 +200,6 @@ mod tests {
         };
 
         let mut test_buf: [u8; 100] = [0u8; 100];
-
         let pkt_size = test_pkt.to_bytes(&mut test_buf);
         let sized = &test_buf[..pkt_size];
         let expected_bin_data = &[

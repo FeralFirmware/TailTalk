@@ -42,14 +42,19 @@ struct PendingLookup {
 pub struct Nbp {
     sock: DdpSocket,
     registered_names: Vec<RegisteredName>,
-    addressing: AddressingHandle,
+    et_addressing: Option<AddressingHandle>,
+    lt_addressing: Option<AddressingHandle>,
     request_recv: mpsc::Receiver<NbpCommand>,
     pending_lookups: HashMap<u8, PendingLookup>,
     next_tid: u8,
 }
 
 impl Nbp {
-    pub async fn spawn(ddp: &DdpHandle, addressing: AddressingHandle) -> NbpHandle {
+    pub async fn spawn(
+        ddp: &DdpHandle,
+        et_addressing: Option<AddressingHandle>,
+        lt_addressing: Option<AddressingHandle>,
+    ) -> NbpHandle {
         let sock = ddp
             .new_sock(DdpProtocolType::Nbp, Some(2))
             .await
@@ -60,7 +65,8 @@ impl Nbp {
         let nbp = Nbp {
             sock,
             registered_names: Vec::new(),
-            addressing,
+            et_addressing,
+            lt_addressing,
             request_recv,
             pending_lookups: HashMap::new(),
             next_tid: 1,
@@ -100,14 +106,17 @@ impl Nbp {
                                 let tid = self.next_tid;
                                 self.next_tid = self.next_tid.wrapping_add(1);
 
-                                let our_addr = self.addressing.addr()
-                                    .await
-                                    .expect("failed to get our addr");
+                                // Use the primary address (ET if available, else LT) in the lookup tuple.
+                                let primary_addr = if let Some(et) = &self.et_addressing {
+                                    et.addr().await.expect("failed to get ET addr")
+                                } else {
+                                    self.lt_addressing.as_ref().expect("no addressing").addr().await.expect("failed to get LT addr")
+                                };
 
                                 let tuple = NbpTuple {
-                                    network_number: our_addr.network_number,
-                                    node_id: our_addr.node_number,
-                                    socket_number: 2, // Default NBP socket
+                                    network_number: primary_addr.network_number,
+                                    node_id: primary_addr.node_number,
+                                    socket_number: 2,
                                     enumerator: 0,
                                     entity_name: lookup.request,
                                 };
@@ -120,23 +129,50 @@ impl Nbp {
 
                                 let mut buf = [0u8; 1024];
                                 let size = packet.to_bytes(&mut buf).expect("failed to serialize");
-                                // Send to broadcast
-                                let dest = crate::ddp::DdpAddress::new(
-                                    tailtalk_packets::aarp::AppleTalkAddress {
-                                        network_number: 0,
-                                        node_number: 255,
-                                    },
-                                    2 // NBP socket
-                                );
 
-                                if let Err(e) = self.sock.send_to(&buf[..size], dest).await {
-                                    let _ = lookup.chan.send(Err(e));
-                                } else {
+                                let mut send_ok = true;
+
+                                // Send over LocalTalk (network 0 = this LocalTalk cable).
+                                if self.lt_addressing.is_some() {
+                                    let dest = crate::ddp::DdpAddress::new(
+                                        tailtalk_packets::aarp::AppleTalkAddress {
+                                            network_number: 0,
+                                            node_number: 255,
+                                        },
+                                        2,
+                                    );
+                                    if let Err(e) = self.sock.send_to(&buf[..size], dest).await {
+                                        tracing::error!("NBP LkUp: failed to send on LocalTalk: {e}");
+                                        send_ok = false;
+                                    }
+                                }
+
+                                // Send over EtherTalk (our assigned network, node 255 = cable broadcast).
+                                if let Some(et) = &self.et_addressing {
+                                    let et_addr = et.addr().await.expect("failed to get ET addr");
+                                    let dest = crate::ddp::DdpAddress::new(
+                                        tailtalk_packets::aarp::AppleTalkAddress {
+                                            network_number: et_addr.network_number,
+                                            node_number: 255,
+                                        },
+                                        2,
+                                    );
+                                    if let Err(e) = self.sock.send_to(&buf[..size], dest).await {
+                                        tracing::error!("NBP LkUp: failed to send on EtherTalk: {e}");
+                                        send_ok = false;
+                                    }
+                                }
+
+                                if send_ok {
                                     self.pending_lookups.insert(tid, PendingLookup {
                                         chan: lookup.chan,
                                         start_time: Instant::now(),
                                         results: Vec::new(),
                                     });
+                                } else {
+                                    let _ = lookup.chan.send(Err(io::Error::other(
+                                        "failed to send NBP lookup on all transports",
+                                    )));
                                 }
                             },
                         }
@@ -207,7 +243,7 @@ impl Nbp {
 
         match packet.operation {
             NbpOperation::Lookup => {
-                let response = self.generate_response(&packet).await;
+                let response = self.generate_response(&packet, ddp.src_network_num).await;
 
                 // Only send a reply if we have at least one matching tuple
                 if !response.tuples.is_empty() {
@@ -256,12 +292,19 @@ impl Nbp {
         }
     }
 
-    async fn generate_response(&self, nbp: &NbpPacket) -> NbpPacket {
-        let our_addr = self
-            .addressing
-            .addr()
-            .await
-            .expect("failed to get our addr");
+    async fn generate_response(&self, nbp: &NbpPacket, source_network: u16) -> NbpPacket {
+        // Respond with the address on the same interface the lookup arrived from.
+        let our_addr = if source_network == 0 {
+            if let Some(lt) = &self.lt_addressing {
+                lt.addr().await.expect("failed to get LT addr")
+            } else {
+                self.et_addressing.as_ref().expect("no addressing").addr().await.expect("failed to get ET addr")
+            }
+        } else if let Some(et) = &self.et_addressing {
+            et.addr().await.expect("failed to get ET addr")
+        } else {
+            self.lt_addressing.as_ref().expect("no addressing").addr().await.expect("failed to get LT addr")
+        };
 
         let mut tuples = Vec::new();
 
