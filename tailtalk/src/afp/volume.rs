@@ -118,16 +118,20 @@ impl Node {
         }
     }
 
-    pub async fn open_resource_fork(&mut self, sidecar_path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = sidecar_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+    pub async fn open_resource_fork(&mut self, path: &Path) -> std::io::Result<()> {
+        // Native macOS named-fork paths (`<file>/..namedfork/rsrc`) always exist
+        // for any file and can't have their parent directory created.
+        if !is_native_resource_fork_path(path) {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
         }
         let file = tokio::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(sidecar_path)
+            .open(path)
             .await?;
         self.resource_fork = Some(file);
         Ok(())
@@ -311,8 +315,8 @@ impl Node {
         }
 
         if bitmap.contains(FPFileBitmap::RESOURCE_FORK_LENGTH) {
-            let sidecar = rsrc_path(volume_root, &self.path);
-            let rsrc_len = tokio::fs::metadata(&sidecar)
+            let rsrc = resolve_resource_fork_path(volume_root, &self.path);
+            let rsrc_len = tokio::fs::metadata(&rsrc)
                 .await
                 .map(|m| m.len() as u32)
                 .unwrap_or(0);
@@ -356,6 +360,48 @@ pub fn rsrc_path(volume_root: &Path, relative_path: &Path) -> PathBuf {
         .join(".tailtalk")
         .join("rsrc")
         .join(relative_path)
+}
+
+/// True if `path` ends in `<file>/..namedfork/rsrc`, the macOS-native path
+/// for accessing a file's resource fork.
+fn is_native_resource_fork_path(path: &Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str() == std::ffi::OsStr::new("..namedfork"))
+}
+
+/// Resolves where to read the resource fork for a file.
+///
+/// Prefers the `.tailtalk/rsrc/<path>` sidecar if it has data. On macOS,
+/// falls back to the native named-fork path `<file>/..namedfork/rsrc` if
+/// that file has a non-empty resource fork (as it does when modern macOS
+/// Finder copies a file with a resource fork — e.g. an APPL — into the
+/// volume directory). Falls back to the sidecar path otherwise, so that
+/// first-time writes still land in the sidecar.
+///
+/// An empty sidecar must not shadow a populated native fork: `open_fork`
+/// sometimes leaves behind a zero-byte sidecar (since `OpenOptions::create`
+/// runs unconditionally), and we want that empty file to be ignored on
+/// subsequent opens.
+fn resolve_resource_fork_path(volume_root: &Path, relative_path: &Path) -> PathBuf {
+    let sidecar = rsrc_path(volume_root, relative_path);
+    if let Ok(meta) = std::fs::metadata(&sidecar)
+        && meta.len() > 0
+    {
+        return sidecar;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let native = volume_root
+            .join(relative_path)
+            .join("..namedfork")
+            .join("rsrc");
+        if let Ok(meta) = std::fs::metadata(&native)
+            && meta.len() > 0
+        {
+            return native;
+        }
+    }
+    sidecar
 }
 
 /// Converts an AFP path string to a POSIX PathBuf.
@@ -1194,8 +1240,8 @@ impl Volume {
                     return Err(AfpError::FileBusy);
                 }
 
-                let sidecar = rsrc_path(&self.path, &node.path.clone());
-                node.open_resource_fork(&sidecar).await.map_err(|e| {
+                let rsrc_target = resolve_resource_fork_path(&self.path, &node.path.clone());
+                node.open_resource_fork(&rsrc_target).await.map_err(|e| {
                     eprintln!("Error opening resource fork: {:?}", e);
                     AfpError::AccessDenied
                 })?;
@@ -2437,6 +2483,83 @@ mod tests {
             !sidecar.exists(),
             "sidecar should be removed when file is deleted"
         );
+    }
+
+    /// Reproduces the bug where copying an APPL from modern macOS Finder
+    /// into the volume directory caused 0 KB transfers to classic Mac.
+    /// Modern Finder stores the resource fork as `com.apple.ResourceFork`
+    /// (i.e. the named fork at `<file>/..namedfork/rsrc`) rather than in
+    /// TailTalk's sidecar. A pre-existing empty sidecar — which `open_fork`
+    /// previously left behind on every open — must not shadow it.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_resource_fork_falls_back_to_macos_named_fork() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        let file_path = root_path.join("MacApp");
+        File::create(&file_path).await.unwrap();
+
+        let rsrc_payload = b"native resource fork bytes from xattr";
+        xattr::set(&file_path, "com.apple.ResourceFork", rsrc_payload).unwrap();
+
+        // Simulate a stale, zero-byte sidecar left by a previous open_fork
+        // (the real cause of the original bug).
+        let sidecar = rsrc_path(&root_path, Path::new("MacApp"));
+        tokio::fs::create_dir_all(sidecar.parent().unwrap()).await.unwrap();
+        tokio::fs::File::create(&sidecar).await.unwrap();
+
+        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
+
+        // Length reported via enumerate / get_file_parms must come from the
+        // native fork, not the empty sidecar.
+        let node_id = volume.resolve_node_lazy(2, Path::new("MacApp")).await.unwrap();
+        let mut parms_output = [0u8; 64];
+        let (_, bytes_written) = volume
+            .get_node_parms(
+                node_id,
+                FPFileBitmap::RESOURCE_FORK_LENGTH,
+                FPDirectoryBitmap::empty(),
+                &mut parms_output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes_written, 4);
+        let reported_len = u32::from_be_bytes(parms_output[0..4].try_into().unwrap());
+        assert_eq!(
+            reported_len as usize,
+            rsrc_payload.len(),
+            "RESOURCE_FORK_LENGTH must reflect the native named fork"
+        );
+
+        // Opening and reading must return the native fork's bytes.
+        let mut output = [0u8; 256];
+        volume
+            .open_fork(
+                ForkType::Resource,
+                FPFileBitmap::RESOURCE_FORK_LENGTH,
+                2,
+                &PathBuf::from("MacApp"),
+                &mut output,
+            )
+            .await
+            .unwrap();
+        let fork_ref = u16::from_be_bytes(output[2..4].try_into().unwrap());
+
+        let mut buf = vec![0u8; 256];
+        let (n, _eof) = volume
+            .read(
+                &FPRead {
+                    fork_id: fork_ref,
+                    offset: 0,
+                    req_count: 256,
+                    newline_mask: 0,
+                    newline_char: 0,
+                },
+                &mut buf,
+            )
+            .await
+            .unwrap();
+        assert_eq!(&buf[..n], rsrc_payload);
     }
 
     #[tokio::test]
