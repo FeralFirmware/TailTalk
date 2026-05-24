@@ -1,4 +1,4 @@
-import { Button, ComboBox, LineEdit, GroupBox, HorizontalBox, VerticalBox, CheckBox } from "std-widgets.slint";
+import { Button, ComboBox, LineEdit, HorizontalBox, VerticalBox, CheckBox, Palette } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
     title: "TailTalk AFP Server";
@@ -56,72 +56,78 @@ export component AppWindow inherits Window {
         padding: 12px;
         spacing: 8px;
 
-        GroupBox {
-            title: "Configuration";
+        Rectangle {
+            background: Palette.alternate-background;
+            border-radius: 8px;
 
             VerticalBox {
+                padding: 12px;
                 spacing: 6px;
 
+                // ── Server ────────────────────────────────────────────────────
+                Text { text: "Server"; font-weight: 700; }
+
                 HorizontalBox {
-                    Text { text: "Server Name:"; min-width: 140px; vertical-alignment: center; }
+                    padding-top: 0; padding-bottom: 0;
+                    Text { text: "Server Name"; min-width: 140px; vertical-alignment: center; }
                     LineEdit {
                         text <=> root.server-name;
                         placeholder-text: "TailTalk AFP";
                         horizontal-stretch: 1;
                         enabled: !root.running;
+
                     }
                 }
 
                 if root.feature-ethertalk : HorizontalBox {
-                    Text { text: "Ethernet Interface:"; min-width: 140px; vertical-alignment: center; }
+                    padding-top: 0; padding-bottom: 0;
+                    Text { text: "Ethernet Interface"; min-width: 140px; vertical-alignment: center; }
                     ComboBox {
                         model: root.ethernet-interfaces;
                         current-index <=> root.selected-ethernet;
                         horizontal-stretch: 1;
                         enabled: !root.running;
+
                     }
                 }
 
                 if root.feature-tashtalk : HorizontalBox {
-                    Text { text: "TashTalk Port:"; min-width: 140px; vertical-alignment: center; }
+                    padding-top: 0; padding-bottom: 0;
+                    Text { text: "TashTalk Port"; min-width: 140px; vertical-alignment: center; }
                     ComboBox {
                         model: root.tashtalk-ports;
                         current-index <=> root.selected-tashtalk;
                         horizontal-stretch: 1;
                         enabled: !root.running;
+
                     }
                 }
 
-                if root.feature-tashtalk : HorizontalBox {
-                    Text { text: "Capture pcap:"; min-width: 140px; vertical-alignment: center; }
-                    CheckBox {
-                        checked <=> root.pcap-enabled;
-                        enabled: !root.running;
-                    }
-                }
+                // ── Shared Volume ─────────────────────────────────────────────
+                Rectangle { height: 8px; }
+                Text { text: "Shared Volume"; font-weight: 700; }
 
-                if root.feature-tashtalk && root.pcap-enabled : HorizontalBox {
-                    Text { text: "pcap File:"; min-width: 140px; vertical-alignment: center; }
+                HorizontalBox {
+                    padding-top: 0; padding-bottom: 0;
+                    Text { text: "Volume Name"; min-width: 140px; vertical-alignment: center; }
                     LineEdit {
-                        text <=> root.pcap-path;
-                        placeholder-text: "Path to output .pcap file";
+                        text <=> root.volume-name;
+                        placeholder-text: "MacShare";
                         horizontal-stretch: 1;
                         enabled: !root.running;
-                    }
-                    Button {
-                        text: "Browse…";
-                        enabled: !root.running;
-                        clicked => { root.browse-pcap(); }
+
                     }
                 }
 
                 HorizontalBox {
-                    Text { text: "Volume Path:"; min-width: 140px; vertical-alignment: center; }
+                    padding-top: 0; padding-bottom: 0;
+                    Text { text: "Volume Path"; min-width: 140px; vertical-alignment: center; }
                     LineEdit {
                         text <=> root.volume-path;
                         placeholder-text: "/path/to/share";
                         horizontal-stretch: 1;
                         enabled: !root.running;
+
                     }
                     Button {
                         text: "Browse…";
@@ -130,13 +136,33 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                HorizontalBox {
-                    Text { text: "Volume Name:"; min-width: 140px; vertical-alignment: center; }
-                    LineEdit {
-                        text <=> root.volume-name;
-                        placeholder-text: "MacShare";
-                        horizontal-stretch: 1;
+                // ── Debugging ─────────────────────────────────────────────────
+                if root.feature-tashtalk : Rectangle { height: 8px; }
+                if root.feature-tashtalk : Text { text: "Debugging"; font-weight: 700; }
+
+                if root.feature-tashtalk : HorizontalBox {
+                    padding-top: 0; padding-bottom: 0;
+                    Text { text: "Capture PCAP"; min-width: 140px; vertical-alignment: center; }
+                    CheckBox {
+                        checked <=> root.pcap-enabled;
                         enabled: !root.running;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
+                if root.feature-tashtalk : HorizontalBox {
+                    padding-top: 0; padding-bottom: 0;
+                    Text { text: "PCAP File"; min-width: 140px; vertical-alignment: center; }
+                    LineEdit {
+                        text <=> root.pcap-path;
+                        placeholder-text: "Path to output .pcap file";
+                        horizontal-stretch: 1;
+                        enabled: !root.running && root.pcap-enabled;
+                    }
+                    Button {
+                        text: "Browse…";
+                        enabled: !root.running && root.pcap-enabled;
+                        clicked => { root.browse-pcap(); }
                     }
                 }
             }
