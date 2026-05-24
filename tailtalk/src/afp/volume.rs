@@ -43,6 +43,37 @@ fn infer_type_creator_from_content(path: &Path) -> Option<TypeCreator> {
     }
 }
 
+/// Read the 32-byte Finder Info blob from the platform-native metadata store.
+/// Returns all-zeros if no Finder Info is set (does not infer from extension).
+pub fn read_finder_info(path: &Path) -> std::io::Result<[u8; 32]> {
+    #[cfg(unix)]
+    {
+        match xattr::get(path, FINDER_INFO_XATTR) {
+            Ok(Some(data)) if data.len() >= 32 => {
+                let mut info = [0u8; 32];
+                info.copy_from_slice(&data[0..32]);
+                Ok(info)
+            }
+            Ok(_) => Ok([0u8; 32]),
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(windows)]
+    {
+        let stream_path = format!("{}:{}", path.display(), FINDER_INFO_STREAM);
+        match std::fs::read(&stream_path) {
+            Ok(data) if data.len() >= 32 => {
+                let mut info = [0u8; 32];
+                info.copy_from_slice(&data[0..32]);
+                Ok(info)
+            }
+            Ok(_) => Ok([0u8; 32]),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok([0u8; 32]),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 /// Write a 32-byte Finder Info blob directly to the platform-native metadata
 /// store for `path`.  The first 4 bytes are the file type, bytes 4–7 are the
 /// creator; the remainder may be zero.

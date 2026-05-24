@@ -24,10 +24,19 @@ export component AppWindow inherits Window {
     in-out property <string> pcap-path;
     in-out property <string> info-message: "";
 
+    in-out property <bool> finder-info-visible: false;
+    in-out property <string> finder-info-path: "";
+    in-out property <string> finder-info-type: "";
+    in-out property <string> finder-info-creator: "";
+
     callback start-stop();
     callback browse-volume();
     callback browse-pcap();
     callback import-stuffit();
+    callback inspect-finder-info();
+    callback save-finder-info();
+    // Returns the input truncated to 4 characters; registered in Rust.
+    callback clamp-ostype(string) -> string;
 
     MenuBar {
         Menu {
@@ -35,6 +44,10 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: "Import StuffIt Archive…";
                 activated => { root.import-stuffit(); }
+            }
+            MenuItem {
+                title: "Inspect Finder Info…";
+                activated => { root.inspect-finder-info(); }
             }
         }
     }
@@ -201,6 +214,79 @@ export component AppWindow inherits Window {
                     Button {
                         text: "OK";
                         clicked => { root.error-message = ""; }
+                    }
+                }
+            }
+        }
+    }
+
+    // Finder Info dialog — file type and creator editor
+    if root.finder-info-visible : Rectangle {
+        x: 0; y: 0;
+        width: root.width;
+        height: root.height;
+        background: rgba(0, 0, 0, 0.45);
+
+        Rectangle {
+            width: 380px;
+            height: fi-content.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #f5f5f5;
+            border-radius: 8px;
+            drop-shadow-blur: 20px;
+            drop-shadow-color: rgba(0, 0, 0, 0.35);
+
+            fi-content := VerticalBox {
+                padding: 20px;
+                spacing: 14px;
+
+                Text {
+                    text: "Finder Info";
+                    font-size: 15px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    color: #1a1a1a;
+                }
+
+                Text {
+                    text: root.finder-info-path;
+                    wrap: word-wrap;
+                    horizontal-alignment: center;
+                    color: #555555;
+                    font-size: 11px;
+                }
+
+                HorizontalBox {
+                    Text { text: "File Type:"; min-width: 80px; vertical-alignment: center; color: #1a1a1a; }
+                    LineEdit {
+                        text <=> root.finder-info-type;
+                        placeholder-text: "    ";
+                        horizontal-stretch: 1;
+                        edited(t) => { root.finder-info-type = root.clamp-ostype(t); }
+                    }
+                }
+
+                HorizontalBox {
+                    Text { text: "Creator:"; min-width: 80px; vertical-alignment: center; color: #1a1a1a; }
+                    LineEdit {
+                        text <=> root.finder-info-creator;
+                        placeholder-text: "    ";
+                        horizontal-stretch: 1;
+                        edited(t) => { root.finder-info-creator = root.clamp-ostype(t); }
+                    }
+                }
+
+                HorizontalBox {
+                    alignment: center;
+                    spacing: 8px;
+                    Button {
+                        text: "Cancel";
+                        clicked => { root.finder-info-visible = false; }
+                    }
+                    Button {
+                        text: "Save";
+                        clicked => { root.save-finder-info(); }
                     }
                 }
             }

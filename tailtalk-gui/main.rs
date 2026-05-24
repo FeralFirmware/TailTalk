@@ -2,11 +2,9 @@ use std::path::{Path, PathBuf};
 
 #[cfg(any(feature = "ethertalk", feature = "tashtalk"))]
 use std::rc::Rc;
-
 #[cfg(feature = "tashtalk")]
 use std::cell::RefCell;
 
-#[cfg(any(feature = "ethertalk", feature = "tashtalk"))]
 use slint::SharedString;
 #[cfg(feature = "tashtalk")]
 use slint::Model as _;
@@ -368,6 +366,79 @@ fn main() -> anyhow::Result<()> {
         });
     });
 
+    ui.on_clamp_ostype(|s| s.chars().take(4).collect::<String>().into());
+
+    let ui_weak = ui.as_weak();
+    ui.on_inspect_finder_info(move || {
+        let ui_weak = ui_weak.clone();
+        let volume_path = ui_weak
+            .upgrade()
+            .map(|ui| ui.get_volume_path().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        std::thread::spawn(move || {
+            let mut dialog = rfd::FileDialog::new().set_title("Choose a file to inspect");
+            if let Some(ref dir) = volume_path {
+                dialog = dialog.set_directory(dir);
+            }
+            let Some(path) = dialog.pick_file() else {
+                return;
+            };
+
+            let info = match tailtalk::afp::read_finder_info(&path) {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = format!("Could not read Finder Info: {e}");
+                    slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_weak.upgrade() {
+                            ui.set_error_message(msg.into());
+                        }
+                    })
+                    .ok();
+                    return;
+                }
+            };
+
+            let type_str = ostype_to_string(&info[0..4]);
+            let creator_str = ostype_to_string(&info[4..8]);
+            // finder-info-path stores the actual file path (used for saving too)
+            let path_str: SharedString = path.to_string_lossy().into_owned().into();
+
+            slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_finder_info_type(type_str.into());
+                    ui.set_finder_info_creator(creator_str.into());
+                    ui.set_finder_info_path(path_str);
+                    ui.set_finder_info_visible(true);
+                }
+            })
+            .ok();
+        });
+    });
+
+    let ui_weak = ui.as_weak();
+    ui.on_save_finder_info(move || {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        let path = PathBuf::from(ui.get_finder_info_path().as_str());
+
+        let type_bytes = string_to_ostype(&ui.get_finder_info_type());
+        let creator_bytes = string_to_ostype(&ui.get_finder_info_creator());
+
+        let mut info = tailtalk::afp::read_finder_info(&path).unwrap_or([0u8; 32]);
+        info[0..4].copy_from_slice(&type_bytes);
+        info[4..8].copy_from_slice(&creator_bytes);
+
+        match tailtalk::afp::write_finder_info(&path, &info) {
+            Ok(()) => {
+                ui.set_finder_info_visible(false);
+            }
+            Err(e) => {
+                let msg = format!("Could not write Finder Info: {e}");
+                ui.set_error_message(msg.into());
+            }
+        }
+    });
+
     let ui_weak = ui.as_weak();
     ui.on_import_stuffit(move || {
         let ui_weak = ui_weak.clone();
@@ -552,6 +623,28 @@ fn show_info(ui_weak: slint::Weak<AppWindow>, message: String) {
         }
     })
     .ok();
+}
+
+// ── OSType (4-byte Mac type/creator code) helpers ────────────────────────────
+
+/// Convert a 4-byte OSType to a displayable string, replacing non-graphic bytes with spaces.
+fn ostype_to_string(bytes: &[u8]) -> String {
+    if bytes.iter().all(|&b| b == 0) {
+        return String::new();
+    }
+    bytes
+        .iter()
+        .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { ' ' })
+        .collect()
+}
+
+/// Convert a user-supplied string to a 4-byte OSType, truncating or space-padding as needed.
+fn string_to_ostype(s: &str) -> [u8; 4] {
+    let mut out = [b' '; 4];
+    for (dst, src) in out.iter_mut().zip(s.bytes()) {
+        *dst = src;
+    }
+    out
 }
 
 // ── Mac resource fork parsing ─────────────────────────────────────────────────
