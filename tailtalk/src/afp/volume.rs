@@ -4,8 +4,8 @@ use std::time::SystemTime;
 
 use tailtalk_packets::afp::{
     AfpError, CreateFlag, FPByteRangeLockFlags, FPDelete, FPDirectoryBitmap, FPEnumerate,
-    FPFileBitmap, FPRead, FPSetForkParms, FPVolume, FPVolumeBitmap, FileType, ForkType,
-    VolumeSignature,
+    FPFileBitmap, FPRead, FPSetForkParms, FPVolume, FPVolumeBitmap, FileType, FinderFlags,
+    FinderInfo, ForkType, VolumeSignature,
 };
 
 use crate::time_to_afp_v1;
@@ -43,50 +43,52 @@ fn infer_type_creator_from_content(path: &Path) -> Option<TypeCreator> {
     }
 }
 
-/// Read the 32-byte Finder Info blob from the platform-native metadata store.
-/// Returns all-zeros if no Finder Info is set (does not infer from extension).
-pub fn read_finder_info(path: &Path) -> std::io::Result<[u8; 32]> {
-    #[cfg(unix)]
-    {
-        match xattr::get(path, FINDER_INFO_XATTR) {
-            Ok(Some(data)) if data.len() >= 32 => {
-                let mut info = [0u8; 32];
-                info.copy_from_slice(&data[0..32]);
-                Ok(info)
+/// Read Finder Info from the platform-native metadata store.
+/// Returns a zeroed `FinderInfo` if no attribute is set (does not infer from extension).
+pub async fn read_finder_info(path: &Path) -> std::io::Result<FinderInfo> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(unix)]
+        {
+            match xattr::get(&path, FINDER_INFO_XATTR) {
+                Ok(Some(data)) if data.len() >= 32 => {
+                    Ok(FinderInfo::from(<[u8; 32]>::try_from(&data[0..32]).unwrap()))
+                }
+                Ok(_) => Ok(FinderInfo::default()),
+                Err(e) => Err(e),
             }
-            Ok(_) => Ok([0u8; 32]),
-            Err(e) => Err(e),
         }
-    }
-    #[cfg(windows)]
-    {
-        let stream_path = format!("{}:{}", path.display(), FINDER_INFO_STREAM);
-        match std::fs::read(&stream_path) {
-            Ok(data) if data.len() >= 32 => {
-                let mut info = [0u8; 32];
-                info.copy_from_slice(&data[0..32]);
-                Ok(info)
+        #[cfg(windows)]
+        {
+            let stream_path = format!("{}:{}", path.display(), FINDER_INFO_STREAM);
+            match std::fs::read(&stream_path) {
+                Ok(data) if data.len() >= 32 => {
+                    Ok(FinderInfo::from(<[u8; 32]>::try_from(&data[0..32]).unwrap()))
+                }
+                Ok(_) => Ok(FinderInfo::default()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FinderInfo::default()),
+                Err(e) => Err(e),
             }
-            Ok(_) => Ok([0u8; 32]),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok([0u8; 32]),
-            Err(e) => Err(e),
         }
-    }
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
-/// Write a 32-byte Finder Info blob directly to the platform-native metadata
-/// store for `path`.  The first 4 bytes are the file type, bytes 4–7 are the
-/// creator; the remainder may be zero.
-pub fn write_finder_info(path: &Path, info: &[u8; 32]) -> std::io::Result<()> {
+/// Write Finder Info to the platform-native metadata store.
+pub async fn write_finder_info(path: &Path, info: &FinderInfo) -> std::io::Result<()> {
+    let raw: [u8; 32] = (*info).into();
+    let path = path.to_path_buf();
     #[cfg(unix)]
-    {
-        xattr::set(path, FINDER_INFO_XATTR, info)
-    }
+    tokio::task::spawn_blocking(move || xattr::set(&path, FINDER_INFO_XATTR, &raw))
+        .await
+        .map_err(std::io::Error::other)??;
     #[cfg(windows)]
     {
         let stream_path = format!("{}:{}", path.display(), FINDER_INFO_STREAM);
-        std::fs::write(&stream_path, info)
+        tokio::fs::write(&stream_path, &raw).await?;
     }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -142,99 +144,56 @@ impl Node {
     /// Read Finder Info from the platform-native metadata store.
     /// If no Finder Info exists for a file, attempts to infer type/creator from
     /// the file extension and persists the result so future reads are consistent.
-    pub fn get_finder_info(&self, volume_root: &Path) -> [u8; 32] {
+    pub async fn get_finder_info(&self, volume_root: &Path) -> FinderInfo {
         let absolute_path = volume_root.join(&self.path);
-        let stored = {
-            #[cfg(unix)]
-            {
-                match xattr::get(&absolute_path, FINDER_INFO_XATTR) {
-                    Ok(Some(data)) if data.len() >= 32 => {
-                        let mut info = [0u8; 32];
-                        info.copy_from_slice(&data[0..32]);
-                        info
-                    }
-                    _ => [0u8; 32],
-                }
-            }
-            #[cfg(windows)]
-            {
-                let stream_path = format!("{}:{}", absolute_path.display(), FINDER_INFO_STREAM);
-                match std::fs::read(&stream_path) {
-                    Ok(data) if data.len() >= 32 => {
-                        let mut info = [0u8; 32];
-                        info.copy_from_slice(&data[0..32]);
-                        info
-                    }
-                    _ => [0u8; 32],
-                }
-            }
-        };
+        let stored = read_finder_info(&absolute_path).await.unwrap_or_default();
 
-        if stored == [0u8; 32]
-            && !self.is_dir
-            && let Some(tc) = infer_type_creator_from_content(&absolute_path)
-        {
-            let mut inferred = [0u8; 32];
-            inferred[0..4].copy_from_slice(&tc.file_type);
-            inferred[4..8].copy_from_slice(&tc.creator);
-            if let Err(e) = write_finder_info(&absolute_path, &inferred) {
-                error!("Failed to persist inferred Finder Info for {:?}: {:?}", self.path, e);
+        if stored == FinderInfo::default() && !self.is_dir {
+            let abs = absolute_path.clone();
+            let maybe_tc = tokio::task::spawn_blocking(move || infer_type_creator_from_content(&abs))
+                .await
+                .unwrap_or(None);
+            if let Some(tc) = maybe_tc {
+                let inferred = FinderInfo {
+                    file_type: tc.file_type,
+                    creator: tc.creator,
+                    ..Default::default()
+                };
+                if let Err(e) = write_finder_info(&absolute_path, &inferred).await {
+                    error!("Failed to persist inferred Finder Info for {:?}: {:?}", self.path, e);
+                }
+                return inferred;
             }
-            return inferred;
         }
 
         stored
     }
 
     /// Write Finder Info to the platform-native metadata store.
-    pub fn set_finder_info(&self, volume_root: &Path, info: &[u8; 32]) -> Result<(), AfpError> {
-        let absolute_path = volume_root.join(&self.path);
-        #[cfg(unix)]
-        {
-            xattr::set(&absolute_path, FINDER_INFO_XATTR, info).map_err(|e| {
-                error!("Failed to set Finder Info for {:?}: {:?}", self.path, e);
-                AfpError::AccessDenied
-            })
-        }
-        #[cfg(windows)]
-        {
-            let stream_path = format!("{}:{}", absolute_path.display(), FINDER_INFO_STREAM);
-            std::fs::write(&stream_path, info).map_err(|e| {
-                error!("Failed to set Finder Info for {:?}: {:?}", self.path, e);
-                AfpError::AccessDenied
-            })
-        }
+    pub async fn set_finder_info(&self, volume_root: &Path, info: &FinderInfo) -> Result<(), AfpError> {
+        write_finder_info(&volume_root.join(&self.path), info).await.map_err(|e| {
+            error!("Failed to set Finder Info for {:?}: {:?}", self.path, e);
+            AfpError::AccessDenied
+        })
     }
 
     /// Get AFP file/dir attributes derived from the Finder Info xattr.
     /// Bit 0 (Invisible) maps to fdFlags bit 14 (kIsInvisible, 0x4000).
-    pub fn get_attributes(&self, volume_root: &Path) -> u16 {
-        let finder_info = self.get_finder_info(volume_root);
-        let fd_flags = u16::from_be_bytes([finder_info[8], finder_info[9]]);
-        let mut attrs: u16 = 0;
-        if fd_flags & 0x4000 != 0 {
-            attrs |= 0x0001; // Invisible
-        }
-        attrs
+    pub async fn get_attributes(&self, volume_root: &Path) -> u16 {
+        let finder_info = self.get_finder_info(volume_root).await;
+        if finder_info.flags.contains(FinderFlags::IS_INVISIBLE) { 0x0001 } else { 0 }
     }
 
     /// Set AFP Attributes by updating Finder Info (e.g. Invisible bit)
-    pub fn set_attributes(&self, volume_root: &Path, attributes: u16) -> Result<(), AfpError> {
-        let mut finder_info = self.get_finder_info(volume_root);
-        let mut fd_flags = u16::from_be_bytes([finder_info[8], finder_info[9]]);
-
-        // AFP Attribute Invisible (Bit 0) -> kIsInvisible (Bit 14, 0x4000)
+    pub async fn set_attributes(&self, volume_root: &Path, attributes: u16) -> Result<(), AfpError> {
+        let mut finder_info = self.get_finder_info(volume_root).await;
+        // AFP Attribute Invisible (Bit 0) -> kIsInvisible (Bit 14)
         if (attributes & 0x0001) != 0 {
-            fd_flags |= 0x4000;
+            finder_info.flags |= FinderFlags::IS_INVISIBLE;
         } else {
-            fd_flags &= !0x4000;
+            finder_info.flags &= !FinderFlags::IS_INVISIBLE;
         }
-
-        let fd_flags_bytes = fd_flags.to_be_bytes();
-        finder_info[8] = fd_flags_bytes[0];
-        finder_info[9] = fd_flags_bytes[1];
-
-        self.set_finder_info(volume_root, &finder_info)
+        self.set_finder_info(volume_root, &finder_info).await
     }
 
     /// Process file parameter bitmap and write response to output buffer.
@@ -254,7 +213,7 @@ impl Node {
             .map_err(|_| AfpError::ObjectNotFound)?;
 
         if bitmap.contains(FPFileBitmap::ATTRIBUTES) {
-            let attributes = self.get_attributes(volume_root);
+            let attributes = self.get_attributes(volume_root).await;
             output[offset..offset + 2].copy_from_slice(&attributes.to_be_bytes());
             offset += 2;
         }
@@ -282,8 +241,8 @@ impl Node {
         }
 
         if bitmap.contains(FPFileBitmap::FINDER_INFO) {
-            let finder_info = self.get_finder_info(volume_root);
-            output[offset..offset + 32].copy_from_slice(&finder_info);
+            let raw: [u8; 32] = self.get_finder_info(volume_root).await.into();
+            output[offset..offset + 32].copy_from_slice(&raw);
             offset += 32;
         }
 
@@ -567,7 +526,7 @@ impl Volume {
         };
         if has_attributes {
             let attributes = u16::from_be_bytes([data[offset], data[offset + 1]]);
-            node.set_attributes(&volume_root, attributes)?;
+            node.set_attributes(&volume_root, attributes).await?;
             offset += 2;
         }
 
@@ -608,9 +567,8 @@ impl Volume {
             file_bitmap.contains(FPFileBitmap::FINDER_INFO)
         };
         if has_finder_info {
-            let mut finder_info = [0u8; 32];
-            finder_info.copy_from_slice(&data[offset..offset + 32]);
-            node.set_finder_info(&volume_root, &finder_info)?;
+            let raw: [u8; 32] = data[offset..offset + 32].try_into().unwrap();
+            node.set_finder_info(&volume_root, &FinderInfo::from(raw)).await?;
         }
 
         Ok(())
@@ -747,7 +705,7 @@ impl Volume {
             let mut read_dir = tokio::fs::read_dir(&current_dir).await?;
             while let Some(entry) = read_dir.next_entry().await? {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name == ".tailtalk" {
+                if name == ".tailtalk" || name == ".AppleDesktop" {
                     continue;
                 }
 
@@ -800,7 +758,7 @@ impl Volume {
 
         while let Some(entry) = read_dir.next_entry().await? {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == ".tailtalk" {
+            if name == ".tailtalk" || name == ".AppleDesktop" {
                 continue;
             }
             let rel_path = dir_path.join(&name);
@@ -986,7 +944,7 @@ impl Volume {
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name == ".tailtalk" {
+            if name == ".tailtalk" || name == ".AppleDesktop" {
                 continue;
             }
             count = count.saturating_add(1);
@@ -1012,7 +970,7 @@ impl Volume {
         let full_path = self.path.join(relative_path);
 
         if bitmap.contains(FPDirectoryBitmap::ATTRIBUTES) {
-            let attributes = node.get_attributes(&self.path);
+            let attributes = node.get_attributes(&self.path).await;
             output[offset..offset + 2].copy_from_slice(&attributes.to_be_bytes());
             offset += 2;
         }
@@ -1041,8 +999,8 @@ impl Volume {
         }
 
         if bitmap.contains(FPDirectoryBitmap::FINDER_INFO) {
-            let finder_info = node.get_finder_info(&self.path);
-            output[offset..offset + 32].copy_from_slice(&finder_info);
+            let raw: [u8; 32] = node.get_finder_info(&self.path).await.into();
+            output[offset..offset + 32].copy_from_slice(&raw);
             offset += 32;
         }
 
@@ -1478,7 +1436,7 @@ impl Volume {
             .map_err(|_| AfpError::ObjectNotFound)?
         {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == ".tailtalk" {
+            if name == ".tailtalk" || name == ".AppleDesktop" {
                 continue;
             }
 

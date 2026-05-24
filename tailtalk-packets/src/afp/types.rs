@@ -1,3 +1,49 @@
+use bitflags::bitflags;
+
+bitflags! {
+    /// Finder flags word (fdFlags / frFlags) stored in bytes 8–9 of the 32-byte Finder Info blob.
+    ///
+    /// Bit definitions from *Inside Macintosh: Files* and the Finder Interface chapter.
+    /// Bits 1–3 encode a 3-bit label/colour index and are not representable as individual
+    /// flags; read them with `FinderFlags::label()` instead.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct FinderFlags: u16 {
+        /// Icon is on the desktop (MFS only; ignored by HFS).
+        const IS_ON_DESK      = 0x0001;
+        /// Application can be launched by multiple users at the same time.
+        const IS_SHARED       = 0x0040;
+        /// Application has no system-extension (INIT) resources.
+        const HAS_NO_INITS    = 0x0080;
+        /// The Finder has already loaded the application's bundle resources.
+        const HAS_BEEN_INITED = 0x0100;
+        /// File has a custom icon stored in its resource fork.
+        const HAS_CUSTOM_ICON = 0x0400;
+        /// File is a stationery pad; opening it creates a copy.
+        const IS_STATIONERY   = 0x0800;
+        /// File's name cannot be changed in the Finder.
+        const NAME_LOCKED     = 0x1000;
+        /// File has a `'BNDL'` resource associating icons with file types.
+        const HAS_BUNDLE      = 0x2000;
+        /// File is hidden from the Finder's directory listings.
+        const IS_INVISIBLE    = 0x4000;
+        /// File is an alias (points to another file or folder).
+        const IS_ALIAS        = 0x8000;
+    }
+}
+
+impl FinderFlags {
+    /// Extract the 3-bit label/colour index from bits 1–3 (values 0–7).
+    /// 0 means no label; 1–7 correspond to the seven Finder label colours.
+    pub fn label(self) -> u8 {
+        ((self.bits() & 0x000E) >> 1) as u8
+    }
+
+    /// Return a copy of these flags with the label index set to `value` (0–7).
+    pub fn with_label(self, value: u8) -> Self {
+        Self::from_bits_retain((self.bits() & !0x000E) | (((value as u16) & 0x7) << 1))
+    }
+}
+
 /// AFP Error Codes. For AppleTalk implementations these result codes are passed via the
 /// ASP CmdResult field (i.e the 4 user bytes of an ATP packet)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +229,47 @@ impl From<CreateFlag> for u8 {
 pub enum FileType {
     Directory,
     File,
+}
+
+/// The 32-byte Finder Info blob stored as the `com.apple.FinderInfo` xattr.
+///
+/// Layout (Inside Macintosh, Files):
+///   [0..4]   file_type  — OSType (e.g. `TEXT`, `APPL`)
+///   [4..8]   creator    — OSType (e.g. `ttxt`, `MACS`)
+///   [8..10]  flags      — fdFlags / frFlags (big-endian u16)
+///   [10..32] reserved   — icon position, folder ref, extended info
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FinderInfo {
+    pub file_type: [u8; 4],
+    pub creator: [u8; 4],
+    pub flags: FinderFlags,
+    pub reserved: [u8; 22],
+}
+
+impl From<[u8; 32]> for FinderInfo {
+    fn from(raw: [u8; 32]) -> Self {
+        let mut reserved = [0u8; 22];
+        reserved.copy_from_slice(&raw[10..32]);
+        Self {
+            file_type: raw[0..4].try_into().unwrap(),
+            creator: raw[4..8].try_into().unwrap(),
+            flags: FinderFlags::from_bits_retain(u16::from_be_bytes([raw[8], raw[9]])),
+            reserved,
+        }
+    }
+}
+
+impl From<FinderInfo> for [u8; 32] {
+    fn from(info: FinderInfo) -> Self {
+        let mut raw = [0u8; 32];
+        raw[0..4].copy_from_slice(&info.file_type);
+        raw[4..8].copy_from_slice(&info.creator);
+        let flags = info.flags.bits().to_be_bytes();
+        raw[8] = flags[0];
+        raw[9] = flags[1];
+        raw[10..32].copy_from_slice(&info.reserved);
+        raw
+    }
 }
 
 impl From<u8> for FileType {

@@ -160,6 +160,9 @@ fn main() -> anyhow::Result<()> {
 
     let _log_guard = init_logging();
 
+    let rt = tokio::runtime::Runtime::new()?;
+    let rt_handle = rt.handle().clone();
+
     let ui = AppWindow::new()?;
 
     // Inform the UI which transport sections to show
@@ -230,11 +233,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let ui_handle = ui.as_weak();
-    std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(server_loop(cmd_rx, ui_handle));
-    });
+    rt_handle.spawn(server_loop(cmd_rx, ui_handle));
 
     let ui_weak = ui.as_weak();
     #[cfg(feature = "ethertalk")]
@@ -331,11 +330,13 @@ fn main() -> anyhow::Result<()> {
     });
 
     let ui_weak = ui.as_weak();
+    let rt_handle_bv = rt_handle.clone();
     ui.on_browse_volume(move || {
         let ui_weak = ui_weak.clone();
-        std::thread::spawn(move || {
-            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                let path_str: slint::SharedString = path.to_string_lossy().into_owned().into();
+        rt_handle_bv.spawn(async move {
+            if let Some(handle) = rfd::AsyncFileDialog::new().pick_folder().await {
+                let path_str: slint::SharedString =
+                    handle.path().to_string_lossy().into_owned().into();
                 slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_weak.upgrade() {
                         ui.set_volume_path(path_str);
@@ -347,15 +348,18 @@ fn main() -> anyhow::Result<()> {
     });
 
     let ui_weak = ui.as_weak();
+    let rt_handle_bp = rt_handle.clone();
     ui.on_browse_pcap(move || {
         let ui_weak = ui_weak.clone();
-        std::thread::spawn(move || {
-            if let Some(path) = rfd::FileDialog::new()
+        rt_handle_bp.spawn(async move {
+            if let Some(handle) = rfd::AsyncFileDialog::new()
                 .add_filter("pcap capture", &["pcap"])
                 .set_file_name("tailtalk_capture.pcap")
                 .save_file()
+                .await
             {
-                let path_str: slint::SharedString = path.to_string_lossy().into_owned().into();
+                let path_str: slint::SharedString =
+                    handle.path().to_string_lossy().into_owned().into();
                 slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_weak.upgrade() {
                         ui.set_pcap_path(path_str);
@@ -369,6 +373,7 @@ fn main() -> anyhow::Result<()> {
     ui.on_clamp_ostype(|s| s.chars().take(4).collect::<String>().into());
 
     let ui_weak = ui.as_weak();
+    let rt_handle_fi = rt_handle.clone();
     ui.on_inspect_finder_info(move || {
         let ui_weak = ui_weak.clone();
         let volume_path = ui_weak
@@ -376,16 +381,16 @@ fn main() -> anyhow::Result<()> {
             .map(|ui| ui.get_volume_path().to_string())
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
-        std::thread::spawn(move || {
-            let mut dialog = rfd::FileDialog::new().set_title("Choose a file to inspect");
+        rt_handle_fi.spawn(async move {
+            let mut dialog = rfd::AsyncFileDialog::new().set_title("Choose a file to inspect");
             if let Some(ref dir) = volume_path {
                 dialog = dialog.set_directory(dir);
             }
-            let Some(path) = dialog.pick_file() else {
-                return;
-            };
+            let path = dialog.pick_file().await.map(|h| h.path().to_path_buf());
 
-            let info = match tailtalk::afp::read_finder_info(&path) {
+            let Some(path) = path else { return };
+
+            let info = match tailtalk::afp::read_finder_info(&path).await {
                 Ok(v) => v,
                 Err(e) => {
                     let msg = format!("Could not read Finder Info: {e}");
@@ -399,9 +404,8 @@ fn main() -> anyhow::Result<()> {
                 }
             };
 
-            let type_str = ostype_to_string(&info[0..4]);
-            let creator_str = ostype_to_string(&info[4..8]);
-            // finder-info-path stores the actual file path (used for saving too)
+            let type_str = ostype_to_string(&info.file_type);
+            let creator_str = ostype_to_string(&info.creator);
             let path_str: SharedString = path.to_string_lossy().into_owned().into();
 
             slint::invoke_from_event_loop(move || {
@@ -417,31 +421,35 @@ fn main() -> anyhow::Result<()> {
     });
 
     let ui_weak = ui.as_weak();
+    let rt_handle_sfi = rt_handle.clone();
     ui.on_save_finder_info(move || {
         let Some(ui) = ui_weak.upgrade() else { return };
         let path = PathBuf::from(ui.get_finder_info_path().as_str());
+        let file_type = string_to_ostype(&ui.get_finder_info_type());
+        let creator = string_to_ostype(&ui.get_finder_info_creator());
+        let ui_weak = ui_weak.clone();
 
-        let type_bytes = string_to_ostype(&ui.get_finder_info_type());
-        let creator_bytes = string_to_ostype(&ui.get_finder_info_creator());
-
-        let mut info = tailtalk::afp::read_finder_info(&path).unwrap_or([0u8; 32]);
-        info[0..4].copy_from_slice(&type_bytes);
-        info[4..8].copy_from_slice(&creator_bytes);
-
-        match tailtalk::afp::write_finder_info(&path, &info) {
-            Ok(()) => {
-                ui.set_finder_info_visible(false);
-            }
-            Err(e) => {
-                let msg = format!("Could not write Finder Info: {e}");
-                ui.set_error_message(msg.into());
-            }
-        }
+        rt_handle_sfi.spawn(async move {
+            let mut info = tailtalk::afp::read_finder_info(&path).await.unwrap_or_default();
+            info.file_type = file_type;
+            info.creator = creator;
+            let result = tailtalk::afp::write_finder_info(&path, &info).await;
+            slint::invoke_from_event_loop(move || {
+                let Some(ui) = ui_weak.upgrade() else { return };
+                match result {
+                    Ok(()) => ui.set_finder_info_visible(false),
+                    Err(e) => ui.set_error_message(format!("Could not write Finder Info: {e}").into()),
+                }
+            })
+            .ok();
+        });
     });
 
     let ui_weak = ui.as_weak();
+    let rt_handle_sit = rt_handle.clone();
     ui.on_import_stuffit(move || {
         let ui_weak = ui_weak.clone();
+        let rt_handle_sit = rt_handle_sit.clone();
 
         let (volume_path, is_running) = {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -463,16 +471,18 @@ fn main() -> anyhow::Result<()> {
             return;
         }
 
-        std::thread::spawn(move || {
-            let Some(sit_path) = rfd::FileDialog::new()
+        rt_handle_sit.spawn(async move {
+            let Some(handle) = rfd::AsyncFileDialog::new()
                 .add_filter("StuffIt Archive", &["sit"])
                 .set_title("Import StuffIt Archive")
                 .pick_file()
+                .await
             else {
                 return;
             };
+            let sit_path = handle.path().to_path_buf();
 
-            match extract_sit(&sit_path, &volume_path) {
+            match extract_sit(&sit_path, &volume_path).await {
                 Ok(count) => show_info(
                     ui_weak,
                     format!("Extracted {count} file(s) from the archive successfully."),
@@ -993,8 +1003,8 @@ fn register_appl_from_resource_fork(
 
 /// Extract a StuffIt archive into `volume_path`, placing resource fork sidecars
 /// under `<volume_path>/.tailtalk/rsrc/<relative_path>` to match TailTalk's layout.
-fn extract_sit(sit_path: &Path, volume_path: &Path) -> Result<usize, String> {
-    let bytes = std::fs::read(sit_path)
+async fn extract_sit(sit_path: &Path, volume_path: &Path) -> Result<usize, String> {
+    let bytes = tokio::fs::read(sit_path).await
         .map_err(|e| format!("Failed to read archive: {e}"))?;
 
     let archive = stuffit::SitArchive::parse(&bytes)
@@ -1020,7 +1030,7 @@ fn extract_sit(sit_path: &Path, volume_path: &Path) -> Result<usize, String> {
         }
 
         if entry.is_folder {
-            std::fs::create_dir_all(volume_path.join(&rel))
+            tokio::fs::create_dir_all(volume_path.join(&rel)).await
                 .map_err(|e| format!("Failed to create '{}': {e}", rel.display()))?;
             continue;
         }
@@ -1029,7 +1039,7 @@ fn extract_sit(sit_path: &Path, volume_path: &Path) -> Result<usize, String> {
         if let Some(parent) = rel.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(volume_path.join(parent))
+            tokio::fs::create_dir_all(volume_path.join(parent)).await
                 .map_err(|e| format!("Failed to create parent for '{}': {e}", rel.display()))?;
         }
 
@@ -1040,26 +1050,28 @@ fn extract_sit(sit_path: &Path, volume_path: &Path) -> Result<usize, String> {
         // Always create the data fork file, even when empty, so that AFP can
         // serve the resource fork sidecar for resource-only files (e.g. apps).
         let dest = volume_path.join(&rel);
-        std::fs::write(&dest, &data_fork)
+        tokio::fs::write(&dest, &data_fork).await
             .map_err(|e| format!("Failed to write '{}': {e}", dest.display()))?;
         file_count += 1;
 
         // Preserve the Mac file type and creator from the archive so that AFP
         // reports correct FinderInfo (the Finder needs type=APPL to launch apps).
-        let mut finder_info = [0u8; 32];
-        finder_info[0..4].copy_from_slice(&entry.file_type);
-        finder_info[4..8].copy_from_slice(&entry.creator);
-        if let Err(e) = tailtalk::afp::write_finder_info(&dest, &finder_info) {
+        let finder_info = tailtalk::afp::FinderInfo {
+            file_type: entry.file_type,
+            creator: entry.creator,
+            ..Default::default()
+        };
+        if let Err(e) = tailtalk::afp::write_finder_info(&dest, &finder_info).await {
             tracing::warn!("Could not set FinderInfo for '{}': {e}", rel.display());
         }
 
         if !rsrc_fork.is_empty() {
             let rsrc_dest = volume_path.join(".tailtalk").join("rsrc").join(&rel);
             if let Some(parent) = rsrc_dest.parent() {
-                std::fs::create_dir_all(parent)
+                tokio::fs::create_dir_all(parent).await
                     .map_err(|e| format!("Failed to create rsrc dir for '{}': {e}", rel.display()))?;
             }
-            std::fs::write(&rsrc_dest, &rsrc_fork)
+            tokio::fs::write(&rsrc_dest, &rsrc_fork).await
                 .map_err(|e| format!("Failed to write resource fork for '{}': {e}", rel.display()))?;
 
             let file_name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
