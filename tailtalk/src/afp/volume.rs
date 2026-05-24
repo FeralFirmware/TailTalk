@@ -30,15 +30,15 @@ struct TypeCreator {
     creator: [u8; 4],
 }
 
-/// Returns the `TypeCreator` for a known file extension, or `None` if unrecognized.
-fn infer_type_creator(extension: &str) -> Option<TypeCreator> {
-    match extension.to_ascii_lowercase().as_str() {
-        // Disk Copy 4.2 disk images
-        "dsk" | "img" => Some(TypeCreator { file_type: *b"dImg", creator: *b"dCpy" }),
-        // StuffIt archives
-        "sit" => Some(TypeCreator { file_type: *b"SIT!", creator: *b"SIT!" }),
-        // Plain text files (SimpleText)
-        "txt" | "md" => Some(TypeCreator { file_type: *b"TEXT", creator: *b"ttxt" }),
+/// Returns the `TypeCreator` by probing the file's content using pure-magic.
+fn infer_type_creator_from_content(path: &Path) -> Option<TypeCreator> {
+    let db = magic_db::load().ok()?;
+    let magic = db.first_magic_file(path).ok()?;
+
+    match magic.mime_type() {
+        "text/plain" => Some(TypeCreator { file_type: *b"TEXT", creator: *b"ttxt" }),
+        "application/x-stuffit" => Some(TypeCreator { file_type: *b"SIT!", creator: *b"SIT!" }),
+        "application/x-apple-diskimage" => Some(TypeCreator { file_type: *b"dImg", creator: *b"dCpy" }),
         _ => None,
     }
 }
@@ -141,8 +141,7 @@ impl Node {
 
         if stored == [0u8; 32]
             && !self.is_dir
-            && let Some(ext) = self.path.extension().and_then(|e| e.to_str())
-            && let Some(tc) = infer_type_creator(ext)
+            && let Some(tc) = infer_type_creator_from_content(&absolute_path)
         {
             let mut inferred = [0u8; 32];
             inferred[0..4].copy_from_slice(&tc.file_type);

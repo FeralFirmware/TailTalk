@@ -17,6 +17,8 @@ anyhow = { workspace = true } #unified
 byteorder = { workspace = true } #unified
 bytes = { workspace = true } #unified
 dashmap = "6.1.0"
+magic-db = "0.5"
+pure-magic = "0.3"
 futures = { workspace = true } #unified
 im = "15.1.0"
 mac_address = "1.1"
