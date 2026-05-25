@@ -315,11 +315,7 @@ impl Node {
         }
 
         if bitmap.contains(FPFileBitmap::RESOURCE_FORK_LENGTH) {
-            let rsrc = resolve_resource_fork_path(volume_root, &self.path);
-            let rsrc_len = tokio::fs::metadata(&rsrc)
-                .await
-                .map(|m| m.len() as u32)
-                .unwrap_or(0);
+            let (_, rsrc_len) = resolve_resource_fork_path(volume_root, &self.path).await;
             output[offset..offset + 4].copy_from_slice(&rsrc_len.to_be_bytes());
             offset += 4;
         }
@@ -382,12 +378,12 @@ fn is_native_resource_fork_path(path: &Path) -> bool {
 /// sometimes leaves behind a zero-byte sidecar (since `OpenOptions::create`
 /// runs unconditionally), and we want that empty file to be ignored on
 /// subsequent opens.
-fn resolve_resource_fork_path(volume_root: &Path, relative_path: &Path) -> PathBuf {
+async fn resolve_resource_fork_path(volume_root: &Path, relative_path: &Path) -> (PathBuf, u32) {
     let sidecar = rsrc_path(volume_root, relative_path);
-    if let Ok(meta) = std::fs::metadata(&sidecar)
+    if let Ok(meta) = tokio::fs::metadata(&sidecar).await
         && meta.len() > 0
     {
-        return sidecar;
+        return (sidecar, meta.len() as u32);
     }
     #[cfg(target_os = "macos")]
     {
@@ -395,13 +391,13 @@ fn resolve_resource_fork_path(volume_root: &Path, relative_path: &Path) -> PathB
             .join(relative_path)
             .join("..namedfork")
             .join("rsrc");
-        if let Ok(meta) = std::fs::metadata(&native)
+        if let Ok(meta) = tokio::fs::metadata(&native).await
             && meta.len() > 0
         {
-            return native;
+            return (native, meta.len() as u32);
         }
     }
-    sidecar
+    (sidecar, 0)
 }
 
 /// Converts an AFP path string to a POSIX PathBuf.
@@ -1240,7 +1236,7 @@ impl Volume {
                     return Err(AfpError::FileBusy);
                 }
 
-                let rsrc_target = resolve_resource_fork_path(&self.path, &node.path.clone());
+                let (rsrc_target, _) = resolve_resource_fork_path(&self.path, &node.path.clone()).await;
                 node.open_resource_fork(&rsrc_target).await.map_err(|e| {
                     eprintln!("Error opening resource fork: {:?}", e);
                     AfpError::AccessDenied
