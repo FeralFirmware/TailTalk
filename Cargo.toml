@@ -9,6 +9,7 @@ members = [
   "examples/adsp-stylewriter",
   "tailtalk-gui",
   "tashtalk",
+  "hfs-reader",
 ]
 resolver = "3"
 

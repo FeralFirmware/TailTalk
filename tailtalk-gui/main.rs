@@ -492,6 +492,53 @@ fn main() -> anyhow::Result<()> {
         });
     });
 
+    let ui_weak = ui.as_weak();
+    let rt_handle_hfs = rt_handle.clone();
+    ui.on_import_hfs_image(move || {
+        let ui_weak = ui_weak.clone();
+        let rt_handle_hfs = rt_handle_hfs.clone();
+
+        let (volume_path, is_running) = {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            (PathBuf::from(ui.get_volume_path().as_str()), ui.get_running())
+        };
+
+        if is_running {
+            show_error(
+                ui_weak,
+                "Please stop the AFP server before importing a disk image.\n\
+                 Importing while the server is running may corrupt the desktop database."
+                    .to_string(),
+            );
+            return;
+        }
+
+        if volume_path.as_os_str().is_empty() {
+            show_error(ui_weak, "Please set a volume path before importing.".to_string());
+            return;
+        }
+
+        rt_handle_hfs.spawn(async move {
+            let Some(handle) = rfd::AsyncFileDialog::new()
+                .add_filter("HFS Disk Image", &["dsk", "img", "hfs", "image"])
+                .set_title("Import HFS Disk Image")
+                .pick_file()
+                .await
+            else {
+                return;
+            };
+            let img_path = handle.path().to_path_buf();
+
+            match extract_hfs_image(&img_path, &volume_path).await {
+                Ok(count) => show_info(
+                    ui_weak,
+                    format!("Imported {count} file(s) from the HFS image successfully."),
+                ),
+                Err(e) => show_error(ui_weak, e),
+            }
+        });
+    });
+
     // Poll for serial device changes every 1.5 s so plug/unplug is reflected live.
     #[cfg(feature = "tashtalk")]
     let _serial_poll_timer = {
@@ -1111,6 +1158,136 @@ async fn extract_sit(sit_path: &Path, volume_path: &Path) -> Result<usize, Strin
             }
             c
         });
+        if let Err(e) = load_icon_rsrc_into_desktop_db(rsrc_fork, creator, volume_path) {
+            tracing::warn!("Could not load Icon\\r into desktop db: {e}");
+        }
+    }
+
+    Ok(file_count)
+}
+
+// ── HFS disk image extraction ─────────────────────────────────────────────────
+
+/// Extract an HFS (classic, not HFS+) disk image into `volume_path`.
+///
+/// Resource forks are stored as TailTalk sidecars under
+/// `<volume_path>/.tailtalk/rsrc/<relative_path>`, matching the StuffIt layout.
+/// FinderInfo (type + creator) is preserved via xattr.
+///
+/// Returns the number of files extracted on success.
+async fn extract_hfs_image(img_path: &Path, volume_path: &Path) -> Result<usize, String> {
+    let img = tokio::fs::read(img_path).await
+        .map_err(|e| format!("Failed to read disk image: {e}"))?;
+
+    let vol = hfs_reader::HfsVolume::parse(&img)
+        .map_err(|e| format!("Failed to parse HFS image: {e}"))?;
+
+    // Place all extracted files inside a subdirectory named after the HFS volume.
+    // Fall back to the image filename stem when the volume has no name.
+    let vol_subdir: PathBuf = if vol.volume_name.is_empty() {
+        img_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "untitled".to_string())
+            .into()
+    } else {
+        vol.volume_name.clone().into()
+    };
+    let dest_root = volume_path.join(&vol_subdir);
+    tokio::fs::create_dir_all(&dest_root).await
+        .map_err(|e| format!("Failed to create destination directory '{}': {e}", dest_root.display()))?;
+
+    let mut dir_creators: std::collections::HashMap<u32, [u8; 4]> =
+        std::collections::HashMap::new();
+    let mut deferred_icon_cr: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    let mut file_count = 0usize;
+
+    // Walk every file record in the catalog B-tree.
+    for file in &vol.files {
+        let rel = &file.rel_path;
+        // AFP looks up sidecars as volume_path/.tailtalk/rsrc/<full_rel_from_volume_root>.
+        // Since dest_root is volume_path/<vol_subdir>, the full path relative to volume_path is
+        // <vol_subdir>/<rel>.
+        let full_rel = vol_subdir.join(rel);
+
+        // Ensure parent directory exists.
+        if let Some(parent) = rel.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(dest_root.join(parent)).await
+                .map_err(|e| format!("Failed to create parent for '{}': {e}", rel.display()))?;
+        }
+
+        let data_fork = vol.read_data_fork(file)
+            .map_err(|e| format!("Failed to read data fork for '{}': {e}", rel.display()))?;
+        let rsrc_fork = vol.read_rsrc_fork(file)
+            .map_err(|e| format!("Failed to read resource fork for '{}': {e}", rel.display()))?;
+
+        let dest = dest_root.join(rel);
+        tokio::fs::write(&dest, &data_fork).await
+            .map_err(|e| format!("Failed to write '{}': {e}", dest.display()))?;
+        file_count += 1;
+
+        let finder_info = tailtalk::afp::FinderInfo {
+            file_type: file.file_type,
+            creator: file.creator,
+            ..Default::default()
+        };
+        if let Err(e) = tailtalk::afp::write_finder_info(&dest, &finder_info).await {
+            tracing::warn!("Could not set FinderInfo for '{}': {e}", rel.display());
+        }
+
+        if !rsrc_fork.is_empty() {
+            // Sidecar must live under volume_path/.tailtalk/rsrc/<vol_subdir>/<rel>
+            // so that the AFP server (which is rooted at volume_path) finds it.
+            let rsrc_dest = volume_path.join(".tailtalk").join("rsrc").join(&full_rel);
+            if let Some(parent) = rsrc_dest.parent() {
+                tokio::fs::create_dir_all(parent).await
+                    .map_err(|e| format!("Failed to create rsrc dir for '{}': {e}", rel.display()))?;
+            }
+            tokio::fs::write(&rsrc_dest, &rsrc_fork).await
+                .map_err(|e| format!("Failed to write resource fork for '{}': {e}", rel.display()))?;
+
+            let file_name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            if file_name == "Icon\r" {
+                let parent_dir = full_rel.parent().unwrap_or(Path::new("")).to_path_buf();
+                deferred_icon_cr.push((parent_dir, rsrc_fork));
+            } else {
+                if let Some(creator) = extract_bndl_creator(&rsrc_fork) {
+                    dir_creators.entry(file.parent_cnid).or_insert(creator);
+                }
+                if let Err(e) = register_appl_from_resource_fork(&rsrc_fork, &full_rel, volume_path) {
+                    tracing::warn!("Could not register APPL for '{}': {e}", rel.display());
+                }
+            }
+        }
+    }
+
+    // Also create any directories that existed in the image but had no files.
+    for dir in &vol.dirs {
+        let abs = dest_root.join(&dir.rel_path);
+        tokio::fs::create_dir_all(&abs).await
+            .map_err(|e| format!("Failed to create directory '{}': {e}", dir.rel_path.display()))?;
+    }
+
+    // Process deferred Icon\r entries now that we have the full creator map.
+    for (parent_dir, rsrc_fork) in &deferred_icon_cr {
+        let creator = dir_creators
+            .values()
+            .next()
+            .copied()
+            .unwrap_or_else(|| {
+                let folder_name = parent_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                let mut c = [b' '; 4];
+                for (dst, src) in c.iter_mut().zip(folder_name.bytes()) {
+                    *dst = src;
+                }
+                c
+            });
         if let Err(e) = load_icon_rsrc_into_desktop_db(rsrc_fork, creator, volume_path) {
             tracing::warn!("Could not load Icon\\r into desktop db: {e}");
         }

@@ -29,6 +29,7 @@ toml = "0.8"
 if-addrs = { version = "0.13", optional = true }
 serialport = { version = "4", optional = true }
 stuffit = "0.1.4"
+hfs-reader = { path = "../hfs-reader" }
 
 [build-dependencies]
 slint-build = "1"

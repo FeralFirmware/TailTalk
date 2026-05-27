@@ -33,6 +33,7 @@ export component AppWindow inherits Window {
     callback browse-volume();
     callback browse-pcap();
     callback import-stuffit();
+    callback import-hfs-image();
     callback inspect-finder-info();
     callback save-finder-info();
     // Returns the input truncated to 4 characters; registered in Rust.
@@ -44,6 +45,10 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: "Import StuffIt Archive…";
                 activated => { root.import-stuffit(); }
+            }
+            MenuItem {
+                title: "Import HFS Disk Image…";
+                activated => { root.import-hfs-image(); }
             }
             MenuItem {
                 title: "Inspect Finder Info…";
