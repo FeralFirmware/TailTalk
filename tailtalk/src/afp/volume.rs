@@ -38,7 +38,28 @@ fn infer_type_creator_from_content(path: &Path) -> Option<TypeCreator> {
     match magic.mime_type() {
         "text/plain" => Some(TypeCreator { file_type: *b"TEXT", creator: *b"ttxt" }),
         "application/x-stuffit" => Some(TypeCreator { file_type: *b"SIT!", creator: *b"SIT!" }),
+        // StuffIt SEA (Self-Extracting Archive): APPL type as it is a standalone executable
+        "application/x-stuffit-x" => Some(TypeCreator { file_type: *b"APPL", creator: *b"aust" }),
         "application/x-apple-diskimage" => Some(TypeCreator { file_type: *b"dImg", creator: *b"dCpy" }),
+        // PDF: type 'PDF ' (with trailing space), creator 'CARO' (Adobe Acrobat)
+        "application/pdf" => Some(TypeCreator { file_type: *b"PDF ", creator: *b"CARO" }),
+        // BinHex 4.0: type 'TEXT', creator 'BnHq' (BinHex utility)
+        "application/mac-binhex40" => Some(TypeCreator { file_type: *b"TEXT", creator: *b"BnHq" }),
+        _ => None,
+    }
+}
+
+/// Returns the `TypeCreator` by file extension alone, as a fallback when magic
+/// byte probing fails or returns an unrecognised MIME type.
+fn infer_type_creator_from_extension(path: &Path) -> Option<TypeCreator> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "txt" => Some(TypeCreator { file_type: *b"TEXT", creator: *b"ttxt" }),
+        "sit" => Some(TypeCreator { file_type: *b"SIT!", creator: *b"SIT!" }),
+        "sea" => Some(TypeCreator { file_type: *b"APPL", creator: *b"aust" }),
+        "img" | "dsk" => Some(TypeCreator { file_type: *b"dImg", creator: *b"dCpy" }),
+        "pdf" => Some(TypeCreator { file_type: *b"PDF ", creator: *b"CARO" }),
+        "hqx" => Some(TypeCreator { file_type: *b"TEXT", creator: *b"BnHq" }),
         _ => None,
     }
 }
@@ -153,7 +174,10 @@ impl Node {
 
         if stored == FinderInfo::default() && !self.is_dir {
             let abs = absolute_path.clone();
-            let maybe_tc = tokio::task::spawn_blocking(move || infer_type_creator_from_content(&abs))
+            let maybe_tc = tokio::task::spawn_blocking(move || {
+                infer_type_creator_from_content(&abs)
+                    .or_else(|| infer_type_creator_from_extension(&abs))
+            })
                 .await
                 .unwrap_or(None);
             if let Some(tc) = maybe_tc {

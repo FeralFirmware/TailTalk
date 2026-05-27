@@ -54,6 +54,8 @@ The resulting bundle will be placed in dist/.
 
 ## TashTalk USB
 
+Quick start guide: [Setup.md](/Setup.md)
+
 TashTalk USB uses a Silicon Labs CP210x USB-to-UART bridge (VID `10c4`, PID `ea60`). On Linux, the `cp210x` kernel
 module handles this automatically, but by default the device node is only accessible by root. To grant your user
 access without requiring root, create a udev rule:
