@@ -347,26 +347,15 @@ fn is_native_resource_fork_path(path: &Path) -> bool {
         .any(|c| c.as_os_str() == std::ffi::OsStr::new("..namedfork"))
 }
 
-/// Resolves where to read the resource fork for a file.
+/// Resolves the resource fork path for a file, returning the path and its current length.
 ///
-/// Prefers the `.tailtalk/rsrc/<path>` sidecar if it has data. On macOS,
-/// falls back to the native named-fork path `<file>/..namedfork/rsrc` if
-/// that file has a non-empty resource fork (as it does when modern macOS
-/// Finder copies a file with a resource fork — e.g. an APPL — into the
-/// volume directory). Falls back to the sidecar path otherwise, so that
-/// first-time writes still land in the sidecar.
+/// On macOS: prefers the native named-fork (`<file>/..namedfork/rsrc`) if non-empty,
+/// then falls back to the `.tailtalk/rsrc/<path>` sidecar if non-empty, then returns
+/// the native fork path with length 0 (so new writes land in the native fork).
 ///
-/// An empty sidecar must not shadow a populated native fork: `open_fork`
-/// sometimes leaves behind a zero-byte sidecar (since `OpenOptions::create`
-/// runs unconditionally), and we want that empty file to be ignored on
-/// subsequent opens.
+/// On other platforms: prefers the sidecar if non-empty, otherwise returns the sidecar
+/// path with length 0.
 async fn resolve_resource_fork_path(volume_root: &Path, relative_path: &Path) -> (PathBuf, u32) {
-    let sidecar = rsrc_path(volume_root, relative_path);
-    if let Ok(meta) = tokio::fs::metadata(&sidecar).await
-        && meta.len() > 0
-    {
-        return (sidecar, meta.len() as u32);
-    }
     #[cfg(target_os = "macos")]
     {
         let native = volume_root
@@ -378,8 +367,24 @@ async fn resolve_resource_fork_path(volume_root: &Path, relative_path: &Path) ->
         {
             return (native, meta.len() as u32);
         }
+        let sidecar = rsrc_path(volume_root, relative_path);
+        if let Ok(meta) = tokio::fs::metadata(&sidecar).await
+            && meta.len() > 0
+        {
+            return (sidecar, meta.len() as u32);
+        }
+        return (native, 0);
     }
-    (sidecar, 0)
+    #[cfg(not(target_os = "macos"))]
+    {
+        let sidecar = rsrc_path(volume_root, relative_path);
+        if let Ok(meta) = tokio::fs::metadata(&sidecar).await
+            && meta.len() > 0
+        {
+            return (sidecar, meta.len() as u32);
+        }
+        (sidecar, 0)
+    }
 }
 
 /// Converts an AFP path string to a POSIX PathBuf.
@@ -2393,15 +2398,20 @@ mod tests {
         volume.write_fork(fork_ref, 0, payload).await.unwrap();
         volume.close_fork(fork_ref).await.unwrap();
 
-        // Sidecar file should exist at the expected path
-        let sidecar = rsrc_path(&root_path, Path::new("rsrc_test.txt"));
-        assert!(
-            sidecar.exists(),
-            "sidecar file should exist at {:?}",
-            sidecar
-        );
-        let sidecar_contents = tokio::fs::read(&sidecar).await.unwrap();
-        assert_eq!(sidecar_contents, payload);
+        // On macOS writes land in the native resource fork; elsewhere in the sidecar.
+        #[cfg(target_os = "macos")]
+        {
+            let native = root_path.join("rsrc_test.txt").join("..namedfork").join("rsrc");
+            let contents = tokio::fs::read(&native).await.unwrap();
+            assert_eq!(contents, payload);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let sidecar = rsrc_path(&root_path, Path::new("rsrc_test.txt"));
+            assert!(sidecar.exists(), "sidecar file should exist at {:?}", sidecar);
+            let contents = tokio::fs::read(&sidecar).await.unwrap();
+            assert_eq!(contents, payload);
+        }
 
         // RESOURCE_FORK_LENGTH should now reflect the written size
         let node_id = volume.resolve_node_lazy(2, Path::new("rsrc_test.txt")).await.unwrap();
@@ -2443,14 +2453,19 @@ mod tests {
             .unwrap();
         volume.close_fork(fork_ref).await.unwrap();
 
-        let sub_sidecar = rsrc_path(&root_path, Path::new("subdir/rsrc_sub.txt"));
-        assert!(
-            sub_sidecar.exists(),
-            "subdir sidecar should exist at {:?}",
-            sub_sidecar
-        );
+        #[cfg(target_os = "macos")]
+        {
+            let native = root_path.join("subdir").join("rsrc_sub.txt").join("..namedfork").join("rsrc");
+            let contents = tokio::fs::read(&native).await.unwrap();
+            assert_eq!(contents, b"sub resource");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let sub_sidecar = rsrc_path(&root_path, Path::new("subdir/rsrc_sub.txt"));
+            assert!(sub_sidecar.exists(), "subdir sidecar should exist at {:?}", sub_sidecar);
+        }
 
-        // Deleting the file should remove the sidecar
+        // Deleting the file should remove it (and its sidecar on non-macOS)
         let delete_req = FPDelete {
             volume_id: 1,
             directory_id: 2,
@@ -2458,8 +2473,8 @@ mod tests {
         };
         volume.delete(&delete_req).await.unwrap();
         assert!(
-            !sidecar.exists(),
-            "sidecar should be removed when file is deleted"
+            !root_path.join("rsrc_test.txt").exists(),
+            "file should be removed after delete"
         );
     }
 
