@@ -33,31 +33,52 @@ It additionally supports running with TashTalk for LocalTalk Macs.
 
 ## Building
 
-This project requires Rust 1.90 or above, which can be installed from [rustup.rs](rustup.rs). This should install
+### Prerequisites
+
+This project requires Rust 1.90 or above, which can be installed from [rustup.rs](https://rustup.rs). This should install
 a matching compiler for your OS and CPU architecture by default.
 
-Once installed, run `cargo build --release` from the root of this repository to build everything, or for just the
+This project uses [cargo-packager](github.com/crabnebula-dev/cargo-packager) for building AppImage for Linux, and App bundles
+for macOS and installers for Windows. Install it with `cargo install cargo-packager`.
+
+### Windows Only
+
+Ensure you have the Windows MSVC prerequisites installed as specified in the [rustup book](https://rust-lang.github.io/rustup/installation/windows-msvc.html).
+
+Windows requires the npcap SDK to be saved somewhere on your machine. It is available at [npcap.com](https://npcap.com/#download). Point a LIB environment variable to the folder where you unzipped the SDK, such as:
+``` C:\npcap-sdk-1.13\Lib\x64```
+
+
+### Running the build
+
+Once the prerequisites are installed, run `cargo build --release` from the root of this repository to build everything, or for just the
 TailTail GUI run `cargo build -p tailtalk-gui --release`.
 
 After building the binaries should be located at `target/release/`.
 
-This project uses [cargo-packager](github.com/crabnebula-dev/cargo-packager) for building AppImage for Linux and App bundles
-for macOS. Install it with `cargo install cargo-packager`, then run the following based on your OS:
+
+Then run the following based on your OS:
 ```sh
 # Linux
 cargo packager --release -f appimage -p tailtalk-gui
 # macOS
 cargo packager --release -p tailtalk-gui
+# Windows 
+cargo packager --release -f nsis -p tailtalk-gui
+
 ```
 
 The resulting bundle will be placed in dist/. 
+
 
 ## TashTalk USB
 
 Quick start guide: [Setup.md](/Setup.md)
 
-TashTalk USB uses a Silicon Labs CP210x USB-to-UART bridge (VID `10c4`, PID `ea60`). On Linux, the `cp210x` kernel
-module handles this automatically, but by default the device node is only accessible by root. To grant your user
+TashTalk USB uses a Silicon Labs CP210x USB-to-UART bridge (VID `10c4`, PID `ea60`). 
+
+### Linux
+The `cp210x` kernel module is likely installed already but by default the device node is only accessible by root. To grant your user
 access without requiring root, create a udev rule:
 
 ```sh
@@ -68,6 +89,12 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 After running these commands, unplug and re-plug the TashTalk USB device. It will appear as `/dev/ttyUSB0` (or
 similar) and be accessible without root.
+
+### Windows
+Install the CP210x VCP Windows driver from 
+[Silicon Labs](https://www.silabs.com/software-and-tools/usb-to-uart-bridge-vcp-drivers?tab=downloads).
+
+Install npcap 1.88 from [npcap.com](https://npcap.com/#download)
 
 ## Existing Programs
 There are 4 demo programs I have written to verify the functionality of this software as I have developed it:
