@@ -26,6 +26,7 @@ pub struct DesktopDatabase {
     icons: sled::Tree,
     comments: sled::Tree,
     appls: sled::Tree,
+    pub mangle_names: sled::Tree,
 }
 
 impl DesktopDatabase {
@@ -64,7 +65,11 @@ impl DesktopDatabase {
             error!("Failed to open 'appls' tree: {}", e);
             AfpError::AccessDenied
         })?;
-        Ok(Self { dt_ref_num, icons, comments, appls })
+        let mangle_names = db.open_tree(b"mangle_names").map_err(|e| {
+            error!("Failed to open 'mangle_names' tree: {}", e);
+            AfpError::AccessDenied
+        })?;
+        Ok(Self { dt_ref_num, icons, comments, appls, mangle_names })
     }
 
     /// Open (or create) the desktop database at the standard path and wrap it.
@@ -72,6 +77,24 @@ impl DesktopDatabase {
     pub fn new(volume_root: &Path, dt_ref_num: u16) -> Result<Self, AfpError> {
         let db = Self::open_or_create(volume_root)?;
         Self::from_db(db, dt_ref_num)
+    }
+
+    /// Record a mangled name → original POSIX filename mapping so it survives restarts.
+    /// `mangled_mac_bytes` is the raw MacRoman output of `mangle_name`; `posix_name` is
+    /// the on-disk filename (UTF-8, no AFP colon/slash substitution).
+    pub fn register_mangle(&self, mangled_mac_bytes: &[u8], posix_name: &str) {
+        if let Err(e) = self.mangle_names.insert(mangled_mac_bytes, posix_name.as_bytes()) {
+            error!("Failed to register mangle entry: {}", e);
+        }
+    }
+
+    /// Look up a mangled name and return the original POSIX filename, if known.
+    pub fn lookup_mangle(&self, mangled_mac_bytes: &[u8]) -> Option<String> {
+        self.mangle_names
+            .get(mangled_mac_bytes)
+            .ok()
+            .flatten()
+            .and_then(|v| String::from_utf8(v.to_vec()).ok())
     }
 
     pub fn add_icon(
@@ -441,5 +464,114 @@ impl DesktopDatabase {
         }
 
         Err(AfpError::ItemNotFound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tailtalk_packets::afp::mangle_name;
+    use tempfile::tempdir;
+
+    fn open_db(root: &std::path::Path) -> DesktopDatabase {
+        let db = DesktopDatabase::open_or_create(root).unwrap();
+        DesktopDatabase::from_db(db, 1).unwrap()
+    }
+
+    #[test]
+    fn register_then_lookup_returns_original_name() {
+        let dir = tempdir().unwrap();
+        let dt = open_db(dir.path());
+
+        let long_name = "This is a very long filename that exceeds the AFP 2.x limit.txt";
+        let mangled = mangle_name(long_name);
+
+        dt.register_mangle(&mangled, long_name);
+        assert_eq!(dt.lookup_mangle(&mangled).as_deref(), Some(long_name));
+    }
+
+    #[test]
+    fn lookup_unknown_key_returns_none() {
+        let dir = tempdir().unwrap();
+        let dt = open_db(dir.path());
+        assert_eq!(dt.lookup_mangle(b"not-registered"), None);
+    }
+
+    #[test]
+    fn mangle_mapping_survives_db_reopen() {
+        let dir = tempdir().unwrap();
+
+        let long_name = "This is a very long filename that exceeds the AFP 2.x limit.txt";
+        let mangled = mangle_name(long_name);
+
+        // Session 1: register and close.
+        {
+            let dt = open_db(dir.path());
+            dt.register_mangle(&mangled, long_name);
+        }
+
+        // Session 2: reopen the same on-disk DB and verify the entry is still there.
+        let dt2 = open_db(dir.path());
+        assert_eq!(
+            dt2.lookup_mangle(&mangled).as_deref(),
+            Some(long_name),
+            "mangle entry should survive a DB close and reopen"
+        );
+    }
+
+    #[test]
+    fn multiple_distinct_long_names_are_stored_independently() {
+        let dir = tempdir().unwrap();
+        let dt = open_db(dir.path());
+
+        let name_a = "This is a very long filename that exceeds limit - variant A.txt";
+        let name_b = "This is a very long filename that exceeds limit - variant B.txt";
+        let mangled_a = mangle_name(name_a);
+        let mangled_b = mangle_name(name_b);
+
+        assert_ne!(mangled_a, mangled_b);
+
+        dt.register_mangle(&mangled_a, name_a);
+        dt.register_mangle(&mangled_b, name_b);
+
+        assert_eq!(dt.lookup_mangle(&mangled_a).as_deref(), Some(name_a));
+        assert_eq!(dt.lookup_mangle(&mangled_b).as_deref(), Some(name_b));
+    }
+
+    /// Simulate the full unmangle round-trip that happens on the wire:
+    ///   1. Server mangles the name and sends the raw MacRoman bytes to the client.
+    ///   2. Client stores/displays the name (opaque bytes to it).
+    ///   3. Client sends the name back; our packet parser decodes it from MacRoman to UTF-8.
+    ///   4. We re-encode to MacRoman to key into the sled table.
+    ///   5. lookup_mangle returns the original POSIX filename.
+    #[test]
+    fn unmangle_survives_macroman_decode_reencode_roundtrip() {
+        use encoding_rs::MACINTOSH;
+
+        let dir = tempdir().unwrap();
+        let dt = open_db(dir.path());
+
+        let long_name = "This is a very long filename that exceeds the AFP 2.x limit.txt";
+        let mangled_bytes = mangle_name(long_name);
+
+        dt.register_mangle(&mangled_bytes, long_name);
+
+        // Simulate what our packet parser does: decode the raw MacRoman bytes to UTF-8.
+        let (decoded_utf8, _, _) = MACINTOSH.decode(&mangled_bytes);
+
+        // Simulate what resolve_node does: re-encode the UTF-8 string back to MacRoman.
+        let (reencoded, _, _) = MACINTOSH.encode(decoded_utf8.as_ref());
+
+        // The re-encoded bytes must match the original mangled bytes so the lookup succeeds.
+        assert_eq!(
+            reencoded.as_ref(),
+            mangled_bytes.as_slice(),
+            "MacRoman decode→encode must be lossless for mangled names"
+        );
+        assert_eq!(
+            dt.lookup_mangle(&reencoded).as_deref(),
+            Some(long_name),
+            "lookup_mangle must return the original name after a decode/re-encode round-trip"
+        );
     }
 }

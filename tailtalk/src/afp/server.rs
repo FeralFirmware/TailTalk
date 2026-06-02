@@ -182,6 +182,7 @@ impl AspSession {
             volume_name,
             config.volume_path.clone(),
             1234, // TODO: How should these IDs be created?
+            desktop_db.clone(),
         )
         .await;
 
@@ -363,7 +364,7 @@ impl AspSession {
                 }
                 tailtalk_packets::afp::AFP_CMD_OPEN_DT => {
                     debug!("AFP FPOpenDT req: (no params)");
-                    match our_volume.open_dt(desktop_db.clone()).await {
+                    match our_volume.open_dt().await {
                         Ok(ref_num) => {
                             debug!("AFP FPOpenDT resp: OK dt_ref_num={}", ref_num);
                             command.send_reply(AspCommandResponse {

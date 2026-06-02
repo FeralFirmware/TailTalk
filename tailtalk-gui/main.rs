@@ -11,7 +11,7 @@ use slint::Model as _;
 use serde::{Deserialize, Serialize};
 use tailtalk::ShutdownHandle;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{filter::LevelFilter, prelude::*};
+use tracing_subscriber::{EnvFilter, prelude::*};
 
 slint::include_modules!();
 
@@ -134,8 +134,11 @@ fn init_logging() -> Option<WorkerGuard> {
         let file_appender = tracing_appender::rolling::daily(&log_dir, "tailtalk.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info"));
+
         tracing_subscriber::registry()
-            .with(LevelFilter::INFO)
+            .with(filter)
             .with(tracing_subscriber::fmt::layer()) // stdout
             .with(tracing_subscriber::fmt::layer().with_writer(non_blocking)) // file
             .init();
@@ -145,8 +148,11 @@ fn init_logging() -> Option<WorkerGuard> {
 
     #[allow(unreachable_code)]
     {
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info"));
+
         tracing_subscriber::registry()
-            .with(LevelFilter::INFO)
+            .with(filter)
             .with(tracing_subscriber::fmt::layer())
             .init();
         None

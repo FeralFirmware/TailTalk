@@ -1,5 +1,6 @@
 use bitflags::bitflags;
-use encoding_rs::MACINTOSH;
+
+use crate::afp::util::mangle_name;
 
 bitflags! {
     /// Bitmap of requested volume information. One or more of these can be set in a request
@@ -160,7 +161,7 @@ impl FPDirectoryBitmap {
     }
 
     pub fn response_len(&self, name: &str) -> usize {
-        let mac_name_len = MACINTOSH.encode(name).0.len().min(255);
+        let mac_name_len = mangle_name(name).len();
         self.long_name_offset() + mac_name_len + 1
     }
 }
@@ -244,7 +245,7 @@ impl FPFileBitmap {
     }
 
     pub fn response_len(&self, name: &str) -> usize {
-        let mac_name_len = MACINTOSH.encode(name).0.len().min(255);
+        let mac_name_len = mangle_name(name).len();
         self.long_name_offset() + mac_name_len + 1
     }
 }

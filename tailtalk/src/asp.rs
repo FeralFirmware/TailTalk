@@ -95,7 +95,7 @@ impl AspSession {
 
         // Update our remote_addr in case the client changed its socket after OpenSess
         if self.remote_addr != cmd.client_address {
-            tracing::info!(
+            tracing::debug!(
                 "ASP Session {} remote address updated from {:?} to {:?}",
                 self.id,
                 self.remote_addr,

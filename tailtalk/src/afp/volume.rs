@@ -3,13 +3,13 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use tailtalk_packets::afp::{
-    AfpError, CreateFlag, FPByteRangeLockFlags, FPDelete, FPDirectoryBitmap, FPEnumerate,
-    FPFileBitmap, FPRead, FPSetForkParms, FPVolume, FPVolumeBitmap, FileType, FinderFlags,
-    FinderInfo, ForkType, VolumeSignature,
+    mangle_name, AFP2_MAX_NAME_LEN, AfpError, CreateFlag, FPByteRangeLockFlags, FPDelete,
+    FPDirectoryBitmap, FPEnumerate, FPFileBitmap, FPRead, FPSetForkParms, FPVolume,
+    FPVolumeBitmap, FileType, FinderFlags, FinderInfo, ForkType, VolumeSignature,
 };
+use encoding_rs::MACINTOSH;
 
 use crate::time_to_afp_v1;
-use encoding_rs::MACINTOSH;
 use tracing::{error, info};
 #[cfg(unix)]
 use xattr;
@@ -308,12 +308,12 @@ impl Node {
             output[offset..offset + 2].copy_from_slice(&(long_name_offset as u16).to_be_bytes());
             offset += 2;
 
-            let (encoded_name, _, _) = MACINTOSH.encode(&self.name);
-            let name_len = encoded_name.len().min(255);
+            let encoded_name = mangle_name(&self.name);
+            let name_len = encoded_name.len();
             output[long_name_offset] = name_len as u8;
             long_name_offset += 1;
             output[long_name_offset..long_name_offset + name_len]
-                .copy_from_slice(&encoded_name[..name_len]);
+                .copy_from_slice(&encoded_name);
 
             variable_len_offset += name_len + 1;
         }
@@ -359,7 +359,8 @@ pub struct Volume {
     next_fork_ref_num: u16,
     /// Tracks byte-range locks per fork. Key is fork_ref_num, value is a vector of (offset, length) tuples
     fork_locks: HashMap<u16, Vec<(u64, u64)>>,
-    desktop_database: Option<crate::afp::DesktopDatabase>,
+    desktop_database: crate::afp::DesktopDatabase,
+    mangle_tree: sled::Tree,
 }
 
 /// Returns the path to the resource fork sidecar for a given file.
@@ -440,6 +441,23 @@ fn posix_name_to_afp(name: &str) -> String {
     name.replace(':', "/")
 }
 
+/// If `afp_name` encodes to more than AFP2_MAX_NAME_LEN MacRoman bytes, registers the
+/// mangled → posix_name mapping in the sled tree so `resolve_node` can reverse it.
+fn register_mangle_if_needed(tree: &sled::Tree, afp_name: &str, posix_name: &str) {
+    let (encoded, _, _) = MACINTOSH.encode(afp_name);
+    if encoded.len() > AFP2_MAX_NAME_LEN {
+        let mangled = mangle_name(afp_name);
+        let mangled_str = String::from_utf8_lossy(&mangled);
+        tracing::debug!(
+            "mangle: registering {:?} -> {:?} (key={:?})",
+            afp_name, posix_name, mangled_str
+        );
+        if let Err(e) = tree.insert(mangled, posix_name.as_bytes()) {
+            tracing::error!("Failed to register mangle entry for {:?}: {}", posix_name, e);
+        }
+    }
+}
+
 /// Returns true if `path` represents an AFP empty path — either a zero-length OS string
 /// or one composed entirely of null bytes (the AFP wire encoding for "this node itself").
 fn afp_path_is_empty(path: &Path) -> bool {
@@ -451,8 +469,11 @@ fn afp_path_is_empty(path: &Path) -> bool {
 }
 
 impl Volume {
-    pub async fn new(name: String, path: PathBuf, volume_id: u16) -> Self {
+    pub async fn new(name: String, path: PathBuf, volume_id: u16, db: sled::Db) -> Self {
         let created_at = time_to_afp_v1(SystemTime::now());
+        let desktop_database = crate::afp::DesktopDatabase::from_db(db, 1)
+            .expect("failed to open AFP desktop database");
+        let mangle_tree = desktop_database.mangle_names.clone();
         let mut new_self = Self {
             name,
             path,
@@ -464,7 +485,8 @@ impl Volume {
             fork_ref_to_node_id: HashMap::new(),
             next_fork_ref_num: 1,
             fork_locks: HashMap::new(),
-            desktop_database: None,
+            desktop_database,
+            mangle_tree,
         };
 
         // Initialize Vol Node (Parent of Root)
@@ -562,13 +584,60 @@ impl Volume {
             AfpError::ObjectNotFound
         })?;
         let full_path = base_path.join(path_name);
-        self.path_to_id.get(&full_path).copied().ok_or_else(|| {
-            info!(
-                "resolve_node failed: dir_id={}, path={:?} (resolved to {:?}) not found",
-                directory_id, path_name, full_path
-            );
-            AfpError::ObjectNotFound
-        })
+
+        if let Some(&id) = self.path_to_id.get(&full_path) {
+            return Ok(id);
+        }
+
+        // Direct lookup missed — try to unmangle each path component via the persistent table.
+        {
+            let mut resolved = PathBuf::new();
+            let mut had_match = false;
+            for comp in path_name.components() {
+                let s = comp.as_os_str().to_string_lossy();
+                let (mac_bytes, _, _) = MACINTOSH.encode(s.as_ref());
+                tracing::debug!(
+                    "mangle: looking up component {:?} ({} MacRoman bytes)",
+                    s, mac_bytes.len()
+                );
+                if let Ok(Some(original)) = self.mangle_tree.get(mac_bytes.as_ref())
+                    && let Ok(original_str) = std::str::from_utf8(&original)
+                {
+                    tracing::debug!("mangle: hit — {:?} -> {:?}", s, original_str);
+                    resolved.push(original_str);
+                    had_match = true;
+                    continue;
+                }
+                tracing::debug!("mangle: miss for {:?}", s);
+                resolved.push(s.as_ref());
+            }
+            if had_match {
+                let unmangled_path = base_path.join(&resolved);
+                if let Some(&id) = self.path_to_id.get(&unmangled_path) {
+                    return Ok(id);
+                }
+                info!(
+                    "mangle: unmangled to {:?} but path not in path_to_id (dir populated?)",
+                    unmangled_path
+                );
+            }
+        }
+
+        // Dump the full mangle table — only pay the sled scan cost when debug logging is active.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!("mangle: table contents at lookup failure:");
+            for entry in self.mangle_tree.iter().filter_map(|r| r.ok()) {
+                let key = String::from_utf8_lossy(&entry.0);
+                let val = String::from_utf8_lossy(&entry.1);
+                tracing::debug!("  {:?} -> {:?}", key, val);
+            }
+        }
+
+        info!(
+            "resolve_node failed: dir_id={}, path={:?} (resolved to {:?}) not found",
+            directory_id, path_name, full_path
+        );
+        Err(AfpError::ObjectNotFound)
     }
 
     /// Get unified parameters for a node (file or directory).
@@ -834,6 +903,11 @@ impl Volume {
                     self.nodes.insert(new_id, node);
                     self.path_to_id.insert(rel_path_buf, new_id);
 
+                    {
+                        let afp_name = posix_name_to_afp(&entry.file_name().to_string_lossy());
+                        register_mangle_if_needed(&self.mangle_tree, &afp_name, &entry.file_name().to_string_lossy());
+                    }
+
                     if is_dir {
                         stack.push((entry_path, new_id));
                     }
@@ -883,6 +957,11 @@ impl Volume {
                 },
             );
             self.path_to_id.insert(rel_path, new_id);
+
+            {
+                let afp_name = posix_name_to_afp(&name);
+                register_mangle_if_needed(&self.mangle_tree, &afp_name, &name);
+            }
         }
 
         Ok(())
@@ -1112,12 +1191,12 @@ impl Volume {
             output[offset..offset + 2].copy_from_slice(&(long_name_offset as u16).to_be_bytes());
             offset += 2;
 
-            let (encoded_name, _, _) = MACINTOSH.encode(&node.name);
-            let name_len = encoded_name.len().min(255);
+            let encoded_name = mangle_name(&node.name);
+            let name_len = encoded_name.len();
             output[long_name_offset] = name_len as u8;
             long_name_offset += 1;
             output[long_name_offset..long_name_offset + name_len]
-                .copy_from_slice(&encoded_name[..name_len]);
+                .copy_from_slice(&encoded_name);
 
             variable_len_offset += name_len + 1;
         }
@@ -1188,25 +1267,24 @@ impl Volume {
         fork_type: ForkType,
         bitmap: FPFileBitmap,
         dir_id: u32,
-        relative_path: &PathBuf,
+        relative_path: &Path,
         output: &mut [u8],
     ) -> Result<usize, AfpError> {
         let mut offset = 0;
 
-        // Populate the parent directory on first access so callers don't need
-        // to enumerate before opening a file they already know exists.
-        let _ = self.ensure_dir_populated(dir_id).await;
+        // Resolve the node through resolve_node_lazy so that mangled names are
+        // unmangled via the sled table and the parent directory is populated on
+        // first access, without requiring a prior FPEnumerate call.
+        let id = self.resolve_node_lazy(dir_id, relative_path).await?;
+        let full_relative_path = self
+            .nodes
+            .get(&id)
+            .ok_or(AfpError::ObjectNotFound)?
+            .path
+            .clone();
 
         match fork_type {
             ForkType::Data => {
-                let parent_path = self.get_node_path(dir_id).ok_or(AfpError::ObjectNotFound)?;
-
-                let full_relative_path = parent_path.join(relative_path);
-
-                let id = *self
-                    .path_to_id
-                    .get(&full_relative_path)
-                    .ok_or(AfpError::ObjectNotFound)?;
                 let node = self.nodes.get_mut(&id).ok_or(AfpError::ObjectNotFound)?;
 
                 if node.data_fork.is_some() {
@@ -1224,8 +1302,7 @@ impl Volume {
                 if self.next_fork_ref_num == 0 {
                     self.next_fork_ref_num = 1;
                 }
-                self.fork_ref_to_node_id
-                    .insert(fork_ref_num, (id, fork_type));
+                self.fork_ref_to_node_id.insert(fork_ref_num, (id, fork_type));
 
                 output[offset..offset + 2].copy_from_slice(&bitmap.bits().to_be_bytes());
                 offset += 2;
@@ -1244,20 +1321,14 @@ impl Volume {
                 }
             }
             ForkType::Resource => {
-                let parent_path = self.get_node_path(dir_id).ok_or(AfpError::ObjectNotFound)?;
-                let full_relative_path = parent_path.join(relative_path);
-
-                let id = *self
-                    .path_to_id
-                    .get(&full_relative_path)
-                    .ok_or(AfpError::ObjectNotFound)?;
                 let node = self.nodes.get_mut(&id).ok_or(AfpError::ObjectNotFound)?;
 
                 if node.resource_fork.is_some() {
                     return Err(AfpError::FileBusy);
                 }
 
-                let (rsrc_target, _) = resolve_resource_fork_path(&self.path, &node.path.clone()).await;
+                let (rsrc_target, _) =
+                    resolve_resource_fork_path(&self.path, &node.path.clone()).await;
                 node.open_resource_fork(&rsrc_target).await.map_err(|e| {
                     eprintln!("Error opening resource fork: {:?}", e);
                     AfpError::AccessDenied
@@ -1268,8 +1339,7 @@ impl Volume {
                 if self.next_fork_ref_num == 0 {
                     self.next_fork_ref_num = 1;
                 }
-                self.fork_ref_to_node_id
-                    .insert(fork_ref_num, (id, fork_type));
+                self.fork_ref_to_node_id.insert(fork_ref_num, (id, fork_type));
 
                 output[offset..offset + 2].copy_from_slice(&bitmap.bits().to_be_bytes());
                 offset += 2;
@@ -1290,17 +1360,13 @@ impl Volume {
         }
     }
 
-    pub async fn open_dt(&mut self, db: sled::Db) -> Result<u16, AfpError> {
+    pub async fn open_dt(&mut self) -> Result<u16, AfpError> {
         // Create .AppleDesktop directory so offspring counts match ClassicStack behaviour.
         let apple_desktop = self.path.join(".AppleDesktop");
         if !apple_desktop.exists() {
             let _ = tokio::fs::create_dir(&apple_desktop).await;
         }
-
-        let desktop_db = crate::afp::DesktopDatabase::from_db(db, 1)?;
-        let ref_num = desktop_db.dt_ref_num;
-        self.desktop_database = Some(desktop_db);
-        Ok(ref_num)
+        Ok(self.desktop_database.dt_ref_num)
     }
 
     pub fn add_icon(
@@ -1309,10 +1375,8 @@ impl Volume {
         req: &tailtalk_packets::afp::FPAddIcon,
         data: &[u8],
     ) -> Result<(), AfpError> {
-        if let Some(ref db) = self.desktop_database
-            && db.dt_ref_num == dt_ref_num
-        {
-            return db.add_icon(req.file_creator, req.file_type, req.icon_type, data);
+        if self.desktop_database.dt_ref_num == dt_ref_num {
+            return self.desktop_database.add_icon(req.file_creator, req.file_type, req.icon_type, data);
         }
         Err(AfpError::ItemNotFound)
     }
@@ -1322,10 +1386,8 @@ impl Volume {
         dt_ref_num: u16,
         req: &tailtalk_packets::afp::FPGetIcon,
     ) -> Result<Vec<u8>, AfpError> {
-        if let Some(ref db) = self.desktop_database
-            && db.dt_ref_num == dt_ref_num
-        {
-            return db.get_icon(req.file_creator, req.file_type, req.icon_type, req.size);
+        if self.desktop_database.dt_ref_num == dt_ref_num {
+            return self.desktop_database.get_icon(req.file_creator, req.file_type, req.icon_type, req.size);
         }
         Err(AfpError::ItemNotFound)
     }
@@ -1335,10 +1397,8 @@ impl Volume {
         dt_ref_num: u16,
         req: &tailtalk_packets::afp::FPGetIconInfo,
     ) -> Result<(u32, u32, u16), AfpError> {
-        if let Some(ref db) = self.desktop_database
-            && db.dt_ref_num == dt_ref_num
-        {
-            return db.get_icon_info(req.file_creator, req.icon_type);
+        if self.desktop_database.dt_ref_num == dt_ref_num {
+            return self.desktop_database.get_icon_info(req.file_creator, req.icon_type);
         }
         Err(AfpError::ItemNotFound)
     }
@@ -1588,10 +1648,11 @@ impl Volume {
             if !self.path_to_id.contains_key(&entry_relative_path) {
                 let new_id = self.next_id;
                 self.next_id += 1;
+                let afp_name_for_node = posix_name_to_afp(name);
                 let new_node = Node {
                     id: new_id,
                     parent_id: node_id,
-                    name: posix_name_to_afp(name),
+                    name: afp_name_for_node.clone(),
                     is_dir: *is_dir,
                     path: entry_relative_path.clone(),
                     data_fork: None,
@@ -1599,6 +1660,7 @@ impl Volume {
                 };
                 self.nodes.insert(new_id, new_node);
                 self.path_to_id.insert(entry_relative_path.clone(), new_id);
+                register_mangle_if_needed(&self.mangle_tree, &afp_name_for_node, name);
             }
             let mut entry_offset = offset;
 
@@ -1805,13 +1867,13 @@ impl Volume {
         dst_path: &std::path::Path,
         new_name: &str,
     ) -> Result<(), AfpError> {
-        let src_node_id = self.resolve_node(src_dir_id, src_path)?;
+        let src_node_id = self.resolve_node_lazy(src_dir_id, src_path).await?;
 
         if src_node_id <= 2 {
             return Err(AfpError::AccessDenied);
         }
 
-        let dst_node_id = self.resolve_node(dst_dir_id, dst_path)?;
+        let dst_node_id = self.resolve_node_lazy(dst_dir_id, dst_path).await?;
 
         // Snapshot what we need from both nodes before taking mut references.
         let (src_old_name, src_old_relative, src_is_dir) = {
@@ -1895,21 +1957,17 @@ impl Volume {
             for (id, old_path, new_child_path) in child_updates {
                 self.path_to_id.remove(&old_path);
                 self.path_to_id.insert(new_child_path.clone(), id);
-                if let Some(db) = &self.desktop_database {
-                    let _ = db.move_comment(&old_path, &new_child_path);
-                }
+                let _ = self.desktop_database.move_comment(&old_path, &new_child_path);
                 self.nodes.get_mut(&id).unwrap().path = new_child_path;
             }
         }
 
         // Migrate comment and APPL registration to the new path.
-        if let Some(db) = &self.desktop_database {
-            let _ = db.move_comment(&src_old_relative, &new_relative);
-            if !src_is_dir {
-                let old_path_str = src_old_relative.to_string_lossy();
-                let new_path_str = new_relative.to_string_lossy();
-                let _ = db.move_appl_path(&old_path_str, &new_path_str, src_dir_id, dst_node_id);
-            }
+        let _ = self.desktop_database.move_comment(&src_old_relative, &new_relative);
+        if !src_is_dir {
+            let old_path_str = src_old_relative.to_string_lossy();
+            let new_path_str = new_relative.to_string_lossy();
+            let _ = self.desktop_database.move_appl_path(&old_path_str, &new_path_str, src_dir_id, dst_node_id);
         }
 
         Ok(())
@@ -1984,13 +2042,11 @@ impl Volume {
 
         // Clean up desktop DB entries for this path.
         // Icons are keyed by type/creator and are intentionally shared, so they are not removed.
-        if let Some(db) = &self.desktop_database {
-            let _ = db.remove_comment(&relative_path);
-            if !is_dir {
-                let path_str = relative_path.to_string_lossy();
-                let parent_id = self.nodes.get(&node_id).map(|n| n.parent_id).unwrap_or(0);
-                let _ = db.delete_appls_for_path(parent_id, &path_str);
-            }
+        let _ = self.desktop_database.remove_comment(&relative_path);
+        if !is_dir {
+            let path_str = relative_path.to_string_lossy();
+            let parent_id = self.nodes.get(&node_id).map(|n| n.parent_id).unwrap_or(0);
+            let _ = self.desktop_database.delete_appls_for_path(parent_id, &path_str);
         }
 
         self.nodes.remove(&node_id);
@@ -2011,7 +2067,7 @@ impl Volume {
         dst_path: &Path,
         new_name: &str,
     ) -> Result<u32, AfpError> {
-        let src_node_id = self.resolve_node(src_dir_id, src_path)?;
+        let src_node_id = self.resolve_node_lazy(src_dir_id, src_path).await?;
 
         let (src_is_dir, src_relative, src_name) = {
             let n = self.nodes.get(&src_node_id).ok_or(AfpError::ObjectNotFound)?;
@@ -2022,7 +2078,7 @@ impl Volume {
         };
         let _ = src_is_dir;
 
-        let dst_node_id = self.resolve_node(dst_dir_id, dst_path)?;
+        let dst_node_id = self.resolve_node_lazy(dst_dir_id, dst_path).await?;
         let dst_relative = {
             let n = self.nodes.get(&dst_node_id).ok_or(AfpError::ObjectNotFound)?;
             if !n.is_dir {
@@ -2075,12 +2131,10 @@ impl Volume {
         }
 
         // Copy comment and APPL registration to the new path.
-        if let Some(db) = &self.desktop_database {
-            let _ = db.copy_comment(&src_relative, &new_relative);
-            let src_path_str = src_relative.to_string_lossy();
-            let new_path_str = new_relative.to_string_lossy();
-            let _ = db.copy_appl(&src_path_str, &new_path_str, src_dir_id, dst_node_id);
-        }
+        let _ = self.desktop_database.copy_comment(&src_relative, &new_relative);
+        let src_path_str = src_relative.to_string_lossy();
+        let new_path_str = new_relative.to_string_lossy();
+        let _ = self.desktop_database.copy_appl(&src_path_str, &new_path_str, src_dir_id, dst_node_id);
 
         let new_id = self.next_id;
         self.next_id += 1;
@@ -2170,10 +2224,8 @@ impl Volume {
         &self,
         req: &tailtalk_packets::afp::FPAddAPPL,
     ) -> Result<(), AfpError> {
-        if let Some(ref db) = self.desktop_database
-            && db.dt_ref_num == req.dt_ref_num
-        {
-            return db.add_appl(req.file_creator, req.tag, req.directory_id, req.path.as_str());
+        if self.desktop_database.dt_ref_num == req.dt_ref_num {
+            return self.desktop_database.add_appl(req.file_creator, req.tag, req.directory_id, req.path.as_str());
         }
         Err(AfpError::ItemNotFound)
     }
@@ -2182,10 +2234,8 @@ impl Volume {
         &self,
         req: &tailtalk_packets::afp::FPRemoveAPPL,
     ) -> Result<(), AfpError> {
-        if let Some(ref db) = self.desktop_database
-            && db.dt_ref_num == req.dt_ref_num
-        {
-            return db.remove_appl(req.file_creator, req.directory_id, req.path.as_str());
+        if self.desktop_database.dt_ref_num == req.dt_ref_num {
+            return self.desktop_database.remove_appl(req.file_creator, req.directory_id, req.path.as_str());
         }
         Err(AfpError::ItemNotFound)
     }
@@ -2194,10 +2244,8 @@ impl Volume {
         &self,
         req: &tailtalk_packets::afp::FPGetAPPL,
     ) -> Result<(u32, u32, String), AfpError> {
-        if let Some(ref db) = self.desktop_database
-            && db.dt_ref_num == req.dt_ref_num
-        {
-            return db.get_appl(req.file_creator, req.appl_index);
+        if self.desktop_database.dt_ref_num == req.dt_ref_num {
+            return self.desktop_database.get_appl(req.file_creator, req.appl_index);
         }
         Err(AfpError::ItemNotFound)
     }
@@ -2210,31 +2258,19 @@ impl Volume {
     ) -> Result<(), AfpError> {
         let node_id = self.resolve_node(directory_id, path)?;
         let rel_path = self.nodes.get(&node_id).ok_or(AfpError::ObjectNotFound)?.path.clone();
-        if let Some(db) = &self.desktop_database {
-            db.set_comment(&rel_path, comment)
-        } else {
-            Err(AfpError::AccessDenied)
-        }
+        self.desktop_database.set_comment(&rel_path, comment)
     }
 
     pub fn get_comment(&self, directory_id: u32, path: &Path) -> Result<Vec<u8>, AfpError> {
         let node_id = self.resolve_node(directory_id, path)?;
         let rel_path = self.nodes.get(&node_id).ok_or(AfpError::ObjectNotFound)?.path.clone();
-        if let Some(db) = &self.desktop_database {
-            db.get_comment(&rel_path)
-        } else {
-            Err(AfpError::AccessDenied)
-        }
+        self.desktop_database.get_comment(&rel_path)
     }
 
     pub fn remove_comment(&self, directory_id: u32, path: &Path) -> Result<(), AfpError> {
         let node_id = self.resolve_node(directory_id, path)?;
         let rel_path = self.nodes.get(&node_id).ok_or(AfpError::ObjectNotFound)?.path.clone();
-        if let Some(db) = &self.desktop_database {
-            db.remove_comment(&rel_path)
-        } else {
-            Err(AfpError::AccessDenied)
-        }
+        self.desktop_database.remove_comment(&rel_path)
     }
 }
 
@@ -2244,6 +2280,13 @@ mod tests {
     use tailtalk_packets::afp::{FPDelete, FPDirectoryBitmap, FPEnumerate, FPFileBitmap};
     use tempfile::tempdir;
     use tokio::fs::File;
+
+    /// Create a Volume backed by a temporary sled DB rooted at `path`.
+    /// All tests should use this instead of calling `Volume::new` directly.
+    async fn make_test_volume(name: String, path: PathBuf) -> Volume {
+        let db = crate::afp::DesktopDatabase::open_or_create(&path).unwrap();
+        Volume::new(name, path, 1, db).await
+    }
 
     #[tokio::test]
     async fn test_enumerate_volume_root() {
@@ -2257,7 +2300,7 @@ mod tests {
         File::create(&file1_path).await.unwrap();
         File::create(&file2_path).await.unwrap();
 
-        let mut volume = Volume::new(volume_name, root_path.clone(), 1).await;
+        let mut volume = make_test_volume(volume_name, root_path.clone()).await;
 
         let enumerate_cmd = FPEnumerate {
             volume_id: 1,
@@ -2309,7 +2352,7 @@ mod tests {
                 .unwrap();
         }
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
+        let mut volume = make_test_volume("TestVol".to_string(), root_path).await;
 
         let bitmap = FPFileBitmap::LONG_NAME | FPFileBitmap::FILE_NUMBER;
         let max_reply_size: u16 = 55;
@@ -2358,7 +2401,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
+        let mut volume = make_test_volume("TestVol".to_string(), root_path).await;
 
         let mut output = [0u8; 256];
 
@@ -2440,7 +2483,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
+        let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
         let mut output = [0u8; 256];
 
         // --- Root-level file ---
@@ -2567,7 +2610,7 @@ mod tests {
         tokio::fs::create_dir_all(sidecar.parent().unwrap()).await.unwrap();
         tokio::fs::File::create(&sidecar).await.unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
+        let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
 
         // Length reported via enumerate / get_file_parms must come from the
         // native fork, not the empty sidecar.
@@ -2624,7 +2667,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_node_identity() {
         let dir = tempdir().unwrap();
-        let volume = Volume::new("TestVol".to_string(), dir.path().to_path_buf(), 1).await;
+        let volume = make_test_volume("TestVol".to_string(), dir.path().to_path_buf()).await;
 
         // ID 1 + empty path = ID 1 (virtual parent-of-root)
         assert_eq!(volume.resolve_node(1, Path::new("")).unwrap(), 1);
@@ -2647,7 +2690,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
+        let mut volume = make_test_volume("TestVol".to_string(), root_path).await;
 
         // Resolve subdir from root
         let subdir_id = volume.resolve_node_lazy(2, Path::new("subdir")).await.unwrap();
@@ -2676,7 +2719,7 @@ mod tests {
         File::create(subdir.join("b.txt")).await.unwrap();
         File::create(subdir.join("c.txt")).await.unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
+        let mut volume = make_test_volume("TestVol".to_string(), root_path).await;
         let subdir_id = volume.resolve_node_lazy(2, Path::new("subdir")).await.unwrap();
 
         let enumerate_cmd = FPEnumerate {
@@ -2724,7 +2767,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
+        let mut volume = make_test_volume("TestVol".to_string(), root_path).await;
         let node_id = volume.resolve_node_lazy(2, Path::new("mydir")).await.unwrap();
 
         // Build a recognisable 32-byte Finder Info payload
@@ -2768,7 +2811,7 @@ mod tests {
         let root_path = dir.path().to_path_buf();
         File::create(root_path.join("todelete.txt")).await.unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
+        let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
 
         let delete_req = FPDelete {
             volume_id: 1,
@@ -2795,7 +2838,7 @@ mod tests {
         tokio::fs::create_dir(&subdir).await.unwrap();
         File::create(subdir.join("occupant.txt")).await.unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
+        let mut volume = make_test_volume("TestVol".to_string(), root_path).await;
 
         let delete_req = FPDelete {
             volume_id: 1,
@@ -2813,7 +2856,7 @@ mod tests {
         let root_path = dir.path().to_path_buf();
         File::create(root_path.join("test.txt")).await.unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
+        let mut volume = make_test_volume("TestVol".to_string(), root_path).await;
         let node_id = volume.resolve_node_lazy(2, Path::new("test.txt")).await.unwrap();
 
         let mut output = [0u8; 64];
@@ -2839,7 +2882,7 @@ mod tests {
         let root_path = dir.path().to_path_buf();
         File::create(root_path.join("test.txt")).await.unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
+        let mut volume = make_test_volume("TestVol".to_string(), root_path).await;
         let node_id = volume.resolve_node_lazy(2, Path::new("test.txt")).await.unwrap();
 
         let mut finder_info = [0u8; 32];
@@ -2885,7 +2928,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
+        let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
 
         let delete_req = FPDelete {
             volume_id: 1,
@@ -2913,7 +2956,7 @@ mod tests {
     async fn test_trash_folder_lifecycle() {
         let dir = tempdir().unwrap();
         let root_path = dir.path().to_path_buf();
-        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
+        let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
 
         // Step 1: Finder creates "Network Trash Folder" at volume root (DID=2).
         let network_trash_id = volume
@@ -3070,8 +3113,8 @@ mod tests {
         let root_path = dir.path().to_path_buf();
         File::create(root_path.join("readme.txt")).await.unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
-        volume.open_dt(crate::afp::DesktopDatabase::open_or_create(&root_path).unwrap()).await.unwrap();
+        let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
+        volume.open_dt().await.unwrap();
         volume.walk_dir(PathBuf::new()).await.unwrap();
 
         // Set
@@ -3103,8 +3146,8 @@ mod tests {
 
         // First volume instance: set a comment
         {
-            let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
-            volume.open_dt(crate::afp::DesktopDatabase::open_or_create(&root_path).unwrap()).await.unwrap();
+            let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
+            volume.open_dt().await.unwrap();
             volume.walk_dir(PathBuf::new()).await.unwrap();
             volume
                 .set_comment(2, Path::new("persist.txt"), b"survives restart")
@@ -3113,8 +3156,8 @@ mod tests {
 
         // Second volume instance (simulates server restart): comment must still be there
         {
-            let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
-            volume.open_dt(crate::afp::DesktopDatabase::open_or_create(&root_path).unwrap()).await.unwrap();
+            let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
+            volume.open_dt().await.unwrap();
             volume.walk_dir(PathBuf::new()).await.unwrap();
             let got = volume
                 .get_comment(2, Path::new("persist.txt"))
@@ -3129,8 +3172,8 @@ mod tests {
         let root_path = dir.path().to_path_buf();
         File::create(root_path.join("before.txt")).await.unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
-        volume.open_dt(crate::afp::DesktopDatabase::open_or_create(&root_path).unwrap()).await.unwrap();
+        let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
+        volume.open_dt().await.unwrap();
         volume.walk_dir(PathBuf::new()).await.unwrap();
 
         volume.set_comment(2, Path::new("before.txt"), b"my comment").unwrap();
@@ -3155,8 +3198,8 @@ mod tests {
         tokio::fs::create_dir(root_path.join("dst_dir")).await.unwrap();
         File::create(root_path.join("src_dir").join("file.txt")).await.unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
-        volume.open_dt(crate::afp::DesktopDatabase::open_or_create(&root_path).unwrap()).await.unwrap();
+        let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
+        volume.open_dt().await.unwrap();
         volume.walk_dir(PathBuf::new()).await.unwrap();
 
         let src_dir_id = volume.resolve_node(2, Path::new("src_dir")).unwrap();
@@ -3185,8 +3228,8 @@ mod tests {
         tokio::fs::create_dir(root_path.join("dst_dir")).await.unwrap();
         File::create(root_path.join("original.txt")).await.unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
-        volume.open_dt(crate::afp::DesktopDatabase::open_or_create(&root_path).unwrap()).await.unwrap();
+        let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
+        volume.open_dt().await.unwrap();
         volume.walk_dir(PathBuf::new()).await.unwrap();
 
         let dst_dir_id = volume.resolve_node(2, Path::new("dst_dir")).unwrap();
@@ -3211,11 +3254,8 @@ mod tests {
         let root_path = dir.path().to_path_buf();
         File::create(root_path.join("doomed.txt")).await.unwrap();
 
-        // Open the shared DB handle once; clone it for the second volume instance.
-        let shared_db = crate::afp::DesktopDatabase::open_or_create(&root_path).unwrap();
-
-        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
-        volume.open_dt(shared_db.clone()).await.unwrap();
+        let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
+        volume.open_dt().await.unwrap();
         volume.walk_dir(PathBuf::new()).await.unwrap();
 
         volume.set_comment(2, Path::new("doomed.txt"), b"goodbye").unwrap();
@@ -3227,13 +3267,196 @@ mod tests {
         };
         volume.delete(&delete_req).await.unwrap();
 
-        // Query the DB directly via the shared handle — the file node is gone so
-        // we can't go via resolve_node, and no drop/reopen is needed.
+        // Drop the volume to release the sled handle, then reopen to verify the comment is gone.
+        drop(volume);
+        let verify_db = crate::afp::DesktopDatabase::open_or_create(&root_path).unwrap();
         assert_eq!(
-            crate::afp::DesktopDatabase::from_db(shared_db, 1).unwrap()
+            crate::afp::DesktopDatabase::from_db(verify_db, 1).unwrap()
                 .get_comment(std::path::Path::new("doomed.txt")),
             Err(AfpError::ItemNotFound),
             "comment should have been deleted with the file"
+        );
+    }
+
+    // Volume::new now initialises DesktopDatabase eagerly, so comment operations
+    // work without a preceding FPOpenDT call. This test pins that behaviour.
+    #[tokio::test]
+    async fn test_set_comment_works_without_open_dt() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        File::create(root_path.join("note.txt")).await.unwrap();
+
+        let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
+        // Deliberately skipping open_dt().
+        volume.ensure_dir_populated(2).await.unwrap();
+
+        assert!(
+            volume.set_comment(2, Path::new("note.txt"), b"hello").is_ok(),
+            "set_comment should succeed without a prior FPOpenDT"
+        );
+        assert_eq!(
+            volume.get_comment(2, Path::new("note.txt")).unwrap(),
+            b"hello"
+        );
+    }
+
+    // ── open_fork with mangled name ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_open_fork_succeeds_with_mangled_name() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+
+        let long_name = "This file has a very long name that exceeds the 31 byte AFP limit.txt";
+        File::create(root_path.join(long_name)).await.unwrap();
+
+        let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
+
+        // Enumerate so the Mac client would have the mangled name.
+        let enumerate_cmd = FPEnumerate {
+            volume_id: 1,
+            directory_id: 2,
+            file_bitmap: FPFileBitmap::LONG_NAME | FPFileBitmap::FILE_NUMBER,
+            directory_bitmap: FPDirectoryBitmap::LONG_NAME | FPDirectoryBitmap::DIR_ID,
+            req_count: 100,
+            start_index: 1,
+            max_reply_size: 1024,
+            path: "".into(),
+        };
+        let mut output = [0u8; 1024];
+        volume.enumerate(enumerate_cmd, &mut output).await.unwrap();
+
+        // The client now sends FPOpenFork with the mangled name.
+        let mangled_str = client_visible_name(long_name);
+        let result = volume
+            .open_fork(
+                ForkType::Data,
+                FPFileBitmap::FILE_NUMBER,
+                2,
+                &PathBuf::from(&mangled_str),
+                &mut output,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "open_fork must succeed when given a mangled name: {:?}",
+            result.err()
+        );
+    }
+
+    // ── Mangle registration via enumerate ───────────────────────────────────
+    //
+    // The enumerate() code path has its own node-creation loop. This test
+    // ensures that mangle entries are registered there too, which is the path
+    // the Mac client exercises when it lists a directory.
+
+    #[tokio::test]
+    async fn test_mangle_registered_via_enumerate_path() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+
+        let long_name = "This file has a very long name that exceeds the 31 byte AFP limit.txt";
+        File::create(root_path.join(long_name)).await.unwrap();
+
+        let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
+
+        // Enumerate the root directory — this is the code path a Mac client takes.
+        // Deliberately NOT calling ensure_dir_populated or walk_volume first.
+        let enumerate_cmd = FPEnumerate {
+            volume_id: 1,
+            directory_id: 2,
+            file_bitmap: FPFileBitmap::LONG_NAME | FPFileBitmap::FILE_NUMBER,
+            directory_bitmap: FPDirectoryBitmap::LONG_NAME | FPDirectoryBitmap::DIR_ID,
+            req_count: 100,
+            start_index: 1,
+            max_reply_size: 1024,
+            path: "".into(),
+        };
+        let mut output = [0u8; 1024];
+        volume.enumerate(enumerate_cmd, &mut output).await.unwrap();
+
+        // The Mac now tries to open the file by its mangled name.
+        // This must succeed — the mangle entry must have been registered during enumerate.
+        let mangled_str = client_visible_name(long_name);
+        let result = volume.resolve_node(2, Path::new(&mangled_str));
+        assert!(
+            result.is_ok(),
+            "mangle entry must be registered during enumerate so subsequent \
+             file operations by mangled name succeed: {:?}",
+            result.err()
+        );
+    }
+
+    // ── Mangle / unmangle integration tests ─────────────────────────────────
+
+    /// Helper: compute the UTF-8 string a Mac client would receive for a name
+    /// after it passes through mangle_name → wire → MacRoman decode.
+    fn client_visible_name(posix_name: &str) -> String {
+        let mangled = mangle_name(posix_name);
+        let (s, _, _) = MACINTOSH.decode(&mangled);
+        s.into_owned()
+    }
+
+    #[tokio::test]
+    async fn test_short_name_resolves_directly_without_mangling() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        File::create(root_path.join("short.txt")).await.unwrap();
+
+        let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
+        volume.open_dt().await.unwrap();
+
+        let id = volume.resolve_node_lazy(2, Path::new("short.txt")).await;
+        assert!(id.is_ok(), "short name should resolve without mangling");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_node_by_mangled_long_name() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+
+        let long_name = "This file has a very long name that exceeds the 31 byte AFP limit.txt";
+        File::create(root_path.join(long_name)).await.unwrap();
+
+        let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
+        volume.open_dt().await.unwrap();
+        volume.ensure_dir_populated(2).await.unwrap();
+
+        let mangled_str = client_visible_name(long_name);
+        assert_ne!(mangled_str, long_name, "sanity: name should have been mangled");
+
+        let result = volume.resolve_node(2, Path::new(&mangled_str));
+        assert!(result.is_ok(), "resolve_node should find the file by its mangled name: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_mangled_name_after_simulated_restart() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+
+        let long_name = "This file has a very long name that exceeds the 31 byte AFP limit.txt";
+        File::create(root_path.join(long_name)).await.unwrap();
+
+        // Session 1: make_test_volume opens (or creates) the sled DB at root_path/.tailtalk/desktop.db
+        // and registers the mangle entry.
+        {
+            let mut vol = make_test_volume("TestVol".to_string(), root_path.clone()).await;
+            vol.open_dt().await.unwrap();
+            vol.ensure_dir_populated(2).await.unwrap();
+        } // vol is dropped — in-memory path_to_id is gone, sled entry persists on disk.
+
+        // Session 2: new Volume backed by the same on-disk DB; mangle entry survives.
+        let mut vol2 = make_test_volume("TestVol".to_string(), root_path.clone()).await;
+        vol2.open_dt().await.unwrap();
+        vol2.ensure_dir_populated(2).await.unwrap();
+
+        let mangled_str = client_visible_name(long_name);
+        let result = vol2.resolve_node(2, Path::new(&mangled_str));
+        assert!(
+            result.is_ok(),
+            "resolve_node should find the file by mangled name after a simulated server restart: {:?}",
+            result.err()
         );
     }
 }
