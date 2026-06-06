@@ -163,6 +163,51 @@ jobs:
           exit 1
         fi
         xcrun stapler staple "dist/TailTalk_${{ github.ref_name }}_universal.dmg"
+    - name: Build x86_64 app bundle (macOS)
+      if: matrix.os == 'macos-latest'
+      run: cargo packager --release -p tailtalk-gui --target x86_64-apple-darwin -f app
+    - name: Sign x86_64 app bundle (macOS)
+      if: matrix.os == 'macos-latest'
+      env:
+        APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      run: |
+        codesign --force --deep --options runtime --timestamp \
+          -s "$APPLE_SIGNING_IDENTITY" \
+          dist/TailTalk.app
+    - name: Package x86_64 DMG (macOS)
+      if: matrix.os == 'macos-latest'
+      run: |
+        mkdir -p /tmp/dmg_x86_64
+        cp -r dist/TailTalk.app /tmp/dmg_x86_64/
+        ln -s /Applications /tmp/dmg_x86_64/Applications
+        hdiutil create \
+          -volname TailTalk \
+          -srcfolder /tmp/dmg_x86_64 \
+          -ov -format UDZO \
+          "dist/TailTalk_${{ github.ref_name }}_x86_64.dmg"
+    - name: Notarize and staple x86_64 DMG (macOS)
+      if: matrix.os == 'macos-latest'
+      env:
+        APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+        APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      run: |
+        SUBMISSION=$(xcrun notarytool submit "dist/TailTalk_${{ github.ref_name }}_x86_64.dmg" \
+          --key $RUNNER_TEMP/api_key.p8 \
+          --key-id "$APPLE_API_KEY_ID" \
+          --issuer "$APPLE_API_ISSUER_ID" \
+          --wait \
+          --output-format json)
+        echo "$SUBMISSION"
+        STATUS=$(echo "$SUBMISSION" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+        ID=$(echo "$SUBMISSION" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+        if [ "$STATUS" != "Accepted" ]; then
+          xcrun notarytool log "$ID" \
+            --key $RUNNER_TEMP/api_key.p8 \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID"
+          exit 1
+        fi
+        xcrun stapler staple "dist/TailTalk_${{ github.ref_name }}_x86_64.dmg"
     - name: Clean up keychain (macOS)
       if: matrix.os == 'macos-latest' && always()
       run: security delete-keychain $RUNNER_TEMP/build.keychain
