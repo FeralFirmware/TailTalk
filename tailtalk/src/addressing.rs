@@ -39,11 +39,31 @@ pub struct Addressing {
     cache: Arc<DashMap<AppleTalkAddress, Node>>,
     outbound: OutboundHandle,
     our_mac: Option<EthernetMac>,
+    phase: AddressSource,
     cancel: CancellationToken,
 }
 
 impl Addressing {
     const BROADCAST_MAC: [u8; 6] = [0xFF; 6];
+    pub const APPLETALK_BROADCAST_MULTICAST: [u8; 6] = [0x09, 0x00, 0x07, 0xFF, 0xFF, 0xFF];
+
+    fn broadcast_mac(phase: AddressSource) -> EthernetMac {
+        match phase {
+            AddressSource::EtherTalkPhase2 => Self::APPLETALK_BROADCAST_MULTICAST,
+            _ => Self::BROADCAST_MAC,
+        }
+    }
+
+    /// Returns `true` if `mac` is the correct broadcast address for the given
+    /// EtherTalk phase: `FF:FF:FF:FF:FF:FF` for Phase 1,
+    /// `09:00:07:FF:FF:FF` for Phase 2.
+    pub fn is_broadcast_mac(mac: EthernetMac, phase: AddressSource) -> bool {
+        match phase {
+            AddressSource::EtherTalkPhase1 => mac == Self::BROADCAST_MAC,
+            AddressSource::EtherTalkPhase2 => mac == Self::APPLETALK_BROADCAST_MULTICAST,
+            AddressSource::LocalTalk => false,
+        }
+    }
 
     /// Spawn the addressing actor.
     ///
@@ -54,6 +74,7 @@ impl Addressing {
         our_mac: Option<EthernetMac>,
         outbound: OutboundHandle,
         fixed_addr: Option<AppleTalkAddress>,
+        phase: AddressSource,
     ) -> AddressingHandle {
         let (request_send, request_recv) = mpsc::channel(100);
         let (packet_send, packet_recv) = mpsc::channel(100);
@@ -72,6 +93,7 @@ impl Addressing {
             lt_ack_recv,
             lt_enq_recv,
             our_mac,
+            phase,
             outbound,
         };
 
@@ -84,6 +106,7 @@ impl Addressing {
             lt_ack_send,
             lt_enq_send,
             cache,
+            phase,
         }
     }
 
@@ -181,10 +204,10 @@ impl Addressing {
 
                 let probe = self.create_packet(
                     addr,
-                    Self::BROADCAST_MAC,
+                    Self::broadcast_mac(self.phase),
                     addr,
                     AarpOpcode::Probe,
-                    AddressSource::EtherTalkPhase2,
+                    self.phase,
                 );
                 self.outbound
                     .send(probe)
@@ -258,7 +281,7 @@ impl Addressing {
                     if let Some(command) = req {
                         match command {
                             AarpCommand::Lookup(lookup) => {
-                                let packet = self.create_packet(lookup.addr, Self::BROADCAST_MAC, our_addr, AarpOpcode::Request, AddressSource::EtherTalkPhase2);
+                                let packet = self.create_packet(lookup.addr, Self::broadcast_mac(self.phase), our_addr, AarpOpcode::Request, self.phase);
                                 self.outbound.send(packet).await.expect("failed to dispatch request");
                                 self.pending.entry(lookup.addr).or_default().push(Arc::new(lookup));
                             },
@@ -318,6 +341,7 @@ pub struct AddressingHandle {
     lt_ack_send: mpsc::Sender<u8>,
     lt_enq_send: mpsc::Sender<u8>,
     cache: Arc<DashMap<AppleTalkAddress, Node>>,
+    pub phase: AddressSource,
     _cancel: Arc<DropGuard>,
 }
 
@@ -335,14 +359,23 @@ impl AddressingHandle {
     }
 
     pub fn try_lookup(&self, addr: &AppleTalkAddress) -> Option<Node> {
-        // Network 0 is LocalTalk — node number is the link-layer address directly.
+        // Node 255 is always the cable-wide broadcast for this handle's phase,
+        // regardless of network number (network 0 = network-wide broadcast).
+        if addr.node_number == 255 {
+            return Some(match self.phase {
+                AddressSource::EtherTalkPhase2 => {
+                    Node::EtherTalkPhase2(Addressing::APPLETALK_BROADCAST_MULTICAST)
+                }
+                AddressSource::EtherTalkPhase1 => Node::EtherTalkPhase1(Addressing::BROADCAST_MAC),
+                AddressSource::LocalTalk => Node::LocalTalk(255),
+            });
+        }
+
+        // Network 0 unicast: LocalTalk — node number is the link-layer address directly.
         if addr.network_number == 0 {
             return Some(Node::LocalTalk(addr.node_number));
         }
 
-        if addr.node_number == 255 {
-            return Some(Node::EtherTalkPhase2(Addressing::BROADCAST_MAC));
-        }
         self.cache.get(addr).map(|v| *v)
     }
 

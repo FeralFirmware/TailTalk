@@ -80,7 +80,7 @@ impl TestClient {
             }
         });
 
-        let addressing = Addressing::spawn(Some(mac), outbound_handle.clone(), None);
+        let addressing = Addressing::spawn(Some(mac), outbound_handle.clone(), None, AddressSource::EtherTalkPhase2);
         let ddp = DdpProcessor::spawn(Some(addressing.clone()), None, outbound_handle.clone());
 
         let echo = Echo::spawn(&ddp).await;
@@ -104,11 +104,8 @@ impl TestClient {
                     }
 
                     // Accept packets for us, broadcast, or [0; 6]
-                    let is_for_us = if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac } else { [0; 6] } == mac;
-                    let is_broadcast_std = if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff] } else { false };
-                    let is_zeros = if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac } else { [0; 6] } == [0, 0, 0, 0, 0, 0];
-
-                    if is_for_us || is_broadcast_std || is_zeros {
+                    let dest_mac = if let tailtalk::addressing::Node::EtherTalkPhase2(m) = pkt.dest_node { m } else { [0; 6] };
+                    if dest_mac == mac || tailtalk::addressing::Addressing::is_broadcast_mac(dest_mac, AddressSource::EtherTalkPhase2) {
                         match pkt.protocol {
                             DataLinkProtocol::Ddp => ddp_handle.received_pkt(
                                 &pkt.payload,

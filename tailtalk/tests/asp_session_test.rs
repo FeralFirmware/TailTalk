@@ -73,7 +73,7 @@ impl TestClient {
             }
         });
 
-        let addressing = Addressing::spawn(Some(mac), outbound_handle.clone(), None);
+        let addressing = Addressing::spawn(Some(mac), outbound_handle.clone(), None, AddressSource::EtherTalkPhase2);
         let ddp = DdpProcessor::spawn(Some(addressing.clone()), None, outbound_handle.clone());
 
         let echo = Echo::spawn(&ddp).await;
@@ -103,11 +103,8 @@ impl TestClient {
                     }
 
                     // Accept packets for us, broadcast, or [0; 6]
-                    let is_for_us = if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac } else { [0; 6] } == mac;
-                    let is_broadcast_std = if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac == [0xff, 0xff, 0xff, 0xff, 0xff, 0xff] } else { false };
-                    let is_zeros = if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac } else { [0; 6] } == [0, 0, 0, 0, 0, 0];
-
-                    if is_for_us || is_broadcast_std || is_zeros {
+                    let dest_mac = if let tailtalk::addressing::Node::EtherTalkPhase2(m) = pkt.dest_node { m } else { [0; 6] };
+                    if dest_mac == mac || tailtalk::addressing::Addressing::is_broadcast_mac(dest_mac, AddressSource::EtherTalkPhase2) {
                         match pkt.protocol {
                             DataLinkProtocol::Ddp => ddp_handle.received_pkt(
                                 &pkt.payload,
@@ -167,7 +164,7 @@ async fn test_asp_session_workflow() {
         }
     });
 
-    let addr_server = Addressing::spawn(Some(mac_server), outbound_server.clone(), None);
+    let addr_server = Addressing::spawn(Some(mac_server), outbound_server.clone(), None, AddressSource::EtherTalkPhase2);
     let ddp_server = DdpProcessor::spawn(Some(addr_server.clone()), None, outbound_server.clone());
     // Start NBP for server
     let nbp_server = Nbp::spawn(&ddp_server, Some(addr_server.clone()), None).await;
@@ -185,7 +182,8 @@ async fn test_asp_session_workflow() {
                     continue;
                 }
                 let pkt = &wire_pkt.packet;
-                if if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac } else { [0; 6] } == mac_server || if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac } else { [0; 6] } == [0xff; 6] || if let tailtalk::addressing::Node::EtherTalkPhase2(mac) = pkt.dest_node { mac } else { [0; 6] } == [0; 6] {
+                let dest_mac = if let tailtalk::addressing::Node::EtherTalkPhase2(m) = pkt.dest_node { m } else { [0; 6] };
+                if dest_mac == mac_server || tailtalk::addressing::Addressing::is_broadcast_mac(dest_mac, AddressSource::EtherTalkPhase2) {
                     match pkt.protocol {
                         DataLinkProtocol::Ddp => {
                             ddp_handle_s.received_pkt(&pkt.payload, AddressSource::EtherTalkPhase2, src)

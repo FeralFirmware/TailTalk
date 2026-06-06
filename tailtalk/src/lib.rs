@@ -962,6 +962,7 @@ impl TalkStackBuilder {
                 processor.get_mac(),
                 outbound.clone(),
                 self.fixed_addr,
+                aarp::AddressSource::EtherTalkPhase2,
             ))
         } else {
             None
@@ -975,7 +976,12 @@ impl TalkStackBuilder {
                 network_number: 0,
                 node_number: rand::rng().random_range(1..=253u8),
             });
-            Some(addressing::Addressing::spawn(None, outbound.clone(), lt_fixed))
+            Some(addressing::Addressing::spawn(
+                None,
+                outbound.clone(),
+                lt_fixed,
+                aarp::AddressSource::LocalTalk,
+            ))
         } else {
             None
         };

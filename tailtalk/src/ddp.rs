@@ -14,7 +14,7 @@ use tokio::sync::{
 
 use crate::{
     DataLinkPacket, DataLinkProtocol, OutboundHandle,
-    addressing::{AddressingHandle, Node},
+    addressing::{Addressing, AddressingHandle, Node},
 };
 
 pub struct Packet {
@@ -246,6 +246,31 @@ impl DdpProcessor {
     }
 
     async fn handle_outbound(&mut self, packet: OutboundPacket) {
+        // Network-wide broadcast {0, 255}: send on every configured interface so
+        // all nodes on each cable receive it, regardless of their network number.
+        if packet.dest.addr.network_number == 0 && packet.dest.addr.node_number == 255 {
+            let mut sent = false;
+            if let Some(et) = &self.et_addressing {
+                let et_addr = et.addr().await.unwrap();
+                let dest_node = Node::EtherTalkPhase2(Addressing::APPLETALK_BROADCAST_MULTICAST);
+                self.send_ddp_to_node(&packet, dest_node, et_addr).await;
+                sent = true;
+            }
+            if let Some(lt) = &self.lt_addressing {
+                let lt_addr = lt.addr().await.unwrap();
+                self.send_ddp_to_node(&packet, Node::LocalTalk(255), lt_addr).await;
+                sent = true;
+            }
+            if !sent {
+                tracing::error!(
+                    "DDP: dropping packet to {}.{} — no interfaces configured",
+                    packet.dest.addr.network_number,
+                    packet.dest.addr.node_number,
+                );
+            }
+            return;
+        }
+
         let dest_node = if packet.dest.addr.network_number == 0 {
             if self.lt_addressing.is_none() {
                 tracing::error!(
@@ -273,6 +298,15 @@ impl DdpProcessor {
             _ => self.et_addressing.as_ref().unwrap().addr().await.unwrap(),
         };
 
+        self.send_ddp_to_node(&packet, dest_node, our_addr).await;
+    }
+
+    async fn send_ddp_to_node(
+        &self,
+        packet: &OutboundPacket,
+        dest_node: Node,
+        our_addr: AppleTalkAddress,
+    ) {
         // Short DDP (DDP-S, 5-byte header) is LocalTalk only.
         let use_short = matches!(dest_node, Node::LocalTalk(_));
 

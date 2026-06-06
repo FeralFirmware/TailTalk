@@ -130,49 +130,27 @@ impl Nbp {
                                 let mut buf = [0u8; 1024];
                                 let size = packet.to_bytes(&mut buf).expect("failed to serialize");
 
-                                let mut send_ok = true;
+                                // Network-wide broadcast {0, 255}: the DDP layer will send this
+                                // on every configured interface (EtherTalk and/or LocalTalk).
+                                let dest = crate::ddp::DdpAddress::new(
+                                    tailtalk_packets::aarp::AppleTalkAddress {
+                                        network_number: 0,
+                                        node_number: 255,
+                                    },
+                                    2,
+                                );
 
-                                // Send over LocalTalk (network 0 = this LocalTalk cable).
-                                if self.lt_addressing.is_some() {
-                                    let dest = crate::ddp::DdpAddress::new(
-                                        tailtalk_packets::aarp::AppleTalkAddress {
-                                            network_number: 0,
-                                            node_number: 255,
-                                        },
-                                        2,
-                                    );
-                                    if let Err(e) = self.sock.send_to(&buf[..size], dest).await {
-                                        tracing::error!("NBP LkUp: failed to send on LocalTalk: {e}");
-                                        send_ok = false;
-                                    }
-                                }
-
-                                // Send over EtherTalk (our assigned network, node 255 = cable broadcast).
-                                if let Some(et) = &self.et_addressing {
-                                    let et_addr = et.addr().await.expect("failed to get ET addr");
-                                    let dest = crate::ddp::DdpAddress::new(
-                                        tailtalk_packets::aarp::AppleTalkAddress {
-                                            network_number: et_addr.network_number,
-                                            node_number: 255,
-                                        },
-                                        2,
-                                    );
-                                    if let Err(e) = self.sock.send_to(&buf[..size], dest).await {
-                                        tracing::error!("NBP LkUp: failed to send on EtherTalk: {e}");
-                                        send_ok = false;
-                                    }
-                                }
-
-                                if send_ok {
+                                if let Err(e) = self.sock.send_to(&buf[..size], dest).await {
+                                    tracing::error!("NBP LkUp: failed to send: {e}");
+                                    let _ = lookup.chan.send(Err(io::Error::other(
+                                        "failed to send NBP lookup",
+                                    )));
+                                } else {
                                     self.pending_lookups.insert(tid, PendingLookup {
                                         chan: lookup.chan,
                                         start_time: Instant::now(),
                                         results: Vec::new(),
                                     });
-                                } else {
-                                    let _ = lookup.chan.send(Err(io::Error::other(
-                                        "failed to send NBP lookup on all transports",
-                                    )));
                                 }
                             },
                         }
