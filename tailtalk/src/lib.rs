@@ -591,6 +591,10 @@ impl PacketProcessor {
                         }
                     }
                 }
+                // TashTalk transport lost (device disconnected / reset).
+                // Cancel all tasks so the process shuts down cleanly.
+                tracing::warn!("TashTalk transport closed, shutting down");
+                tash_token.cancel();
             });
 
             Some(tx)
