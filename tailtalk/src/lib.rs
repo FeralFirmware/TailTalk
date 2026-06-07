@@ -63,8 +63,9 @@ pub struct PacketProcessor {
     pcap_tx: Option<pcap::Capture<pcap::Active>>,
     outbound_rx: mpsc::Receiver<DataLinkPacket>,
     our_mac: Option<[u8; 6]>,
-    /// Opened TashTalk instance, stored here and handed to the async task in `run()`.
-    tashtalk: Option<TashTalk<tokio_serial::SerialStream>>,
+    /// Serial port path for LocalTalk / TashTalk. The port is opened (and
+    /// reopened on disconnect) inside the async task spawned by `run()`.
+    localtalk_serial_path: Option<String>,
     /// CRC features to set on the TashTalk firmware at startup.
     tashtalk_features: tashtalk::TashTalkFeatures,
     /// Sender to the LocalTalk pcap writer thread, if capture is enabled.
@@ -138,10 +139,10 @@ impl PacketProcessorBuilder {
 
     /// Configure a LocalTalk transport via a TashTalk serial adapter.
     ///
-    /// The serial port is opened during [`build`](Self::build). The TashTalk
-    /// async task (including node-ID registration) is started inside
-    /// [`PacketProcessor::run`], which already receives the `addressing` and
-    /// `ddp` handles needed for that setup.
+    /// The serial port is opened lazily when the device becomes available.
+    /// If the device is not present at startup, a warning is logged and
+    /// the stack keeps running. When the device appears (or reappears
+    /// after a disconnect), LocalTalk is brought up automatically.
     pub fn localtalk(mut self, serial_path: &str) -> Self {
         self.localtalk_serial_path = Some(serial_path.to_string());
         self
@@ -194,17 +195,8 @@ impl PacketProcessorBuilder {
         }
 
         // ── LocalTalk / TashTalk setup ───────────────────────────────────────
-        // Open the serial port now so failures surface at build time.
-        // The async task is deferred to run() where addressing/ddp handles are available.
-        let tashtalk = if let Some(path) = self.localtalk_serial_path {
-            let stream = tokio_serial::new(&path, 1_000_000)
-                .flow_control(tokio_serial::FlowControl::Hardware)
-                .open_native_async()
-                .map_err(|e| anyhow::anyhow!("Failed to open TashTalk serial port '{}': {e}", path))?;
-            Some(TashTalk::new(stream))
-        } else {
-            None
-        };
+        // Serial port is opened lazily inside the async task (hot-pluggable).
+        // We just store the path here.
 
         let (outbound_tx, outbound_rx) = mpsc::channel(100);
 
@@ -215,7 +207,7 @@ impl PacketProcessorBuilder {
             pcap_tx,
             outbound_rx,
             our_mac,
-            tashtalk,
+            localtalk_serial_path: self.localtalk_serial_path,
             tashtalk_features: self.tashtalk_features,
             pcap_sender,
         };
@@ -467,142 +459,174 @@ impl PacketProcessor {
 
         // ── TashTalk async task ──────────────────────────────────────────────
         // Spawned here rather than in the builder because it needs the addressing
-        // and ddp handles, which callers construct using the OutboundHandle that
-        // build() returns.
+        // and ddp handles. The task opens (and reopens) the serial port, so
+        // the device can be hot-plugged.
         let tashtalk_features = self.tashtalk_features;
         let (tashtalk_ready_tx, mut tashtalk_ready_rx) = tokio::sync::watch::channel(false);
-        let tashtalk_tx: Option<mpsc::Sender<Vec<u8>>> = if let Some(mut tashtalk_instance) = self.tashtalk {
-            let (tx, mut tashtalk_rx) = mpsc::channel::<Vec<u8>>(100);
-
+        // The TX sender is wrapped in a watch so the outbound loop can track
+        // reconnections: None = device offline, Some(sender) = online.
+        let (tashtalk_tx_watch_tx, tashtalk_tx_watch_rx) =
+            tokio::sync::watch::channel::<Option<mpsc::Sender<Vec<u8>>>>(None);
+        let has_localtalk = self.localtalk_serial_path.is_some();
+        if let Some(serial_path) = self.localtalk_serial_path {
             let ddp_handle = ddp.clone();
             let addressing_handle = lt_addressing.clone().expect("TashTalk task requires LT addressing");
             let tash_token = token.clone();
-            let ready = tashtalk_ready_tx; // moved into the spawned task
+            let ready = tashtalk_ready_tx;
+            let tx_watch = tashtalk_tx_watch_tx;
 
             tokio::spawn(async move {
-                tracing::info!("Resetting TashTalk buffers...");
-                if let Err(e) = tashtalk_instance.reset().await {
-                    tracing::error!("Failed to reset TashTalk: {:?}", e);
-                }
-
-                tracing::info!("Setting TashTalk features: {:?}", tashtalk_features);
-                if let Err(e) = tashtalk_instance
-                    .set_features(tashtalk_features)
-                    .await
-                {
-                    tracing::error!("Failed to set TashTalk features: {:?}", e);
-                }
-
-                match addressing_handle.addr().await {
-                    Ok(addr) => {
-                        let node_id = addr.node_number;
-                        tracing::info!("Setting TashTalk node ID bits for node {}", node_id);
-                        let mut node_bits = [0u8; 32];
-                        let byte_idx = (node_id / 8) as usize;
-                        let bit_idx = node_id % 8;
-                        node_bits[byte_idx] |= 1 << bit_idx;
-                        if let Err(e) = tashtalk_instance.set_node_ids(node_bits).await {
-                            tracing::error!("Failed to set TashTalk node IDs: {:?}", e);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to get our AppleTalk address for TashTalk setup: {:?}",
-                            e
-                        );
-                    }
-                }
-
-                tracing::info!("Starting TashTalk async loop");
-                let _ = ready.send(true);
+                let mut first_connect = true;
                 loop {
-                    tokio::select! {
-                        _ = tash_token.cancelled() => break,
-                        frame_opt = tashtalk_rx.recv() => {
-                            if let Some(frame) = frame_opt {
-                                if let Err(e) = tashtalk_instance.send_frame(&frame).await {
-                                    tracing::error!("TashTalk send_frame error: {:?}", e);
-                                }
-                            } else {
-                                break;
+                    // ── Open serial port ────────────────────────────────
+                    let stream = match tokio_serial::new(&serial_path, 1_000_000)
+                        .flow_control(tokio_serial::FlowControl::Hardware)
+                        .open_native_async()
+                    {
+                        Ok(s) => {
+                            tracing::info!("TashTalk: opened {}", serial_path);
+                            s
+                        }
+                        Err(e) => {
+                            if first_connect {
+                                tracing::warn!("TashTalk: {} not available ({e}), waiting for device", serial_path);
+                                first_connect = false;
+                            }
+                            tokio::select! {
+                                _ = tash_token.cancelled() => return,
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => continue,
                             }
                         }
-                        res = tashtalk_instance.receive_frame() => {
-                            match res {
-                                Ok(Some(data)) => {
-                                    if let Some(ref tx) = pcap_rx_sender {
-                                        let _ = tx.try_send((SystemTime::now(), data.clone()));
+                    };
+                    first_connect = false;
+
+                    let mut tashtalk_instance = TashTalk::new(stream);
+
+                    // ── Init sequence ────────────────────────────────────
+                    tracing::info!("TashTalk: resetting");
+                    if let Err(e) = tashtalk_instance.reset().await {
+                        tracing::error!("TashTalk reset failed: {:?}", e);
+                        continue;
+                    }
+
+                    tracing::info!("TashTalk: setting features {:?}", tashtalk_features);
+                    if let Err(e) = tashtalk_instance.set_features(tashtalk_features).await {
+                        tracing::error!("TashTalk set_features failed: {:?}", e);
+                        continue;
+                    }
+
+                    match addressing_handle.addr().await {
+                        Ok(addr) => {
+                            let node_id = addr.node_number;
+                            tracing::info!("TashTalk: setting node ID bits for node {}", node_id);
+                            let mut node_bits = [0u8; 32];
+                            node_bits[(node_id / 8) as usize] |= 1 << (node_id % 8);
+                            if let Err(e) = tashtalk_instance.set_node_ids(node_bits).await {
+                                tracing::error!("TashTalk set_node_ids failed: {:?}", e);
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("TashTalk: failed to get address: {:?}", e);
+                            continue;
+                        }
+                    }
+
+                    // ── Create TX channel for this connection ────────────
+                    let (tx, mut tashtalk_rx) = mpsc::channel::<Vec<u8>>(100);
+                    let _ = tx_watch.send(Some(tx));
+                    let _ = ready.send(true);
+
+                    // ── Main I/O loop ────────────────────────────────────
+                    tracing::info!("TashTalk: online");
+                    loop {
+                        tokio::select! {
+                            _ = tash_token.cancelled() => return,
+                            frame_opt = tashtalk_rx.recv() => {
+                                if let Some(frame) = frame_opt {
+                                    if let Err(e) = tashtalk_instance.send_frame(&frame).await {
+                                        tracing::error!("TashTalk send_frame error: {:?}", e);
+                                        break;
                                     }
-                                    if data.len() < 3 { continue; }
-                                    if let Ok(llap) = LlapPacket::parse(&data) {
-                                        match llap.type_ {
-                                            LlapType::DdpShort => {
-                                                tracing::debug!("TashTalk: LocalTalk DDP Short");
-                                                if let Ok(headers) = DdpPacket::parse_short(
-                                                    &data[3..],
-                                                    llap.dst_node,
-                                                    llap.src_node,
-                                                ) {
-                                                    tracing::debug!(
-                                                        "LLAP: {:?}, DDP Short: {:?}",
-                                                        llap,
-                                                        headers
-                                                    );
-                                                    let end = (3 + headers.len).min(data.len());
-                                                    let payload = data[8..end].to_vec().into_boxed_slice();
-                                                    ddp_handle.received_parsed_pkt(
-                                                        headers,
-                                                        payload,
-                                                        aarp::AddressSource::LocalTalk,
-                                                        [0; 6],
-                                                    );
-                                                }
-                                            }
-                                            LlapType::Enquiry => {
-                                                addressing_handle.received_llap_enq(llap.dst_node);
-                                            }
-                                            LlapType::Acknowledge => {
-                                                addressing_handle.received_llap_ack(llap.src_node);
-                                            }
-                                            LlapType::DdpLong => {
-                                                tracing::info!("TashTalk: LocalTalk DDP Long");
-                                                if let Ok(headers) = DdpPacket::parse(&data[3..]) {
-                                                    let end = (3 + headers.len).min(data.len());
-                                                    let payload =
-                                                        data[(3 + DdpPacket::LEN)..end].to_vec().into_boxed_slice();
-                                                    ddp_handle.received_parsed_pkt(
-                                                        headers,
-                                                        payload,
-                                                        aarp::AddressSource::LocalTalk,
-                                                        [0; 6],
-                                                    );
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                                Ok(None) => break,
-                                Err(e) => {
-                                    tracing::error!("TashTalk I/O error: {:?}", e);
+                                } else {
                                     break;
                                 }
                             }
+                            res = tashtalk_instance.receive_frame() => {
+                                match res {
+                                    Ok(Some(data)) => {
+                                        if let Some(ref tx) = pcap_rx_sender {
+                                            let _ = tx.try_send((SystemTime::now(), data.clone()));
+                                        }
+                                        if data.len() < 3 { continue; }
+                                        if let Ok(llap) = LlapPacket::parse(&data) {
+                                            match llap.type_ {
+                                                LlapType::DdpShort => {
+                                                    tracing::debug!("TashTalk: LocalTalk DDP Short");
+                                                    if let Ok(headers) = DdpPacket::parse_short(
+                                                        &data[3..],
+                                                        llap.dst_node,
+                                                        llap.src_node,
+                                                    ) {
+                                                        tracing::debug!(
+                                                            "LLAP: {:?}, DDP Short: {:?}",
+                                                            llap,
+                                                            headers
+                                                        );
+                                                        let end = (3 + headers.len).min(data.len());
+                                                        let payload = data[8..end].to_vec().into_boxed_slice();
+                                                        ddp_handle.received_parsed_pkt(
+                                                            headers,
+                                                            payload,
+                                                            aarp::AddressSource::LocalTalk,
+                                                            [0; 6],
+                                                        );
+                                                    }
+                                                }
+                                                LlapType::Enquiry => {
+                                                    addressing_handle.received_llap_enq(llap.dst_node);
+                                                }
+                                                LlapType::Acknowledge => {
+                                                    addressing_handle.received_llap_ack(llap.src_node);
+                                                }
+                                                LlapType::DdpLong => {
+                                                    tracing::info!("TashTalk: LocalTalk DDP Long");
+                                                    if let Ok(headers) = DdpPacket::parse(&data[3..]) {
+                                                        let end = (3 + headers.len).min(data.len());
+                                                        let payload =
+                                                            data[(3 + DdpPacket::LEN)..end].to_vec().into_boxed_slice();
+                                                        ddp_handle.received_parsed_pkt(
+                                                            headers,
+                                                            payload,
+                                                            aarp::AddressSource::LocalTalk,
+                                                            [0; 6],
+                                                        );
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    Ok(None) => break,
+                                    Err(e) => {
+                                        tracing::error!("TashTalk I/O error: {:?}", e);
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
+                    // Device disconnected — signal offline, then retry.
+                    tracing::warn!("TashTalk: offline, will reconnect");
+                    let _ = tx_watch.send(None);
+                    let _ = ready.send(false);
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
-                // TashTalk transport lost (device disconnected / reset).
-                // Cancel all tasks so the process shuts down cleanly.
-                tracing::warn!("TashTalk transport closed, shutting down");
-                tash_token.cancel();
             });
-
-            Some(tx)
         } else {
             // No TashTalk — signal ready immediately so the outbound
             // loop doesn't block waiting for a device that doesn't exist.
             let _ = tashtalk_ready_tx.send(true);
-            None
         };
 
         // ── Outbound TX loop ─────────────────────────────────────────────────
@@ -610,10 +634,17 @@ impl PacketProcessor {
         let mut rx = self.outbound_rx;
         let mut pcap_tx = self.pcap_tx;
 
-        // Wait for TashTalk init (reset + set_features + set_node_ids) to
-        // finish before processing outbound frames. Without this, frames
-        // queued during init would be sent before the firmware is configured.
-        let _ = tashtalk_ready_rx.wait_for(|ready| *ready).await;
+        // Wait for TashTalk init unless no LocalTalk is configured.
+        // If the device isn't present yet, proceed — outbound frames to
+        // LocalTalk will be silently dropped until the device comes online.
+        if has_localtalk {
+            // Non-blocking: if device isn't ready yet, just log and continue.
+            if !*tashtalk_ready_rx.borrow() {
+                tracing::info!("Waiting for TashTalk device...");
+                let _ = tashtalk_ready_rx.wait_for(|ready| *ready).await;
+            }
+        }
+        let mut tashtalk_tx_watch_rx = tashtalk_tx_watch_rx;
 
         loop {
             let pkt = tokio::select! {
@@ -721,7 +752,8 @@ impl PacketProcessor {
                     }
                 }
                 addressing::Node::LocalTalk(_) => {
-                    if let Some(tx) = &tashtalk_tx {
+                    let tashtalk_tx = tashtalk_tx_watch_rx.borrow_and_update().clone();
+                    if let Some(tx) = tashtalk_tx {
                         tracing::debug!("Sending to Tashtalk tx: {:X?}", &output_buf[..final_size]);
                         if let Err(e) = tx.send(output_buf[..final_size].to_vec()).await {
                             tracing::error!("Failed to send to Tashtalk tx: {}", e);
