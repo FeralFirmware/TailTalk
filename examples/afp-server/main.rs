@@ -59,10 +59,14 @@ async fn main() {
     tracing::info!("AFP server serving {:?} on {}", args.path, transport);
     tracing::info!("Press Ctrl+C to exit");
 
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to listen for ctrl+c");
-
-    tracing::info!("Shutting down");
-    stack.shutdown_handle().graceful_shutdown().await;
+    let shutdown = stack.shutdown_handle();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Ctrl+C received, shutting down");
+        }
+        _ = shutdown.transport_closed() => {
+            tracing::info!("Transport closed, shutting down");
+        }
+    }
+    shutdown.graceful_shutdown().await;
 }

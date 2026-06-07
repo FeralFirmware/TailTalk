@@ -774,6 +774,12 @@ impl ShutdownHandle {
         self.transport_token.cancel();
     }
 
+    /// Wait until the transport layer shuts down (e.g. serial device
+    /// disconnected). Useful for detecting when the stack is no longer viable.
+    pub async fn transport_closed(&self) {
+        self.transport_token.cancelled().await;
+    }
+
     /// Close sessions gracefully (e.g. send ASP CloseSess), then stop the
     /// transport once all services confirm they are done, or after 5 seconds.
     pub async fn graceful_shutdown(&self) {
