@@ -96,6 +96,10 @@ Install the CP210x VCP Windows driver from
 
 Install npcap 1.88 from [npcap.com](https://npcap.com/#download)
 
+### MacOS
+macOS 11 and later includes support for the CP2102N USB chip out of the box. For 10.12 through 10.15 the driver from Silicon
+Labs is required for the device to be recognised: https://www.silabs.com/software-and-tools/usb-to-uart-bridge-vcp-drivers?tab=downloads
+
 ## Existing Programs
 There are 4 demo programs I have written to verify the functionality of this software as I have developed it:
 
