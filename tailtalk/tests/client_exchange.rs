@@ -86,7 +86,7 @@ impl TestClient {
             }
         });
 
-        let nbp = Nbp::spawn(&ddp, Some(addressing.clone()), None).await;
+        let nbp = Nbp::spawn(&ddp, Some(addressing.clone()), None, None).await;
 
         let mut rx = hub_rx;
         let ddp_handle = ddp.clone();

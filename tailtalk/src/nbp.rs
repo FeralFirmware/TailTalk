@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::io;
 use std::time::Duration;
 use tailtalk_packets::{
+    aarp::AppleTalkAddress,
     ddp::{DdpPacket, DdpProtocolType},
     nbp::{EntityName, NbpOperation, NbpPacket, NbpTuple},
 };
@@ -47,6 +48,7 @@ pub struct Nbp {
     request_recv: mpsc::Receiver<NbpCommand>,
     pending_lookups: HashMap<u8, PendingLookup>,
     next_tid: u8,
+    router_addr: Option<AppleTalkAddress>,
 }
 
 impl Nbp {
@@ -54,6 +56,7 @@ impl Nbp {
         ddp: &DdpHandle,
         et_addressing: Option<AddressingHandle>,
         lt_addressing: Option<AddressingHandle>,
+        router_addr: Option<AppleTalkAddress>,
     ) -> NbpHandle {
         let sock = ddp
             .new_sock(DdpProtocolType::Nbp, Some(2))
@@ -70,6 +73,7 @@ impl Nbp {
             request_recv,
             pending_lookups: HashMap::new(),
             next_tid: 1,
+            router_addr,
         };
 
         tokio::spawn(async move { nbp.run().await });
@@ -121,24 +125,31 @@ impl Nbp {
                                     entity_name: lookup.request,
                                 };
 
+                                // With a router: send BrRq (unicast to router, which fans it out
+                                // to all segments in the zone). Without: broadcast LkUp locally.
+                                let (operation, dest) = if let Some(router) = self.router_addr {
+                                    (
+                                        NbpOperation::BroadcastRequest,
+                                        crate::ddp::DdpAddress::new(router, 2),
+                                    )
+                                } else {
+                                    (
+                                        NbpOperation::Lookup,
+                                        crate::ddp::DdpAddress::new(
+                                            AppleTalkAddress { network_number: 0, node_number: 255 },
+                                            2,
+                                        ),
+                                    )
+                                };
+
                                 let packet = NbpPacket {
-                                    operation: NbpOperation::Lookup,
+                                    operation,
                                     transaction_id: tid,
                                     tuples: vec![tuple],
                                 };
 
                                 let mut buf = [0u8; 1024];
                                 let size = packet.to_bytes(&mut buf).expect("failed to serialize");
-
-                                // Network-wide broadcast {0, 255}: the DDP layer will send this
-                                // on every configured interface (EtherTalk and/or LocalTalk).
-                                let dest = crate::ddp::DdpAddress::new(
-                                    tailtalk_packets::aarp::AppleTalkAddress {
-                                        network_number: 0,
-                                        node_number: 255,
-                                    },
-                                    2,
-                                );
 
                                 if let Err(e) = self.sock.send_to(&buf[..size], dest).await {
                                     tracing::error!("NBP LkUp: failed to send: {e}");

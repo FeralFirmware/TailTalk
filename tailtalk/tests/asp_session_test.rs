@@ -86,7 +86,7 @@ impl TestClient {
             }
         });
 
-        let nbp = Nbp::spawn(&ddp, Some(addressing.clone()), None).await;
+        let nbp = Nbp::spawn(&ddp, Some(addressing.clone()), None, None).await;
 
         let mut rx = hub_rx;
         let ddp_handle = ddp.clone();
@@ -167,7 +167,7 @@ async fn test_asp_session_workflow() {
     let addr_server = Addressing::spawn(Some(mac_server), outbound_server.clone(), None, AddressSource::EtherTalkPhase2);
     let ddp_server = DdpProcessor::spawn(Some(addr_server.clone()), None, outbound_server.clone());
     // Start NBP for server
-    let nbp_server = Nbp::spawn(&ddp_server, Some(addr_server.clone()), None).await;
+    let nbp_server = Nbp::spawn(&ddp_server, Some(addr_server.clone()), None, None).await;
 
     // Start incoming packet loop for server
     let mut rx_server = hub_ref.subscribe();

@@ -26,6 +26,7 @@ pub mod echo;
 pub mod nbp;
 pub mod pap;
 pub mod stylewriter;
+pub mod zip;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DataLinkProtocol {
@@ -1030,7 +1031,6 @@ impl TalkStackBuilder {
 
         let ddp = ddp::DdpProcessor::spawn(et_addressing.clone(), lt_addressing.clone(), outbound);
         let echo = echo::Echo::spawn(&ddp).await;
-        let nbp = nbp::Nbp::spawn(&ddp, et_addressing.clone(), lt_addressing.clone()).await;
 
         let service_token = CancellationToken::new();
         let transport_token = CancellationToken::new();
@@ -1044,6 +1044,32 @@ impl TalkStackBuilder {
         if let Some(lt) = &lt_addressing {
             lt.addr().await?;
         }
+
+        // ZIP probe: discover whether a router is present on any configured segment.
+        // If found, record the router address for NBP (so it can send BrRq instead of
+        // LkUp), and re-probe EtherTalk addressing with the proper cable-range address.
+        // LocalTalk always stays on network 0 so no reprobe is needed there.
+        let router_addr = match zip::probe_router(&ddp).await {
+            Some(info) => {
+                if self.fixed_addr.is_none() {
+                    if let Some(et) = &et_addressing {
+                        et.reprobe(info.cable_range).await?;
+                    }
+                }
+                // If the router is on LocalTalk it will have a non-zero network number.
+                // Cache the mapping so DDP can route unicast packets to it by network address.
+                if let Some(lt) = &lt_addressing {
+                    lt.learn(
+                        info.router_addr,
+                        addressing::Node::LocalTalk(info.router_addr.node_number),
+                    );
+                }
+                Some(info.router_addr)
+            }
+            None => None,
+        };
+
+        let nbp = nbp::Nbp::spawn(&ddp, et_addressing.clone(), lt_addressing.clone(), router_addr).await;
 
         Ok(TalkStack { et_addressing, lt_addressing, ddp, nbp, echo, service_token, transport_token, services_done })
     }

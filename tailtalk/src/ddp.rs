@@ -184,7 +184,22 @@ impl DdpProcessor {
         };
 
         match packet.source {
-            AppleTalkAddressSource::LocalTalk => {}
+            AppleTalkAddressSource::LocalTalk => {
+                // A LocalTalk DDP-Long packet (e.g. from a router) carries a non-zero
+                // source network number in the DDP header even though the wire is LocalTalk.
+                // Cache it so unicast replies (NBP LkUpRply, etc.) can be routed back.
+                if source_addr.network_number != 0 {
+                    if let Some(lt) = &self.lt_addressing
+                        && lt.try_lookup(&source_addr).is_none()
+                    {
+                        tracing::debug!(
+                            "Learning LocalTalk router address {}.{} from incoming DDP",
+                            source_addr.network_number, source_addr.node_number
+                        );
+                        lt.learn(source_addr, Node::LocalTalk(source_addr.node_number));
+                    }
+                }
+            }
             _ => {
                 if let Some(et) = &self.et_addressing
                     && et.try_lookup(&source_addr).is_none() {
@@ -281,6 +296,12 @@ impl DdpProcessor {
                 return;
             }
             Node::LocalTalk(packet.dest.addr.node_number)
+        } else if let Some(lt) = &self.lt_addressing
+            && let Some(node) = lt.try_lookup(&packet.dest.addr)
+        {
+            // Non-zero network address cached in the LocalTalk table (e.g. a router
+            // on LocalTalk whose network number is non-zero).
+            node
         } else {
             let Some(et) = &self.et_addressing else {
                 tracing::error!(

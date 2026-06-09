@@ -25,9 +25,15 @@ struct SelfAddress {
     chan: oneshot::Sender<AppleTalkAddress>,
 }
 
+struct ReprobeRequest {
+    cable_range: (u16, u16),
+    chan: oneshot::Sender<Result<AppleTalkAddress, Error>>,
+}
+
 enum AarpCommand {
     Lookup(AarpRequest),
     OurAddr(SelfAddress),
+    Reprobe(ReprobeRequest),
 }
 
 pub struct Addressing {
@@ -193,14 +199,16 @@ impl Addressing {
             addr
         } else {
             // EtherTalk: probe via AARP. Retry with a new random address on conflict.
+            // No router found — pick from the startup range (0xFF00–0xFFFE, i.e. 65280–65534).
             'probe: loop {
-                let node_num = rand::rng().random_range(1..=254);
+                let node_num = rand::rng().random_range(1..=253);
+                let network_num = rand::rng().random_range(65280u16..=65534);
                 let addr = AppleTalkAddress {
-                    network_number: 1,
+                    network_number: network_num,
                     node_number: node_num,
                 };
 
-                tracing::info!("addressing: Selecting 1.{node_num} as our address");
+                tracing::info!("addressing: Selecting {network_num}.{node_num} as our address");
 
                 let probe = self.create_packet(
                     addr,
@@ -218,13 +226,13 @@ impl Addressing {
                 loop {
                     tokio::select! {
                         _ = tokio::time::sleep_until(probe_deadline) => {
-                            tracing::info!("No response, address 1.{node_num} confirmed");
+                            tracing::info!("No response, address {network_num}.{node_num} confirmed");
                             break 'probe addr;
                         }
                         pkt = self.packet_recv.recv() => {
                             if let Some((pkt, _source)) = pkt
                                 && pkt.opcode == AarpOpcode::Probe && pkt.target_protocol == addr {
-                                    tracing::warn!("Address conflict for 1.{node_num}, re-selecting");
+                                    tracing::warn!("Address conflict for {network_num}.{node_num}, re-selecting");
                                     continue 'probe;
                                 }
                         }
@@ -232,6 +240,8 @@ impl Addressing {
                 }
             }
         };
+
+        let mut our_addr = our_addr;
 
         // Main event loop — address is now settled.
         loop {
@@ -288,6 +298,13 @@ impl Addressing {
                             AarpCommand::OurAddr(req) => {
                                 req.chan.send(our_addr).expect("failed to send our_addr");
                             },
+                            AarpCommand::Reprobe(req) => {
+                                if let Some(new_addr) = self.do_aarp_probe(req.cable_range).await {
+                                    our_addr = new_addr;
+                                    let _ = req.chan.send(Ok(new_addr));
+                                }
+                                // None means cancelled; task exits on next select iteration.
+                            },
                         }
                     }
                 }
@@ -308,6 +325,54 @@ impl Addressing {
                 _ = self.cancel.cancelled() => {
                     break;
                 }
+            }
+        }
+    }
+
+    async fn do_aarp_probe(&mut self, cable_range: (u16, u16)) -> Option<AppleTalkAddress> {
+        let (range_start, range_end) = cable_range;
+        loop {
+            let node_num = rand::rng().random_range(1..=253u8);
+            let network_num = rand::rng().random_range(range_start..=range_end);
+            let addr = AppleTalkAddress { network_number: network_num, node_number: node_num };
+
+            tracing::info!("addressing: re-probing {network_num}.{node_num} (cable range {range_start}-{range_end})");
+
+            let probe = self.create_packet(
+                addr,
+                Self::broadcast_mac(self.phase),
+                addr,
+                AarpOpcode::Probe,
+                self.phase,
+            );
+            self.outbound.send(probe).await.expect("failed to dispatch probe");
+
+            let probe_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            let mut conflict = false;
+            loop {
+                let remaining = probe_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(remaining) => break,
+                    _ = self.cancel.cancelled() => return None,
+                    pkt = self.packet_recv.recv() => {
+                        if let Some((pkt, _)) = pkt
+                            && pkt.opcode == AarpOpcode::Probe
+                            && pkt.target_protocol == addr
+                        {
+                            tracing::warn!("addressing: {network_num}.{node_num} in use, retrying");
+                            conflict = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !conflict {
+                tracing::info!("addressing: {network_num}.{node_num} confirmed");
+                return Some(addr);
             }
         }
     }
@@ -396,6 +461,15 @@ impl AddressingHandle {
             Ok(res) => res,
             Err(e) => Err(Error::other(e)),
         }
+    }
+
+    pub async fn reprobe(&self, cable_range: (u16, u16)) -> Result<AppleTalkAddress, Error> {
+        let (tx, rx) = oneshot::channel();
+        self.request_send
+            .send(AarpCommand::Reprobe(ReprobeRequest { cable_range, chan: tx }))
+            .await
+            .map_err(Error::other)?;
+        rx.await.map_err(Error::other)?
     }
 
     pub async fn addr(&self) -> Result<AppleTalkAddress, Error> {
