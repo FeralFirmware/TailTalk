@@ -18,8 +18,7 @@ The modern macOS and Linux side software can be found on the Releases page [here
 The Mac version should work with Intel and Apple Silicon machines running 10.12 and newer. The Linux version
 should run on any relatively recent x86_64 distro.
 
-For Linux users the udev rule noted here may be needed to allow your user access to the device:
-https://github.com/FeralFirmware/TailTalk/releases/tag/0.4.1
+For Windows, Mac OS 10.12 through 10.15 and Linux please check out the driver notes from the main README [here](https://github.com/FeralFirmware/TailTalk#tashtalk-usb).
 
 ## Running
 
