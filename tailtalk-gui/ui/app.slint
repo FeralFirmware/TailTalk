@@ -46,6 +46,7 @@ export component AppWindow inherits Window {
     callback import-hfs-image();
     callback inspect-finder-info();
     callback save-finder-info();
+    callback open-log-dir();
     // Returns the input truncated to 1 character; registered in Rust.
     callback clamp-to-one(string) -> string;
 
@@ -63,6 +64,10 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: "Inspect Finder Info…";
                 activated => { root.inspect-finder-info(); }
+            }
+            MenuItem {
+                title: "Open Log Directory…";
+                activated => { root.open-log-dir(); }
             }
         }
     }

@@ -120,43 +120,70 @@ fn enumerate_serial() -> Vec<SerialDevice> {
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 
-/// Set up tracing to write to both stdout and a rolling daily log file.
-/// Returns a guard that must be kept alive for the duration of the process;
-/// dropping it flushes and closes the file writer.
-fn init_logging() -> Option<WorkerGuard> {
-    #[cfg(target_os = "macos")]
-    {
-        let log_dir = dirs::home_dir()
-            .map(|h| h.join("Library/Logs/TailTalk"))
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/TailTalk"));
-        let _ = std::fs::create_dir_all(&log_dir);
-
-        let file_appender = tracing_appender::rolling::daily(&log_dir, "tailtalk.log");
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
+/// Set up tracing. Returns the worker guard (must be kept alive) and the log
+/// directory, if logging to a file. On macOS and Linux when launched from a
+/// terminal, both are None and output goes to stdout only.
+fn init_logging() -> (Option<WorkerGuard>, Option<PathBuf>) {
+    // Shared TTY check: if the user launched from a terminal, log to stdout.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         let filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new("info"));
-
         tracing_subscriber::registry()
             .with(filter)
-            .with(tracing_subscriber::fmt::layer()) // stdout
-            .with(tracing_subscriber::fmt::layer().with_writer(non_blocking)) // file
+            .with(tracing_subscriber::fmt::layer())
             .init();
+        return (None, None);
+    }
 
-        return Some(guard);
+    // Per-platform log directory.
+    #[cfg(target_os = "macos")]
+    let log_dir = dirs::home_dir()
+        .map(|h| h.join("Library/Logs/TailTalk"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/TailTalk"));
+    #[cfg(target_os = "linux")]
+    let log_dir = dirs::data_local_dir()
+        .map(|d| d.join("TailTalk"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/TailTalk"));
+    #[cfg(target_os = "windows")]
+    let log_dir = dirs::data_local_dir()
+        .map(|d| d.join("TailTalk"))
+        .unwrap_or_else(|| PathBuf::from("C:\\TailTalk"));
+
+    // Shared file-logging setup for all known platforms.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        let _ = std::fs::create_dir_all(&log_dir);
+        let file_appender = tracing_appender::rolling::daily(&log_dir, "tailtalk.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info"));
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(non_blocking))
+            .init();
+        return (Some(guard), Some(log_dir));
     }
 
     #[allow(unreachable_code)]
     {
         let filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new("info"));
-
         tracing_subscriber::registry()
             .with(filter)
             .with(tracing_subscriber::fmt::layer())
             .init();
-        None
+        (None, None)
     }
+}
+
+fn open_in_file_manager(path: &Path) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -164,7 +191,7 @@ fn init_logging() -> Option<WorkerGuard> {
 fn main() -> anyhow::Result<()> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ServerCommand>(4);
 
-    let _log_guard = init_logging();
+    let (_log_guard, log_dir) = init_logging();
 
     let rt = tokio::runtime::Runtime::new()?;
     let rt_handle = rt.handle().clone();
@@ -377,6 +404,17 @@ fn main() -> anyhow::Result<()> {
     });
 
     ui.on_clamp_to_one(|s| s.chars().next().map_or(String::new(), |c| c.to_string()).into());
+
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_open_log_dir(move || {
+            if let Some(ref dir) = log_dir {
+                open_in_file_manager(dir);
+            } else if let Some(ui) = ui_weak.upgrade() {
+                ui.set_info_message("Logging to stdout (launched from terminal).".into());
+            }
+        });
+    }
 
     let ui_weak = ui.as_weak();
     let rt_handle_fi = rt_handle.clone();

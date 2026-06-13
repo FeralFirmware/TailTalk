@@ -1,6 +1,5 @@
 use anyhow::Error;
 use mac_address::mac_address_by_name;
-use rand::Rng;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use tailtalk_packets::aarp;
