@@ -22,7 +22,7 @@ rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serialport = { version = "4", optional = true }
 slint = "1"
-stuffit = "0.1.4"
+stuffit = { git = "https://github.com/Arctessa/stuffit-rs", branch = "huffman-method-3" }
 tailtalk = { workspace = true } #unified
 tailtalk-packets = { workspace = true } #unified
 tokio = { workspace = true, features = ["io-util"] } #unified
