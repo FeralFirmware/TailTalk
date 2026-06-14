@@ -61,7 +61,7 @@ fn infer_type_creator_from_content(path: &Path) -> Option<TypeCreator> {
         // JPEG: type/creator from magic-db !:apple 8BIMJPEG
         "image/jpeg" => Some(TypeCreator { file_type: *b"JPEG", creator: *b"8BIM" }),
         // PNG: no !:apple in magic-db; PNGf is the conventional Classic Mac type
-        "image/png" => Some(TypeCreator { file_type: *b"PNGf", creator: *b"????" }),
+        "image/png" => Some(TypeCreator { file_type: *b"PNGf", creator: *b"ogle" }),
         // PICT: type/creator from magic-db !:apple ????PICT
         "image/x-pict" => Some(TypeCreator { file_type: *b"PICT", creator: *b"ttxt" }),
         _ => None,

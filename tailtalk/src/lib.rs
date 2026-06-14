@@ -1,16 +1,16 @@
 use anyhow::Error;
-use mac_address::mac_address_by_name;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use tailtalk_packets::aarp;
 use tailtalk_packets::ddp::DdpPacket;
-use tailtalk_packets::ethertalk::{EtherTalkPhase2Frame, EtherTalkPhase2Type};
 use tailtalk_packets::llap::{LlapPacket, LlapType};
 use tashtalk::TashTalk;
 use tokio::sync::mpsc;
 use tokio_serial::SerialPortBuilderExt;
-use futures::StreamExt;
 pub use tokio_util::sync::CancellationToken;
+
+#[cfg(feature = "ethertalk")]
+mod ethertalk;
 
 pub use tashtalk::TashTalkFeatures;
 
@@ -44,24 +44,10 @@ pub struct DataLinkPacket {
     pub src_node_id: u8,
 }
 
-/// Trivial pcap codec that boxes the raw Ethernet frame bytes.
-struct EtherTalkCodec;
-
-impl pcap::PacketCodec for EtherTalkCodec {
-    type Item = Box<[u8]>;
-
-    fn decode(&mut self, packet: pcap::Packet) -> Self::Item {
-        packet.data.into()
-    }
-}
-
 pub struct PacketProcessor {
-    /// RX capture, consumed into an async stream in `run()`.
-    pcap_rx: Option<pcap::Capture<pcap::Active>>,
-    /// TX capture, used for packet injection in the outbound loop.
-    pcap_tx: Option<pcap::Capture<pcap::Active>>,
+    #[cfg(feature = "ethertalk")]
+    transport: Option<ethertalk::EtherTalkTransport>,
     outbound_rx: mpsc::Receiver<DataLinkPacket>,
-    our_mac: Option<[u8; 6]>,
     /// Serial port path for LocalTalk / TashTalk. The port is opened (and
     /// reopened on disconnect) inside the async task spawned by `run()`.
     localtalk_serial_path: Option<String>,
@@ -77,15 +63,6 @@ pub struct PacketProcessor {
 ///
 /// At least one transport must be configured before calling [`build`](PacketProcessorBuilder::build).
 ///
-/// # Example – EtherTalk only
-/// ```no_run
-/// # use tailtalk::PacketProcessor;
-/// let (processor, handle) = PacketProcessor::builder()
-///     .ethernet("eth0")
-///     .build()?;
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-///
 /// # Example – LocalTalk only
 /// ```no_run
 /// # use tailtalk::PacketProcessor;
@@ -95,8 +72,17 @@ pub struct PacketProcessor {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 ///
-/// # Example – both transports
-/// ```no_run
+/// # Example – EtherTalk only (requires the `ethertalk` feature)
+/// ```ignore
+/// # use tailtalk::PacketProcessor;
+/// let (processor, handle) = PacketProcessor::builder()
+///     .ethernet("eth0")
+///     .build()?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// # Example – both transports (requires the `ethertalk` feature)
+/// ```ignore
 /// # use tailtalk::PacketProcessor;
 /// let (processor, handle) = PacketProcessor::builder()
 ///     .ethernet("eth0")
@@ -105,6 +91,7 @@ pub struct PacketProcessor {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct PacketProcessorBuilder {
+    #[cfg(feature = "ethertalk")]
     ethernet_intf: Option<String>,
     localtalk_serial_path: Option<String>,
     tashtalk_features: tashtalk::TashTalkFeatures,
@@ -114,6 +101,7 @@ pub struct PacketProcessorBuilder {
 impl PacketProcessorBuilder {
     fn new() -> Self {
         Self {
+            #[cfg(feature = "ethertalk")]
             ethernet_intf: None,
             localtalk_serial_path: None,
             tashtalk_features: tashtalk::TashTalkFeatures::new(),
@@ -122,6 +110,7 @@ impl PacketProcessorBuilder {
     }
 
     /// Configure an EtherTalk transport on the given network interface.
+    #[cfg(feature = "ethertalk")]
     pub fn ethernet(mut self, intf: &str) -> Self {
         self.ethernet_intf = Some(intf.to_string());
         self
@@ -159,39 +148,13 @@ impl PacketProcessorBuilder {
 
     /// Finalise the builder: open pcap captures and the serial port as configured.
     pub fn build(self) -> Result<(PacketProcessor, OutboundHandle), Error> {
-        let mut pcap_rx: Option<pcap::Capture<pcap::Active>> = None;
-        let mut pcap_tx: Option<pcap::Capture<pcap::Active>> = None;
-        let mut our_mac: Option<[u8; 6]> = None;
-
         // ── EtherTalk setup ──────────────────────────────────────────────────
-        if let Some(ref intf) = self.ethernet_intf {
-            // Retrieve the interface MAC address cross-platform.
-            let mac = mac_address_by_name(intf)?
-                .ok_or_else(|| anyhow::anyhow!("no MAC address found for interface {}", intf))?;
-            our_mac = Some(mac.bytes());
-
-            // BPF filter: Phase 1 AppleTalk (0x809B), Phase 1 AARP (0x80F3),
-            // and any IEEE 802.2 LLC/SNAP frame (length field ≤ 1500) for Phase 2.
-            let filter = format!("(ether proto 0x809B or ether proto 0x80F3 or (ether[12:2] <= 1500)) and not ether src {mac}");
-
-            tracing::info!("filter string: {filter}");
-            // RX capture – promiscuous mode, filter applied.
-            let mut rx = pcap::Capture::from_device(intf.as_str())?
-                .promisc(true)
-                .immediate_mode(true)
-                .open()?;
-            rx.filter(&filter, true)?;
-
-            pcap_rx = Some(rx);
-
-            // TX capture – separate handle used solely for packet injection.
-            let tx = pcap::Capture::from_device(intf.as_str())?
-                .promisc(true)
-                .open()?;
-            pcap_tx = Some(tx);
-
-            tracing::info!("EtherTalk pcap captures opened on {}", intf);
-        }
+        #[cfg(feature = "ethertalk")]
+        let transport = if let Some(ref intf) = self.ethernet_intf {
+            Some(ethertalk::EtherTalkTransport::open(intf)?)
+        } else {
+            None
+        };
 
         // ── LocalTalk / TashTalk setup ───────────────────────────────────────
         // Serial port is opened lazily inside the async task (hot-pluggable).
@@ -202,10 +165,9 @@ impl PacketProcessorBuilder {
         let pcap_sender = self.pcap_path.and_then(spawn_pcap_writer);
 
         let processor = PacketProcessor {
-            pcap_rx,
-            pcap_tx,
+            #[cfg(feature = "ethertalk")]
+            transport,
             outbound_rx,
-            our_mac,
             localtalk_serial_path: self.localtalk_serial_path,
             tashtalk_features: self.tashtalk_features,
             pcap_sender,
@@ -277,38 +239,6 @@ fn spawn_pcap_writer(
     Some(tx)
 }
 
-// ── Ethernet framing helpers ──────────────────────────────────────────────────
-
-/// Write a 14-byte EtherTalk Phase 1 Ethernet header into `buf` and return 14.
-fn write_eth1_header(buf: &mut [u8], dst: [u8; 6], src: [u8; 6], ethertype: u16) -> usize {
-    buf[0..6].copy_from_slice(&dst);
-    buf[6..12].copy_from_slice(&src);
-    buf[12..14].copy_from_slice(&ethertype.to_be_bytes());
-    14
-}
-
-/// Write a 22-byte EtherTalk Phase 2 LLC/SNAP header into `buf` and return 22.
-///
-/// `oui` is the 3-byte SNAP OUI: `[0x08, 0x00, 0x07]` for AppleTalk DDP,
-/// `[0x00, 0x00, 0x00]` for AARP.
-fn write_snap_header(
-    buf: &mut [u8],
-    dst: [u8; 6],
-    src: [u8; 6],
-    oui: [u8; 3],
-    ethertype: u16,
-    payload_len: usize,
-) -> usize {
-    buf[0..6].copy_from_slice(&dst);
-    buf[6..12].copy_from_slice(&src);
-    let frame_len = 8 + payload_len; // 3 LLC + 5 SNAP bytes
-    buf[12..14].copy_from_slice(&(frame_len as u16).to_be_bytes());
-    buf[14..17].copy_from_slice(&[0xAA, 0xAA, 0x03]); // LLC DSAP, SSAP, Control
-    buf[17..20].copy_from_slice(&oui);
-    buf[20..22].copy_from_slice(&ethertype.to_be_bytes());
-    22
-}
-
 // ── PacketProcessor ───────────────────────────────────────────────────────────
 
 impl PacketProcessor {
@@ -319,7 +249,10 @@ impl PacketProcessor {
     /// Returns the Ethernet MAC address of the configured interface, or `None`
     /// if no EtherTalk transport was added.
     pub fn get_mac(&self) -> Option<[u8; 6]> {
-        self.our_mac
+        #[cfg(feature = "ethertalk")]
+        return self.transport.as_ref().map(|t| t.our_mac);
+        #[cfg(not(feature = "ethertalk"))]
+        None
     }
 
     pub async fn run(
@@ -329,132 +262,26 @@ impl PacketProcessor {
         ddp: ddp::DdpHandle,
         token: CancellationToken,
     ) {
+        #[cfg(not(feature = "ethertalk"))]
+        let _ = et_addressing;
+
         // Extract pcap senders before any other field moves.
         // pcap_rx_sender goes into the TashTalk receive task; pcap_tx_sender stays in the outbound loop.
         let pcap_rx_sender = self.pcap_sender.clone();
         let pcap_tx_sender = self.pcap_sender;
 
-        // ── EtherTalk RX task ────────────────────────────────────────────────
-        if let Some(rx_cap) = self.pcap_rx {
-            let ddp_rx = ddp.clone();
-            let addressing_rx = et_addressing.clone().expect("EtherTalk RX task requires ET addressing");
-            let rx_token = token.clone();
-
-            let rx_cap = match rx_cap.setnonblock() {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("Failed to set pcap nonblocking: {e}");
-                    return;
-                }
-            };
-            let stream = match rx_cap.stream(EtherTalkCodec) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("Failed to create pcap stream: {e}");
-                    return;
-                }
-            };
-
-            tokio::spawn(async move {
-                tracing::info!("EtherTalk RX task started");
-                tokio::pin!(stream);
-                loop {
-                    let data: Box<[u8]> = tokio::select! {
-                        _ = rx_token.cancelled() => break,
-                        result = stream.next() => match result {
-                            Some(Ok(d)) => d,
-                            Some(Err(e)) => { tracing::error!("pcap rx error: {e}"); break; }
-                            None => break,
-                        },
-                    };
-
-                    let ethertype_or_len = u16::from_be_bytes([data[12], data[13]]);
-
-                    if ethertype_or_len <= 1500 {
-                        // EtherTalk Phase 2 – IEEE 802.2 LLC/SNAP encapsulation.
-                        match EtherTalkPhase2Frame::parse(&data) {
-                            Err(e) => tracing::debug!("Phase 2 parse failed: {:?}", e),
-                            Ok(header) => {
-                                let payload = &data[EtherTalkPhase2Frame::len()..];
-                                match header.protocol {
-                                    EtherTalkPhase2Type::Ddp => {
-                                        ddp_rx.received_pkt(
-                                            payload,
-                                            aarp::AddressSource::EtherTalkPhase2,
-                                            header.src_mac,
-                                        );
-                                    }
-                                    EtherTalkPhase2Type::Aarp => {
-                                        if let Err(e) = addressing_rx.received_pkt(
-                                            payload,
-                                            aarp::AddressSource::EtherTalkPhase2,
-                                        ) {
-                                            tracing::error!("failed to relay Phase 2 AARP: {e}");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if ethertype_or_len == 0x80F3 {
-                        // EtherTalk Phase 1 AARP.
-                        if data.len() > 14
-                            && let Err(e) = addressing_rx.received_pkt(
-                                &data[14..],
-                                aarp::AddressSource::EtherTalkPhase1,
-                            )
-                        {
-                            tracing::error!("failed to relay Phase 1 AARP: {e}");
-                        }
-                    } else if ethertype_or_len == 0x809B {
-                        // EtherTalk Phase 1 – LLAP encapsulated in Ethernet.
-                        if data.len() > 14 + LlapPacket::LEN
-                            && let Ok(llap) = LlapPacket::parse(&data[14..])
-                        {
-                            match llap.type_ {
-                                LlapType::DdpShort => {
-                                    let payload = &data[(14 + LlapPacket::LEN)..];
-                                    if payload.len() >= 5
-                                        && let Ok(headers) = DdpPacket::parse_short(
-                                            payload,
-                                            llap.dst_node,
-                                            llap.src_node,
-                                        )
-                                    {
-                                        let ddp_payload = payload[5..headers.len.min(payload.len())].into();
-                                        let source_mac: [u8; 6] =
-                                            data[6..12].try_into().unwrap();
-                                        ddp_rx.received_parsed_pkt(
-                                            headers,
-                                            ddp_payload,
-                                            aarp::AddressSource::EtherTalkPhase1,
-                                            source_mac,
-                                        );
-                                    }
-                                }
-                                LlapType::DdpLong => {
-                                    let payload = &data[(14 + LlapPacket::LEN)..];
-                                    if payload.len() >= DdpPacket::LEN
-                                        && let Ok(headers) = DdpPacket::parse(payload)
-                                    {
-                                        let ddp_payload =
-                                            payload[DdpPacket::LEN..headers.len.min(payload.len())].into();
-                                        let source_mac: [u8; 6] =
-                                            data[6..12].try_into().unwrap();
-                                        ddp_rx.received_parsed_pkt(
-                                            headers,
-                                            ddp_payload,
-                                            aarp::AddressSource::EtherTalkPhase1,
-                                            source_mac,
-                                        );
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            });
-        }
+        // ── EtherTalk: spawn RX task, obtain TX handle ──────────────────────
+        #[cfg(feature = "ethertalk")]
+        let mut et_tx = if let Some(transport) = self.transport {
+            let addressing = et_addressing.clone()
+                .expect("EtherTalk transport requires ET addressing");
+            match transport.spawn_rx_task(ddp.clone(), addressing, token.clone()) {
+                None => return,
+                Some(tx) => Some(tx),
+            }
+        } else {
+            None
+        };
 
         // ── TashTalk async task ──────────────────────────────────────────────
         // Spawned here rather than in the builder because it needs the addressing
@@ -629,9 +456,7 @@ impl PacketProcessor {
         };
 
         // ── Outbound TX loop ─────────────────────────────────────────────────
-        let our_mac = self.our_mac.unwrap_or([0; 6]);
         let mut rx = self.outbound_rx;
-        let mut pcap_tx = self.pcap_tx;
 
         // Wait for TashTalk init unless no LocalTalk is configured.
         // If the device isn't present yet, proceed — outbound frames to
@@ -655,22 +480,9 @@ impl PacketProcessor {
             let final_size = match pkt.protocol {
                 DataLinkProtocol::Ddp => {
                     match pkt.dest_node {
-                        addressing::Node::EtherTalkPhase1(mac) => {
-                            let payload_len = pkt.payload.len();
-                            let n = write_eth1_header(&mut output_buf, mac, our_mac, 0x809B);
-                            // Phase 1 DDP: 3-byte LLAP header (dst, src, type=2) precedes the DDP packet.
-                            // Node numbers are extracted from the DDP header bytes 8 and 9.
-                            output_buf[n] = if payload_len > 8 { pkt.payload[8] } else { 0 };
-                            output_buf[n + 1] = if payload_len > 9 { pkt.payload[9] } else { 0 };
-                            output_buf[n + 2] = 2;
-                            output_buf[n + 3..n + 3 + payload_len].copy_from_slice(&pkt.payload);
-                            n + 3 + payload_len
-                        }
-                        addressing::Node::EtherTalkPhase2(mac) => {
-                            let payload_len = pkt.payload.len();
-                            let n = write_snap_header(&mut output_buf, mac, our_mac, [0x08, 0x00, 0x07], 0x809B, payload_len);
-                            output_buf[n..n + payload_len].copy_from_slice(&pkt.payload);
-                            n + payload_len
+                        #[cfg(feature = "ethertalk")]
+                        addressing::Node::EtherTalkPhase1(_) | addressing::Node::EtherTalkPhase2(_) => {
+                            et_tx.as_ref().map_or(0, |t| t.build_ddp_frame(pkt.dest_node, &pkt.payload, &mut output_buf))
                         }
                         addressing::Node::LocalTalk(node_id) => {
                             let llap_pkt = LlapPacket {
@@ -693,6 +505,8 @@ impl PacketProcessor {
 
                             frame_end + 2
                         }
+                        #[cfg(not(feature = "ethertalk"))]
+                        _ => 0,
                     }
                 }
                 DataLinkProtocol::LlapEnq | DataLinkProtocol::LlapAck => {
@@ -720,19 +534,14 @@ impl PacketProcessor {
                     }
                 }
                 DataLinkProtocol::Aarp => {
-                    let payload_len = pkt.payload.len();
                     match pkt.dest_node {
-                        addressing::Node::EtherTalkPhase1(mac) => {
-                            let n = write_eth1_header(&mut output_buf, mac, our_mac, 0x80F3);
-                            output_buf[n..n + payload_len].copy_from_slice(&pkt.payload);
-                            n + payload_len
-                        }
-                        addressing::Node::EtherTalkPhase2(mac) => {
-                            let n = write_snap_header(&mut output_buf, mac, our_mac, [0x00, 0x00, 0x00], 0x80F3, payload_len);
-                            output_buf[n..n + payload_len].copy_from_slice(&pkt.payload);
-                            n + payload_len
+                        #[cfg(feature = "ethertalk")]
+                        addressing::Node::EtherTalkPhase1(_) | addressing::Node::EtherTalkPhase2(_) => {
+                            et_tx.as_ref().map_or(0, |t| t.build_aarp_frame(pkt.dest_node, &pkt.payload, &mut output_buf))
                         }
                         addressing::Node::LocalTalk(_) => 0,
+                        #[cfg(not(feature = "ethertalk"))]
+                        _ => 0,
                     }
                 }
             };
@@ -742,12 +551,10 @@ impl PacketProcessor {
             }
 
             match pkt.dest_node {
+                #[cfg(feature = "ethertalk")]
                 addressing::Node::EtherTalkPhase1(_) | addressing::Node::EtherTalkPhase2(_) => {
-                    if let Some(ref mut tx) = pcap_tx {
-                        let padded_size = final_size.max(60);
-                        if let Err(e) = tx.sendpacket(&output_buf[..padded_size]) {
-                            tracing::error!("failed to send packet: {e}");
-                        }
+                    if let Some(ref mut t) = et_tx {
+                        t.sendpacket(&output_buf, final_size);
                     }
                 }
                 addressing::Node::LocalTalk(_) => {
@@ -764,6 +571,8 @@ impl PacketProcessor {
                         let _ = tx.try_send((SystemTime::now(), output_buf[..frame_len].to_vec()));
                     }
                 }
+                #[cfg(not(feature = "ethertalk"))]
+                _ => {}
             }
         }
     }
@@ -832,7 +641,7 @@ impl ShutdownHandle {
 /// # use tailtalk::{TalkStack, afp::AfpServerConfig};
 /// # async fn example() -> anyhow::Result<()> {
 /// let stack = TalkStack::builder()
-///     .ethernet("eth0")
+///     .localtalk("/dev/ttyUSB0")
 ///     .build()
 ///     .await?;
 ///
@@ -925,9 +734,11 @@ impl TalkStack {
 
 /// Builder for [`TalkStack`].
 pub struct TalkStackBuilder {
+    #[cfg(feature = "ethertalk")]
     ethernet_intf: Option<String>,
     localtalk_serial_path: Option<String>,
     tashtalk_features: tashtalk::TashTalkFeatures,
+    #[cfg(feature = "ethertalk")]
     fixed_addr: Option<tailtalk_packets::aarp::AppleTalkAddress>,
     lt_fixed_node: Option<u8>,
     pcap_path: Option<PathBuf>,
@@ -936,9 +747,11 @@ pub struct TalkStackBuilder {
 impl TalkStack {
     pub fn builder() -> TalkStackBuilder {
         TalkStackBuilder {
+            #[cfg(feature = "ethertalk")]
             ethernet_intf: None,
             localtalk_serial_path: None,
             tashtalk_features: tashtalk::TashTalkFeatures::new(),
+            #[cfg(feature = "ethertalk")]
             fixed_addr: None,
             lt_fixed_node: None,
             pcap_path: None,
@@ -948,6 +761,7 @@ impl TalkStack {
 
 impl TalkStackBuilder {
     /// Configure an EtherTalk transport on the given network interface.
+    #[cfg(feature = "ethertalk")]
     pub fn ethernet(mut self, intf: &str) -> Self {
         self.ethernet_intf = Some(intf.to_string());
         self
@@ -982,6 +796,7 @@ impl TalkStackBuilder {
     }
 
     /// Use a fixed AppleTalk address on EtherTalk instead of probing via AARP.
+    #[cfg(feature = "ethertalk")]
     pub fn fixed_address(mut self, network: u16, node: u8) -> Self {
         self.fixed_addr = Some(tailtalk_packets::aarp::AppleTalkAddress {
             network_number: network,
@@ -996,6 +811,7 @@ impl TalkStackBuilder {
     /// order, then starts the [`PacketProcessor`] background task.
     pub async fn build(self) -> Result<TalkStack, Error> {
         let mut pp = PacketProcessor::builder().tashtalk_features(self.tashtalk_features);
+        #[cfg(feature = "ethertalk")]
         if let Some(ref intf) = self.ethernet_intf {
             pp = pp.ethernet(intf);
         }
@@ -1008,6 +824,7 @@ impl TalkStackBuilder {
         let (processor, outbound) = pp.build()?;
 
         // EtherTalk addressing: AARP probe (or fixed address if caller specified one).
+        #[cfg(feature = "ethertalk")]
         let et_addressing = if self.ethernet_intf.is_some() {
             Some(addressing::Addressing::spawn(
                 processor.get_mac(),
@@ -1018,6 +835,8 @@ impl TalkStackBuilder {
         } else {
             None
         };
+        #[cfg(not(feature = "ethertalk"))]
+        let et_addressing: Option<addressing::AddressingHandle> = None;
 
         let lt_addressing = if self.localtalk_serial_path.is_some() {
             let lt_fixed = self.lt_fixed_node.map(|node| tailtalk_packets::aarp::AppleTalkAddress {

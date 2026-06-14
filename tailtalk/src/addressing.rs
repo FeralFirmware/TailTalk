@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use im::hashmap::HashMap;
-use rand::Rng;
+use rand::RngExt;
 use std::sync::Arc;
 use std::{io::Error, time::Duration};
 use tailtalk_packets::aarp::*;

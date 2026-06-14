@@ -11,7 +11,7 @@ path = "main.rs"
 [dependencies]
 anyhow = { workspace = true } #unified
 clap = { workspace = true } #unified
-tailtalk = { workspace = true } #unified
+tailtalk = { workspace = true, features = ["ethertalk"] } #unified
 tailtalk-packets = { workspace = true } #unified
 tokio = { workspace = true, features = ["io-util"] } #unified
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

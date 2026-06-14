@@ -20,10 +20,10 @@ dashmap = "6.1.0"
 encoding_rs = { workspace = true } #unified
 futures = { workspace = true } #unified
 im = "15.1.0"
-mac_address = "1.1"
+mac_address = { version = "1.1", optional = true }
 magic-db = "0.5"
-pcap = { version = "2", features = ["capture-stream"] }
-rand = "0.9.3"
+pcap = { version = "2", features = ["capture-stream"], optional = true }
+rand = "0.10"
 sled = "0.34"
 tailtalk-packets = { workspace = true } #unified
 tashtalk = { workspace = true } #unified
@@ -31,12 +31,13 @@ tokio = { workspace = true, features = ["io-util"] } #unified
 tokio-serial = "5.4.4"
 tokio-util = { version = "0.7.12", features = ["codec"] }
 tracing = { workspace = true } #unified
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+tracing-subscriber = { version = "^0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
 xattr = "1.3.1"
 
 [features]
+ethertalk = ["dep:pcap", "dep:mac_address"]
 
 [dev-dependencies]
 tempfile = "3.13"

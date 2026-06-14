@@ -247,10 +247,10 @@ fn main() -> anyhow::Result<()> {
             ui.set_volume_path(v.as_str().into());
         }
         #[cfg(feature = "ethertalk")]
-        if let Some(ref iface) = config.ethernet_interface {
-            if let Some(idx) = ethernet_names.iter().position(|n| n == iface) {
-                ui.set_selected_ethernet(idx as i32);
-            }
+        if let Some(ref iface) = config.ethernet_interface
+            && let Some(idx) = ethernet_names.iter().position(|n| n == iface)
+        {
+            ui.set_selected_ethernet(idx as i32);
         }
         #[cfg(feature = "tashtalk")]
         if let Some(ref port) = config.tashtalk_port {
