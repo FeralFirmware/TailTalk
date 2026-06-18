@@ -718,10 +718,9 @@ impl TalkStack {
         adsp::Adsp::connect(&self.ddp, remote_addr).await
     }
 
-    /// Create a PAP client backed by two fresh ATP sockets.
+    /// Create a PAP client backed by a single ATP socket.
     pub async fn pap_client(&self) -> pap::PapClient {
-        let (_, atp_requestor, _) = atp::Atp::spawn(&self.ddp, None).await;
-        let (_, _, atp_responder) = atp::Atp::spawn(&self.ddp, None).await;
+        let (_, atp_requestor, atp_responder) = atp::Atp::spawn(&self.ddp, None).await;
         pap::PapClient::new(atp_requestor, atp_responder)
     }
 

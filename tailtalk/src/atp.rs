@@ -140,15 +140,38 @@ impl AtpReceivedRequest {
             })
             .collect();
 
-        // Always send at least one packet (e.g. empty ASP OpenSession replies)
+        // ATP requires at least one TResp even for zero-length data.
         if packets.is_empty() {
-            packets.push(AtpResponse {
-                data: vec![],
-                user_bytes,
-            });
+            packets.push(AtpResponse { data: vec![], user_bytes });
         }
 
-        // Send via internal method
+        self.send_response_internal(packets).await
+    }
+
+    /// Send a response fragmented at `chunk_size` bytes per ATP packet.
+    ///
+    /// Use this when the protocol layer imposes a stricter per-packet limit than
+    /// `ATP_MAX_DATA_PER_PACKET`. PAP, for example, caps each packet at 512 bytes.
+    pub async fn send_response_chunked(
+        &self,
+        data: Vec<u8>,
+        user_bytes: [u8; 4],
+        chunk_size: usize,
+    ) -> Result<(), io::Error> {
+        assert!(chunk_size > 0, "chunk_size must be positive");
+        let effective_bitmap = if self.bitmap == 0x00 { 0xFF } else { self.bitmap };
+        let max_packets = (effective_bitmap.count_ones() as usize).clamp(1, 8);
+        let max_data = max_packets * chunk_size;
+
+        let mut packets: Vec<AtpResponse> = data[..data.len().min(max_data)]
+            .chunks(chunk_size)
+            .map(|chunk| AtpResponse { data: chunk.to_vec(), user_bytes })
+            .collect();
+
+        if packets.is_empty() {
+            packets.push(AtpResponse { data: vec![], user_bytes });
+        }
+
         self.send_response_internal(packets).await
     }
 

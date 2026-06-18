@@ -237,6 +237,7 @@ async fn test_pap_print_job() {
             connection_id: conn_id,
             function: PapFunction::OpenConnReply,
             sequence_num: 0,
+            eof: false,
             data: vec![130, 8, 0, 0], // Socket=130, Flow=8, Result=0
         };
         let (ub, d) = reply.to_atp_parts();
@@ -272,6 +273,7 @@ async fn test_pap_print_job() {
         connection_id: conn_id,
         function: PapFunction::SendData,
         sequence_num: 1,
+        eof: false,
         data: vec![],
     };
     let (ub, d) = send_data_pkt.to_atp_parts();

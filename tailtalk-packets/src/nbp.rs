@@ -56,7 +56,7 @@ pub struct NbpTuple {
 }
 
 /// Represents an entity name in NBP.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct EntityName {
     pub object: String,      // Object name
     pub entity_type: String, // Type of the entity (e.g., service type)

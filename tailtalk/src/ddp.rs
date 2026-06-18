@@ -52,6 +52,12 @@ pub struct DdpSocket {
     sender: mpsc::Sender<DdpCommand>,
 }
 
+impl Drop for DdpSocket {
+    fn drop(&mut self) {
+        let _ = self.sender.try_send(DdpCommand::Deregister(self.sock_num));
+    }
+}
+
 impl DdpSocket {
     pub async fn recv(&mut self) -> Result<Packet, io::Error> {
         let res = self
@@ -146,6 +152,9 @@ impl DdpProcessor {
                 DdpCommand::SendPkt(pkt) => {
                     self.handle_outbound(pkt).await;
                 }
+                DdpCommand::Deregister(sock_num) => {
+                    self.sockets.remove(&sock_num);
+                }
             }
         }
     }
@@ -155,13 +164,25 @@ impl DdpProcessor {
         protocol: DdpProtocolType,
         sock_num: Option<SockNum>,
     ) -> Result<DdpSocket, io::Error> {
-        let sock_num = sock_num.unwrap_or_else(|| {
-            rand::rng().random_range(64..=255)
-        });
-
-        if self.sockets.contains_key(&sock_num) {
-            return Err(io::Error::from(io::ErrorKind::AddrInUse));
-        }
+        let sock_num = if let Some(n) = sock_num {
+            if self.sockets.contains_key(&n) {
+                return Err(io::Error::from(io::ErrorKind::AddrInUse));
+            }
+            n
+        } else {
+            let mut rng = rand::rng();
+            let mut candidate = rng.random_range(64u8..=255);
+            for _ in 0..192u16 {
+                if !self.sockets.contains_key(&candidate) {
+                    break;
+                }
+                candidate = rng.random_range(64..=255);
+            }
+            if self.sockets.contains_key(&candidate) {
+                return Err(io::Error::from(io::ErrorKind::AddrInUse));
+            }
+            candidate
+        };
 
         let (tx, rx) = mpsc::channel(100);
         let sock = DdpSocket {
@@ -387,6 +408,7 @@ enum DdpCommand {
     NewSocket(SockArgs),
     ReceivedPkt(DdpPacket),
     SendPkt(OutboundPacket),
+    Deregister(SockNum),
 }
 
 #[derive(Clone)]
