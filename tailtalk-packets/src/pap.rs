@@ -53,8 +53,10 @@ impl TryFrom<u8> for PapFunction {
 pub struct PapPacket {
     pub connection_id: u8,
     pub function: PapFunction,
+    /// Sequence number. Meaningful only for `SendData` (ATP user bytes 2-3, big-endian).
+    /// Ignored on serialization for all other functions; always decoded as 0.
     pub sequence_num: u16,
-    /// End-of-file flag; only meaningful for Data packets.
+    /// End-of-file flag; only meaningful for `Data` packets.
     pub eof: bool,
     pub data: Vec<u8>,
 }

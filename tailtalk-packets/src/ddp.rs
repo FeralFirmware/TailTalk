@@ -147,7 +147,8 @@ impl DdpPacket {
             });
         }
 
-        BigEndian::write_u16(buf, ((self.hop_count as u16 & 0xF) << 2) | self.len as u16);
+        // Bits 13-10: hop_count (4 bits); bits 9-0: DDP length (10 bits).
+        BigEndian::write_u16(buf, ((self.hop_count as u16 & 0xF) << 10) | (self.len as u16 & 0x3FF));
         BigEndian::write_u16(&mut buf[2..], self.chksum);
         BigEndian::write_u16(&mut buf[4..], self.dest_network_num);
         BigEndian::write_u16(&mut buf[6..], self.src_network_num);

@@ -155,14 +155,14 @@ impl TryFrom<&str> for EntityName {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         let first_index = value
-            .find(":")
+            .find(':')
             .ok_or("malformed entity name - missing : separator")?;
         let second_index = value
-            .find("@")
+            .find('@')
             .ok_or("malformed entity name - missing @ separator")?;
 
         if first_index > second_index {
-            return Err("malformed entity name - : was found before @");
+            return Err("malformed entity name - : was found after @");
         }
 
         let object = &value[..first_index];
@@ -292,14 +292,12 @@ impl EntityName {
 
     pub fn fully_qualified(&self) -> bool {
         const LOOKUP_FLAGS: [char; 3] = ['*', '=', '≈'];
-
-        for flag in LOOKUP_FLAGS {
-            if self.object.contains(flag) || self.entity_type.contains(flag) || self.zone != "*" {
-                return false;
-            }
-        }
-
-        true
+        // Object and type must not contain wildcard characters.
+        // Zone is allowed to be "*" (meaning "my current zone") since that is the standard
+        // AppleTalk convention for service registration; the router resolves the real zone.
+        !LOOKUP_FLAGS
+            .iter()
+            .any(|&f| self.object.contains(f) || self.entity_type.contains(f))
     }
 }
 

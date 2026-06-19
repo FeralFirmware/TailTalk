@@ -360,17 +360,21 @@ impl Asp {
                                     };
 
                                     if sess.command_tx.send(command).await.is_ok() {
-                                        // Wait for reply from application
-                                        if let Ok(reply_data) = reply_rx.await {
-                                            let _ = req
-                                                .send_response(reply_data.data, reply_data.result)
-                                                .await;
-                                        } else {
-                                            tracing::warn!(
-                                                "ASP Command for session {}: application dropped reply channel",
-                                                session_id
-                                            );
-                                        }
+                                        // Spawn the reply wait so the select! loop stays
+                                        // responsive to other sessions while AFP processes
+                                        // this command (which may involve disk I/O).
+                                        tokio::spawn(async move {
+                                            if let Ok(reply_data) = reply_rx.await {
+                                                let _ = req
+                                                    .send_response(reply_data.data, reply_data.result)
+                                                    .await;
+                                            } else {
+                                                tracing::warn!(
+                                                    "ASP Command for session {}: application dropped reply channel",
+                                                    session_id
+                                                );
+                                            }
+                                        });
                                     } else {
                                         tracing::warn!(
                                             "ASP Command for session {}: session channel closed",
