@@ -510,10 +510,10 @@ fn main() -> anyhow::Result<()> {
     });
 
     let ui_weak = ui.as_weak();
-    let rt_handle_sit = rt_handle.clone();
-    ui.on_import_stuffit(move || {
+    let rt_handle_imp = rt_handle.clone();
+    ui.on_import_files(move || {
         let ui_weak = ui_weak.clone();
-        let rt_handle_sit = rt_handle_sit.clone();
+        let rt_handle_imp = rt_handle_imp.clone();
 
         let volume_path = {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -525,100 +525,87 @@ fn main() -> anyhow::Result<()> {
             return;
         }
 
-        rt_handle_sit.spawn(async move {
+        rt_handle_imp.spawn(async move {
             let Some(handle) = rfd::AsyncFileDialog::new()
                 .add_filter("StuffIt Archive", &["sit"])
-                .set_title("Import StuffIt Archive")
+                .add_filter("Floppy Disk Image", &["dsk", "img", "hfs", "image"])
+                .add_filter("BinHex Archive", &["hqx"])
+                .set_title("Import Archive/Disk Image")
                 .pick_file()
                 .await
             else {
                 return;
             };
-            let sit_path = handle.path().to_path_buf();
+            let file_path = handle.path().to_path_buf();
 
-            {
-                let ui_weak = ui_weak.clone();
-                slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_weak.upgrade() {
-                        ui.set_import_progress_value(0.0);
-                        ui.set_import_progress_label("Starting…".into());
-                        ui.set_import_progress_visible(true);
-                    }
-                })
-                .ok();
-            }
+            let ext = file_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase());
 
-            let ui_progress = ui_weak.clone();
-            let result = extract_sit(&sit_path, &volume_path, move |done, total| {
-                let ui_weak = ui_progress.clone();
-                slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_weak.upgrade() {
-                        ui.set_import_progress_value(done as f32 / total as f32);
-                        ui.set_import_progress_label(format!("{done} of {total}").into());
-                    }
-                })
-                .ok();
-            })
-            .await;
-
-            match result {
-                Ok(count) => {
-                    let msg =
-                        format!("Extracted {count} file(s) from the archive successfully.");
+            if ext.as_deref() == Some("hqx") {
+                match extract_hqx(&file_path, &volume_path).await {
+                    Ok(()) => show_info(
+                        ui_weak,
+                        "Imported file from BinHex archive successfully.".to_string(),
+                    ),
+                    Err(e) => show_error(ui_weak, e),
+                }
+            } else if ext.as_deref() == Some("sit") {
+                {
+                    let ui_weak = ui_weak.clone();
                     slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_weak.upgrade() {
-                            ui.set_import_progress_visible(false);
-                            ui.set_info_message(msg.into());
+                            ui.set_import_progress_value(0.0);
+                            ui.set_import_progress_label("Starting…".into());
+                            ui.set_import_progress_visible(true);
                         }
                     })
                     .ok();
                 }
-                Err(e) => {
+
+                let ui_progress = ui_weak.clone();
+                let result = extract_sit(&file_path, &volume_path, move |done, total| {
+                    let ui_weak = ui_progress.clone();
                     slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_weak.upgrade() {
-                            ui.set_import_progress_visible(false);
-                            ui.set_error_message(e.into());
+                            ui.set_import_progress_value(done as f32 / total as f32);
+                            ui.set_import_progress_label(format!("{done} of {total}").into());
                         }
                     })
                     .ok();
+                })
+                .await;
+
+                match result {
+                    Ok(count) => {
+                        let msg = format!("Extracted {count} file(s) from the archive successfully.");
+                        slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_weak.upgrade() {
+                                ui.set_import_progress_visible(false);
+                                ui.set_info_message(msg.into());
+                            }
+                        })
+                        .ok();
+                    }
+                    Err(e) => {
+                        slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_weak.upgrade() {
+                                ui.set_import_progress_visible(false);
+                                ui.set_error_message(e.into());
+                            }
+                        })
+                        .ok();
+                    }
                 }
-            }
-        });
-    });
-
-    let ui_weak = ui.as_weak();
-    let rt_handle_hfs = rt_handle.clone();
-    ui.on_import_hfs_image(move || {
-        let ui_weak = ui_weak.clone();
-        let rt_handle_hfs = rt_handle_hfs.clone();
-
-        let volume_path = {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            PathBuf::from(ui.get_volume_path().as_str())
-        };
-
-        if volume_path.as_os_str().is_empty() {
-            show_error(ui_weak, "Please set a volume path before importing.".to_string());
-            return;
-        }
-
-        rt_handle_hfs.spawn(async move {
-            let Some(handle) = rfd::AsyncFileDialog::new()
-                .add_filter("HFS Disk Image", &["dsk", "img", "hfs", "image"])
-                .set_title("Import HFS Disk Image")
-                .pick_file()
-                .await
-            else {
-                return;
-            };
-            let img_path = handle.path().to_path_buf();
-
-            match extract_hfs_image(&img_path, &volume_path).await {
-                Ok(count) => show_info(
-                    ui_weak,
-                    format!("Imported {count} file(s) from the HFS image successfully."),
-                ),
-                Err(e) => show_error(ui_weak, e),
+            } else {
+                match extract_hfs_image(&file_path, &volume_path).await {
+                    Ok(count) => show_info(
+                        ui_weak,
+                        format!("Imported {count} file(s) from the HFS image successfully."),
+                    ),
+                    Err(e) => show_error(ui_weak, e),
+                }
             }
         });
     });
@@ -1263,6 +1250,84 @@ async fn extract_sit(
     }
 
     Ok(file_count)
+}
+
+// ── BinHex extraction ─────────────────────────────────────────────────────────
+
+/// Extracts a BinHex 4.0 (.hqx) file into the volume. BinHex always wraps a
+/// single file, so we just drop it straight into `volume_path` using whatever
+/// name the archive says it should have. The resource fork (if any) goes into
+/// the usual TailTalk sidecar location, and we write the type/creator to xattr
+/// so the Mac sees the right Finder info.
+async fn extract_hqx(hqx_path: &Path, volume_path: &Path) -> Result<(), String> {
+    let bytes = tokio::fs::read(hqx_path).await
+        .map_err(|e| format!("Failed to read BinHex archive: {e}"))?;
+
+    let mut archive = binhex::Archive::try_from(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("Failed to parse BinHex archive: {e}"))?;
+
+    let name = archive.name().to_string();
+    let file_type: [u8; 4] = u32::from(archive.file_code()).to_be_bytes();
+    let creator: [u8; 4] = u32::from(archive.creator_code()).to_be_bytes();
+
+    let mut data_fork = Vec::with_capacity(archive.data_len());
+    std::io::copy(
+        &mut archive.data_fork().map_err(|e| format!("Failed to read data fork: {e}"))?,
+        &mut data_fork,
+    )
+    .map_err(|e| format!("Failed to read data fork: {e}"))?;
+
+    let mut rsrc_fork = Vec::with_capacity(archive.resource_len());
+    std::io::copy(
+        &mut archive.resource_fork().map_err(|e| format!("Failed to read resource fork: {e}"))?,
+        &mut rsrc_fork,
+    )
+    .map_err(|e| format!("Failed to read resource fork: {e}"))?;
+
+    let safe_name: PathBuf = name
+        .split(['/', ':'])
+        .filter(|c| !c.is_empty() && *c != "." && *c != "..")
+        .collect();
+
+    if safe_name.as_os_str().is_empty() {
+        return Err("BinHex archive contains no usable file name".to_string());
+    }
+
+    let dest = volume_path.join(&safe_name);
+    if let Some(parent) = dest.parent()
+        && parent != volume_path
+    {
+        tokio::fs::create_dir_all(parent).await
+            .map_err(|e| format!("Failed to create parent directory: {e}"))?;
+    }
+
+    tokio::fs::write(&dest, &data_fork).await
+        .map_err(|e| format!("Failed to write '{}': {e}", dest.display()))?;
+
+    let finder_info = tailtalk::afp::FinderInfo {
+        file_type,
+        creator,
+        ..Default::default()
+    };
+    if let Err(e) = tailtalk::afp::write_finder_info(&dest, &finder_info).await {
+        tracing::warn!("Could not set FinderInfo for '{}': {e}", dest.display());
+    }
+
+    if !rsrc_fork.is_empty() {
+        let rsrc_dest = volume_path.join(".tailtalk").join("rsrc").join(&safe_name);
+        if let Some(parent) = rsrc_dest.parent() {
+            tokio::fs::create_dir_all(parent).await
+                .map_err(|e| format!("Failed to create rsrc dir: {e}"))?;
+        }
+        tokio::fs::write(&rsrc_dest, &rsrc_fork).await
+            .map_err(|e| format!("Failed to write resource fork for '{}': {e}", dest.display()))?;
+
+        if let Err(e) = register_appl_from_resource_fork(&rsrc_fork, &safe_name, volume_path) {
+            tracing::warn!("Could not register APPL for '{}': {e}", dest.display());
+        }
+    }
+
+    Ok(())
 }
 
 // ── HFS disk image extraction ─────────────────────────────────────────────────

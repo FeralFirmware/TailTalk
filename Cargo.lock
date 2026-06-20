@@ -314,6 +314,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "array-init"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d62b7694a562cdf5a74227903507c56ab2cc8bdd1f781ed5cb4cf9c9f810bfc"
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -624,6 +630,44 @@ dependencies = [
  "regex",
  "rustc-hash 2.1.2",
  "shlex",
+ "syn",
+]
+
+[[package]]
+name = "binhex-rs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1566c65f8d1a993bb340258f25ff5561dc1cb467d0e9a67ae90ab1c0e9b926b5"
+dependencies = [
+ "binrw",
+ "crc",
+ "fourcc-rs",
+ "log",
+ "macintosh-utils",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "binrw"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d53195f985e88ab94d1cc87e80049dd2929fd39e4a772c5ae96a7e5c4aad3642"
+dependencies = [
+ "array-init",
+ "binrw_derive",
+ "bytemuck",
+]
+
+[[package]]
+name = "binrw_derive"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5910da05ee556b789032c8ff5a61fb99239580aa3fd0bfaa8f4d094b2aee00ad"
+dependencies = [
+ "either",
+ "owo-colors",
+ "proc-macro2",
+ "quote",
  "syn",
 ]
 
@@ -1182,6 +1226,21 @@ checksum = "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "crc"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
+dependencies = [
+ "crc-catalog",
+]
+
+[[package]]
+name = "crc-catalog"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
 name = "crc32fast"
@@ -1857,6 +1916,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fourcc-rs"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd6d4455339ea4eaf43266293511b372bdc08351a9f4085dba56b8eb11d588d"
+dependencies = [
+ "binrw",
+ "fourcc-rs-macros",
+ "serde",
+]
+
+[[package]]
+name = "fourcc-rs-macros"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2af9c22f4348a9858a604ca2a973444a8b7ce952b59d1c642acfabb5777af974"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -3200,6 +3281,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "macintosh-utils"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8c38010014f404cb90c5c72132ae3065e59912a090d48f8d30b585cdc397c51"
+dependencies = [
+ "binrw",
+ "bitflags 2.11.0",
+ "chrono",
+ "encoding_rs",
+ "fourcc-rs",
+]
+
+[[package]]
 name = "magic-db"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3978,6 +4072,12 @@ checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
 dependencies = [
  "ttf-parser 0.25.1",
 ]
+
+[[package]]
+name = "owo-colors"
+version = "4.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d211803b9b6b570f68772237e415a029d5a50c65d382910b879fb19d3271f94d"
 
 [[package]]
 name = "pap-print-example"
@@ -5528,6 +5628,7 @@ name = "tailtalk-gui"
 version = "0.5.2"
 dependencies = [
  "anyhow",
+ "binhex-rs",
  "dirs",
  "hfs-reader",
  "if-addrs",

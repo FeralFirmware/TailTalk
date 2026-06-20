@@ -15,6 +15,7 @@ ethertalk = ["dep:if-addrs", "tailtalk/ethertalk"]
 
 [dependencies]
 anyhow = { workspace = true } #unified
+binhex-rs = "0.1.1"
 dirs = "6"
 hfs-reader = { workspace = true } #unified
 if-addrs = { version = "0.15", optional = true }

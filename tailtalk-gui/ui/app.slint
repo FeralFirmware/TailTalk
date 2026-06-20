@@ -42,8 +42,7 @@ export component AppWindow inherits Window {
     callback start-stop();
     callback browse-volume();
     callback browse-pcap();
-    callback import-stuffit();
-    callback import-hfs-image();
+    callback import-files();
     callback inspect-finder-info();
     callback save-finder-info();
     callback open-log-dir();
@@ -54,12 +53,8 @@ export component AppWindow inherits Window {
         Menu {
             title: "File";
             MenuItem {
-                title: "Import StuffIt Archive…";
-                activated => { root.import-stuffit(); }
-            }
-            MenuItem {
-                title: "Import HFS Disk Image…";
-                activated => { root.import-hfs-image(); }
+                title: "Import Archive/Disk Image…";
+                activated => { root.import-files(); }
             }
             MenuItem {
                 title: "Inspect Finder Info…";
