@@ -70,6 +70,15 @@ impl DdpSocket {
     }
 
     pub async fn send_to(&self, buf: &[u8], addr: DdpAddress) -> Result<(), Error> {
+        self.send_to_typed(buf, addr, self.protocol).await
+    }
+
+    pub async fn send_to_typed(
+        &self,
+        buf: &[u8],
+        addr: DdpAddress,
+        protocol: DdpProtocolType,
+    ) -> Result<(), Error> {
         if buf.len() > 586 {
             tracing::error!(
                 "DDP payload length {} exceeds maximum allowed (586 bytes)",
@@ -88,7 +97,7 @@ impl DdpSocket {
             dest: addr,
             payload: buf.into(),
             src_sock: self.sock_num,
-            protocol: self.protocol,
+            protocol,
         };
         self.sender
             .send(DdpCommand::SendPkt(pkt))

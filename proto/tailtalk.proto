@@ -1,0 +1,81 @@
+syntax = "proto3";
+package tailtalk;
+
+message AtalkAddr {
+  uint32 net  = 1;
+  uint32 node = 2;
+}
+
+enum IfaceKind {
+  LOCALTALK = 0;
+  ETHERTALK = 1;
+}
+
+enum EtherTalkPhase {
+  PHASE_2 = 0;
+  PHASE_1 = 1;
+}
+
+message IfaceInfo {
+  string         name   = 1;
+  IfaceKind      kind   = 2;
+  optional EtherTalkPhase phase  = 3;
+  AtalkAddr      addr   = 4;
+  uint32         net_lo = 5;
+  uint32         net_hi = 6;
+  string         zone   = 7;
+}
+
+message Command {
+  oneof msg {
+    Open       open        = 1;
+    Opened     opened      = 2;
+    Send       send        = 3;
+    Recv       recv        = 4;
+    SetAddr    set_addr    = 5;
+    SetAddrOk  set_addr_ok = 6;
+    ListIfaces list_ifaces = 7;
+    IfaceList  iface_list  = 8;
+  }
+}
+
+message Open {
+  uint32    port      = 1;
+  AtalkAddr hint      = 2;
+  string    interface = 3;
+}
+
+message Opened {
+  uint32    port = 1;
+  AtalkAddr addr = 2;
+}
+
+message Send {
+  AtalkAddr dest      = 1;
+  uint32    dest_port = 2;
+  uint32    ddptype   = 3;
+  bytes     payload   = 4;
+  string    interface = 5;
+}
+
+message Recv {
+  AtalkAddr src       = 1;
+  uint32    src_port  = 2;
+  uint32    ddptype   = 3;
+  bytes     payload   = 4;
+  string    interface = 5;
+}
+
+message SetAddr {
+  uint32 hint_node = 1;
+}
+
+message SetAddrOk {
+  uint32 node = 1;
+}
+
+message ListIfaces {}
+
+message IfaceList {
+  repeated IfaceInfo ifaces = 1;
+}

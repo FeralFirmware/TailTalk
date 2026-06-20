@@ -1,0 +1,24 @@
+[package]
+name = "tailtalk-broker"
+version.workspace = true
+edition = "2024"
+description = "DDP broker daemon: owns the TashTalk USB (LocalTalk) transport and multiplexes DDP sockets across multiple netatalk processes via a Unix domain socket"
+license-file = "../LICENSE"
+
+[[bin]]
+name = "tailtalk-broker"
+path = "src/main.rs"
+
+[dependencies]
+tailtalk = { workspace = true }
+tailtalk-packets = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "^0.3", features = ["env-filter"] }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+prost-build = "^0.13"

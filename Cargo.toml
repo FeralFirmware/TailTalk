@@ -2,6 +2,7 @@
 members = [
   "tailtalk-packets",
   "tailtalk",
+  "tailtalk-broker",
   "examples/nbp-lookup",
   "examples/aep-echo",
   "examples/pap-print",
@@ -15,6 +16,8 @@ resolver = "3"
 
 [workspace.dependencies]
 anyhow = "^1.0.102" #unified
+prost = "^0.13"
+libc = "^0.2" #unified
 byteorder = "^1.5.0" #unified
 bytes = "^1.11.1" #unified
 clap = { version = "^4.6.0", features = ["derive"] } #unified
