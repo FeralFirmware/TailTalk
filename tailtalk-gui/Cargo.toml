@@ -11,14 +11,17 @@ path = "main.rs"
 [features]
 default = ["tashtalk"]
 tashtalk = ["dep:serialport"]
-ethertalk = ["dep:if-addrs", "tailtalk/ethertalk"]
+ethertalk = ["tailtalk/ethertalk"]
 
 [dependencies]
 anyhow = { workspace = true } #unified
+axum = "0.8.9"
 binhex-rs = "0.1.1"
 dirs = "6"
 hfs-reader = { workspace = true } #unified
-if-addrs = { version = "0.15", optional = true }
+if-addrs = "0.15"
+ipp = "6.0.1"
+mdns-sd = "0.20.0"
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serialport = { version = "4", optional = true }

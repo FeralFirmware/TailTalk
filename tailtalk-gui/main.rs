@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(any(feature = "ethertalk", feature = "tashtalk"))]
 use std::rc::Rc;
@@ -15,6 +16,8 @@ use tracing_subscriber::{EnvFilter, prelude::*};
 
 slint::include_modules!();
 
+mod ipp_bridge;
+
 // ── Persisted user configuration ──────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Default)]
@@ -28,6 +31,7 @@ struct AppConfig {
     ethernet_interface: Option<String>,
     pcap_enabled: bool,
     pcap_path: Option<String>,
+    ipp_bridge_enabled: bool,
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -63,6 +67,7 @@ enum ServerCommand {
         tashtalk: Option<String>,
         volume: PathBuf,
         pcap_path: Option<PathBuf>,
+        ipp_bridge_enabled: bool,
     },
     Stop,
 }
@@ -190,6 +195,9 @@ fn open_in_file_manager(path: &Path) {
 
 fn main() -> anyhow::Result<()> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ServerCommand>(4);
+    // Shared handle used to shut the stack down when the window closes.
+    let active_handle: Arc<tokio::sync::Mutex<Option<ShutdownHandle>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
 
     let (_log_guard, log_dir) = init_logging();
 
@@ -263,10 +271,11 @@ fn main() -> anyhow::Result<()> {
         if let Some(ref path) = config.pcap_path {
             ui.set_pcap_path(path.as_str().into());
         }
+        ui.set_ipp_bridge_enabled(config.ipp_bridge_enabled);
     }
 
     let ui_handle = ui.as_weak();
-    rt_handle.spawn(server_loop(cmd_rx, ui_handle));
+    rt_handle.spawn(server_loop(cmd_rx, ui_handle, active_handle.clone()));
 
     let ui_weak = ui.as_weak();
     #[cfg(feature = "ethertalk")]
@@ -319,6 +328,41 @@ fn main() -> anyhow::Result<()> {
                 return;
             }
 
+            if ui.get_ipp_bridge_enabled() {
+                let gs_ok = ipp_bridge::gs_probe();
+                if !gs_ok {
+                    #[cfg(target_os = "macos")]
+                    let hint = "Please install it via \"brew install ghostscript\".";
+                    #[cfg(target_os = "linux")]
+                    let hint = "Please install it via \"sudo apt install ghostscript\" or your distro's equivalent.";
+                    #[cfg(target_os = "windows")]
+                    let hint = "Please install it from https://www.ghostscript.com/releases/gsdnld.html and ensure gswin64c or gs is in your PATH.";
+                    show_error(
+                        ui_weak.clone(),
+                        format!("Ghostscript is required for the LaserWriter printing bridge but was not found.\n{hint}"),
+                    );
+                    return;
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let ippeveps_ok = std::process::Command::new("ippeveps")
+                        .stdout(std::process::Stdio::null())
+                        // ippeveps exits with an error when no CONTENT_TYPE is set, but that
+                        // still means it's present — check for spawn failure instead.
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .is_ok();
+                    if !ippeveps_ok {
+                        show_error(
+                            ui_weak.clone(),
+                            "ippeveps is required for the LaserWriter printing bridge on Linux but was not found.\n\
+                            Please install it via \"sudo apt install cups-ipp-utils\".".to_string(),
+                        );
+                        return;
+                    }
+                }
+            }
+
             save_config(&AppConfig {
                 server_name: Some(ui.get_server_name().to_string()),
                 volume_name: Some(ui.get_volume_name().to_string()),
@@ -340,6 +384,7 @@ fn main() -> anyhow::Result<()> {
                     let s = ui.get_pcap_path().to_string();
                     if s.is_empty() { None } else { Some(s) }
                 },
+                ipp_bridge_enabled: ui.get_ipp_bridge_enabled(),
             });
 
             let pcap_path: Option<PathBuf> = if ui.get_pcap_enabled() {
@@ -358,6 +403,7 @@ fn main() -> anyhow::Result<()> {
                 tashtalk,
                 volume,
                 pcap_path,
+                ipp_bridge_enabled: ui.get_ipp_bridge_enabled(),
             });
         }
     });
@@ -660,6 +706,14 @@ fn main() -> anyhow::Result<()> {
     };
 
     ui.run()?;
+
+    // Window closed — shut down any active stack so mDNS goodbye packets are sent.
+    rt.block_on(async {
+        if let Some(h) = active_handle.lock().await.take() {
+            h.graceful_shutdown().await;
+        }
+    });
+
     Ok(())
 }
 
@@ -668,6 +722,7 @@ fn main() -> anyhow::Result<()> {
 async fn server_loop(
     mut cmd_rx: tokio::sync::mpsc::Receiver<ServerCommand>,
     ui_weak: slint::Weak<AppWindow>,
+    active: Arc<tokio::sync::Mutex<Option<ShutdownHandle>>>,
 ) {
     let mut shutdown_handle: Option<ShutdownHandle> = None;
 
@@ -682,13 +737,15 @@ async fn server_loop(
                 tashtalk,
                 volume,
                 pcap_path,
+                ipp_bridge_enabled,
             } => {
                 if let Some(h) = shutdown_handle.take() {
+                    active.lock().await.take();
                     h.graceful_shutdown().await;
                 }
 
                 let ui_w = ui_weak.clone();
-                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<ShutdownHandle>();
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<(ShutdownHandle, ShutdownHandle)>();
                 tokio::spawn(run_server(
                     server_name,
                     volume_name,
@@ -698,13 +755,15 @@ async fn server_loop(
                     tashtalk,
                     volume,
                     pcap_path,
+                    ipp_bridge_enabled,
                     ready_tx,
                     ui_w.clone(),
                 ));
 
                 // Wait for the stack to finish initialising (AARP probe etc.)
                 // before flipping the UI to "Running".
-                if let Ok(handle) = ready_rx.await {
+                if let Ok((handle, extra)) = ready_rx.await {
+                    *active.lock().await = Some(extra);
                     shutdown_handle = Some(handle);
                     slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_w.upgrade() {
@@ -719,6 +778,7 @@ async fn server_loop(
 
             ServerCommand::Stop => {
                 if let Some(h) = shutdown_handle.take() {
+                    active.lock().await.take();
                     h.graceful_shutdown().await;
                 }
                 let ui_w = ui_weak.clone();
@@ -1470,7 +1530,8 @@ async fn run_server(
     #[cfg(feature = "tashtalk")] tashtalk: Option<String>,
     volume: PathBuf,
     pcap_path: Option<PathBuf>,
-    ready_tx: tokio::sync::oneshot::Sender<ShutdownHandle>,
+    ipp_bridge_enabled: bool,
+    ready_tx: tokio::sync::oneshot::Sender<(ShutdownHandle, ShutdownHandle)>,
     ui_weak: slint::Weak<AppWindow>,
 ) {
     use tailtalk::{
@@ -1582,6 +1643,14 @@ async fn run_server(
         }
     };
 
+    if ipp_bridge_enabled {
+        tokio::spawn(ipp_bridge::run(
+            stack.nbp.clone(),
+            stack.ddp.clone(),
+            stack.token(),
+        ));
+    }
+
     #[cfg(any(feature = "ethertalk", feature = "tashtalk"))]
     {
         #[cfg(all(feature = "ethertalk", feature = "tashtalk"))]
@@ -1598,8 +1667,9 @@ async fn run_server(
         tracing::info!("AFP server running on {transport_desc}");
     }
 
-    // Signal the GUI that the stack is up; hand over the shutdown handle.
-    let _ = ready_tx.send(stack.shutdown_handle());
+    // Signal the GUI that the stack is up; hand over two shutdown handles —
+    // one for server_loop (Stop button), one held by main for window-close cleanup.
+    let _ = ready_tx.send((stack.shutdown_handle(), stack.shutdown_handle()));
 
     // Block until shutdown() is called (e.g. the user clicks Stop).
     stack.wait_for_shutdown().await;

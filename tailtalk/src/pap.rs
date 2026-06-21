@@ -109,6 +109,8 @@ impl PapClient {
         self.print_stream(std::io::Cursor::new(data)).await
     }
 
+    /// Stream `source` to the printer.  Call [`read_response`] afterwards to
+    /// collect any printer stdout output (errors, page stats) buffered until job end.
     pub async fn print_stream<R: AsyncRead + Unpin>(&mut self, mut source: R) -> Result<()> {
         tracing::info!("PAP: Starting streaming print job");
 
@@ -116,6 +118,8 @@ impl PapClient {
         let mut tickle_interval = interval(Duration::from_secs(30));
         tickle_interval.tick().await; // skip the immediate first tick
         let mut eof_sent = false;
+        // Skip the 30-s Tickle wait after EOF; return on the next printer SendData or a short deadline.
+        let mut eof_deadline: Option<tokio::time::Instant> = None;
 
         loop {
             tokio::select! {
@@ -152,19 +156,24 @@ impl PapClient {
                                 (n, buf)
                             };
 
+                            let eof = n == 0;
                             let pap_resp = PapPacket {
                                 connection_id: self.connection_id,
                                 function: PapFunction::Data,
                                 sequence_num: seq_num,
-                                eof: n == 0,
+                                eof,
                                 data: buf,
                             };
                             let (user_bytes, chunk_data) = pap_resp.to_atp_parts();
                             req.send_response_chunked(chunk_data.to_vec(), user_bytes, PAP_MAX_DATA_PER_PACKET).await?;
 
-                            if n == 0 && !eof_sent {
+                            if eof && !eof_sent {
                                 tracing::info!("PAP: EOF sent");
                                 eof_sent = true;
+                                eof_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(500));
+                            } else if eof_sent {
+                                // Drained the in-flight SendData after our EOF; safe to return.
+                                return Ok(());
                             }
                         }
                         PapFunction::Tickle => {
@@ -207,6 +216,16 @@ impl PapClient {
                     let (ub, _) = tickle.to_atp_parts();
                     let _ = self.atp_requestor.send_alo(self.server_addr, ub).await;
                 }
+
+                _ = async {
+                    match eof_deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // Short deadline after EOF elapsed with no further printer activity.
+                    return Ok(());
+                }
             }
         }
     }
@@ -235,11 +254,9 @@ impl PapClient {
             }
 
             response.extend_from_slice(&data_pkt.data);
-
             if data_pkt.eof {
                 break;
             }
-
             seq = seq.wrapping_add(1);
         }
 

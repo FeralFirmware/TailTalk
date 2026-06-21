@@ -1,10 +1,40 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tailtalk::{
     TalkStack,
     atp::AtpAddress,
 };
 use tailtalk_packets::nbp::EntityName;
 use tokio::time::Duration;
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum PaperSize {
+    Letter,
+    A4,
+    Legal,
+    Executive,
+    B5,
+}
+
+impl PaperSize {
+    fn points(self) -> (u32, u32) {
+        match self {
+            PaperSize::Letter    => (612, 792),
+            PaperSize::A4        => (595, 842),
+            PaperSize::Legal     => (612, 1008),
+            PaperSize::Executive => (522, 756),
+            PaperSize::B5        => (516, 729),
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            PaperSize::Letter    => "Letter",
+            PaperSize::A4        => "A4",
+            PaperSize::Legal     => "Legal",
+            PaperSize::Executive => "Executive",
+            PaperSize::B5        => "B5",
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(about = "Print and query PAP-capable AppleTalk printers")]
@@ -45,6 +75,12 @@ enum Command {
     DumpStatusdict,
     /// Connect to the printer and immediately close the connection (for diagnostics)
     TestClose,
+    /// Permanently set the default paper size for the cassette tray (writes to NVRAM)
+    SetPaper {
+        /// Paper size to set
+        #[arg(value_enum)]
+        size: PaperSize,
+    },
 }
 
 #[tokio::main]
@@ -104,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
             let labels = &[
                 "Product", "PS Version", "Firmware Rev", "Resolution",
                 "RAM (bytes)", "Page count", "Page size (pts)", "AppleTalk type",
+                "Input trays", "Tray 0 paper (pts)", "Has manual feed",
             ];
 
             // All queries in one job. `stopped` isolates failures per entry; `printval`
@@ -126,6 +163,9 @@ async fn main() -> anyhow::Result<()> {
                  { statusdict begin pagecount end printval } stopped { (error) = } if\n\
                  { currentpagedevice /PageSize get printval } stopped { (error) = } if\n\
                  { statusdict /appletalktype get printval } stopped { (error) = } if\n\
+                 { currentpagedevice /InputAttributes get length = } stopped { (error) = } if\n\
+                 { currentpagedevice /InputAttributes get 0 get /PageSize get printval } stopped { (error) = } if\n\
+                 { currentpagedevice /ManualFeed known = } stopped { (error) = } if\n\
                  flush\n\
                  %%EOF\n";
 
@@ -141,7 +181,8 @@ async fn main() -> anyhow::Result<()> {
             client.close().await?;
 
             let response = String::from_utf8_lossy(&response_bytes);
-            let mut lines = response.lines();
+            // Filter PS status messages (%%[ ... ]%%) that shift line offsets.
+            let mut lines = response.lines().filter(|l| !l.trim_start().starts_with("%%["));
             for label in labels {
                 let value = lines.next().unwrap_or("no response");
                 println!("{label}: {}", if value.is_empty() { "no response" } else { value });
@@ -200,6 +241,44 @@ showpage
             client.close().await?;
 
             print!("{}", String::from_utf8_lossy(&response_bytes));
+        }
+
+        Command::SetPaper { size } => {
+            let (w, h) = size.points();
+            println!("Setting default paper size to {} ({}×{} pts)...", size.label(), w, h);
+
+            // Per developer note p.13: must set both /PageSize and /InputAttributes slot 0.
+            // exitserver (password 0) makes setpagedevice write to NVRAM.
+            let job = format!(
+                "%!PS-Adobe-3.0\n\
+                 %%EndComments\n\
+                 serverdict begin 0 exitserver\n\
+                 << /PageSize [{w} {h}] /InputAttributes << 0 << /PageSize [{w} {h}] >> >> >> setpagedevice\n\
+                 flush\n\
+                 %%EOF\n"
+            );
+
+            let mut client = stack.pap_client().await;
+            client.connect(printer_addr).await?;
+            client.print_stream(std::io::Cursor::new(job.as_bytes())).await?;
+
+            let response_bytes = tokio::time::timeout(
+                Duration::from_secs(15),
+                client.read_response(),
+            ).await.unwrap_or_else(|_| Ok(vec![]))?;
+
+            client.close().await?;
+
+            let response = String::from_utf8_lossy(&response_bytes);
+            let output: Vec<&str> = response.lines()
+                .filter(|l| !l.trim_start().starts_with("%%["))
+                .filter(|l| !l.trim().is_empty())
+                .collect();
+            if output.is_empty() {
+                println!("Done.");
+            } else {
+                println!("Printer responded:\n{}", output.join("\n"));
+            }
         }
 
         Command::TestClose => {

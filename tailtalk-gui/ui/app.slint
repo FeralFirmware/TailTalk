@@ -5,7 +5,7 @@ export component AppWindow inherits Window {
     min-width: 400px;
     min-height: 200px;
     preferred-width: 540px;
-    preferred-height: 440px;
+    preferred-height: 495px;
 
     in-out property <string> server-name: "TailTalk AFP";
     in property <[string]> ethernet-interfaces;
@@ -22,6 +22,7 @@ export component AppWindow inherits Window {
     in-out property <string> error-message: "";
     in-out property <bool> pcap-enabled: false;
     in-out property <string> pcap-path;
+    in-out property <bool> ipp-bridge-enabled: false;
     in-out property <string> info-message: "";
 
     in-out property <bool> import-progress-visible: false;
@@ -179,6 +180,21 @@ export component AppWindow inherits Window {
                         enabled: !root.running && root.pcap-enabled;
                         clicked => { root.browse-pcap(); }
                     }
+                }
+
+                // ── Printing ──────────────────────────────────────────────────
+                Rectangle { height: 8px; }
+                Text { text: "Printing (Experimental)"; font-weight: 700; }
+
+                HorizontalBox {
+                    padding-top: 0; padding-bottom: 0;
+                    Text { text: "IPP Bridge"; min-width: 140px; vertical-alignment: center; }
+                    CheckBox {
+                        checked <=> root.ipp-bridge-enabled;
+                        enabled: !root.running;
+                    }
+                    Text { text: "Expose printers via IPP (port 8631)"; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
                 }
             }
         }
