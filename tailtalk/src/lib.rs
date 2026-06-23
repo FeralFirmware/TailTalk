@@ -24,6 +24,7 @@ pub mod ddp;
 pub mod echo;
 pub mod nbp;
 pub mod pap;
+pub mod route_table;
 pub mod stylewriter;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -656,6 +657,9 @@ pub struct TalkStack {
     pub ddp: ddp::DdpHandle,
     pub nbp: nbp::NbpHandle,
     pub echo: echo::EchoHandle,
+    /// Shared routing table. Call `insert_route` / `insert_zone` on this to
+    /// program static routes before or after the stack is running.
+    pub route_table: route_table::RouteTable,
     /// Cancelled to signal top-of-stack services (AFP, ASP) to begin shutdown.
     service_token: CancellationToken,
     /// Cancelled to stop the transport (DDP, PacketProcessor). Only done after
@@ -852,9 +856,10 @@ impl TalkStackBuilder {
             None
         };
 
-        let ddp = ddp::DdpProcessor::spawn(et_addressing.clone(), lt_addressing.clone(), outbound);
+        let route_table = route_table::RouteTable::new(route_table::LearningMode::Static);
+        let ddp = ddp::DdpProcessor::spawn(et_addressing.clone(), lt_addressing.clone(), outbound, route_table.clone());
         let echo = echo::Echo::spawn(&ddp).await;
-        let nbp = nbp::Nbp::spawn(&ddp, et_addressing.clone(), lt_addressing.clone()).await;
+        let nbp = nbp::Nbp::spawn(&ddp, et_addressing.clone(), lt_addressing.clone(), route_table.clone()).await;
 
         let service_token = CancellationToken::new();
         let transport_token = CancellationToken::new();
@@ -869,7 +874,7 @@ impl TalkStackBuilder {
             lt.addr().await?;
         }
 
-        Ok(TalkStack { et_addressing, lt_addressing, ddp, nbp, echo, service_token, transport_token, services_done })
+        Ok(TalkStack { et_addressing, lt_addressing, ddp, nbp, echo, route_table, service_token, transport_token, services_done })
     }
 }
 

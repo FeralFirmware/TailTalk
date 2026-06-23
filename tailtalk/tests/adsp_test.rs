@@ -6,6 +6,7 @@ use tailtalk::{
     addressing::Addressing,
     adsp::{Adsp, AdspAddress},
     ddp::DdpProcessor,
+    route_table::{LearningMode, RouteTable},
 };
 use tailtalk_packets::aarp::AddressSource;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -66,7 +67,7 @@ impl TestClient {
         });
 
         let addressing = Addressing::spawn(Some(mac), outbound_handle.clone(), None, AddressSource::EtherTalkPhase2);
-        let ddp = DdpProcessor::spawn(Some(addressing.clone()), None, outbound_handle.clone());
+        let ddp = DdpProcessor::spawn(Some(addressing.clone()), None, outbound_handle.clone(), RouteTable::new(LearningMode::Static));
 
         let mut rx = hub_rx;
         let ddp_handle = ddp.clone();

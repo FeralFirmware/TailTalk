@@ -1,6 +1,7 @@
 use crate::{
     addressing::AddressingHandle,
     ddp::{DdpHandle, DdpSocket},
+    route_table::{NbpDispatch, NbpZone, RouteTable},
 };
 use std::collections::HashMap;
 use std::io;
@@ -47,6 +48,7 @@ pub struct Nbp {
     request_recv: mpsc::Receiver<NbpCommand>,
     pending_lookups: HashMap<u8, PendingLookup>,
     next_tid: u8,
+    route_table: RouteTable,
 }
 
 impl Nbp {
@@ -54,6 +56,7 @@ impl Nbp {
         ddp: &DdpHandle,
         et_addressing: Option<AddressingHandle>,
         lt_addressing: Option<AddressingHandle>,
+        route_table: RouteTable,
     ) -> NbpHandle {
         let sock = ddp
             .new_sock(DdpProtocolType::Nbp, Some(2))
@@ -70,6 +73,7 @@ impl Nbp {
             request_recv,
             pending_lookups: HashMap::new(),
             next_tid: 1,
+            route_table,
         };
 
         tokio::spawn(async move { nbp.run().await });
@@ -113,6 +117,24 @@ impl Nbp {
                                     self.lt_addressing.as_ref().expect("no addressing").addr().await.expect("failed to get LT addr")
                                 };
 
+                                // Derive dispatch strategy from the zone in the entity name.
+                                let dispatch = match lookup.request.zone.as_str() {
+                                    "*" => self.route_table.nbp_dispatch(NbpZone::Local),
+                                    "=" => self.route_table.nbp_dispatch(NbpZone::All),
+                                    z   => self.route_table.nbp_dispatch(NbpZone::Named(z)),
+                                };
+
+                                let dest_addr = match dispatch {
+                                    NbpDispatch::RouterBroadcast(_routers) => {
+                                        // TODO: send BrRq to each router once implemented.
+                                        // For now fall back to network-wide broadcast.
+                                        tailtalk_packets::aarp::AppleTalkAddress { network_number: 0, node_number: 255 }
+                                    }
+                                    NbpDispatch::LocalBroadcast | NbpDispatch::ZoneUnknown => {
+                                        tailtalk_packets::aarp::AppleTalkAddress { network_number: 0, node_number: 255 }
+                                    }
+                                };
+
                                 let tuple = NbpTuple {
                                     network_number: primary_addr.network_number,
                                     node_id: primary_addr.node_number,
@@ -130,15 +152,7 @@ impl Nbp {
                                 let mut buf = [0u8; 1024];
                                 let size = packet.to_bytes(&mut buf).expect("failed to serialize");
 
-                                // Network-wide broadcast {0, 255}: the DDP layer will send this
-                                // on every configured interface (EtherTalk and/or LocalTalk).
-                                let dest = crate::ddp::DdpAddress::new(
-                                    tailtalk_packets::aarp::AppleTalkAddress {
-                                        network_number: 0,
-                                        node_number: 255,
-                                    },
-                                    2,
-                                );
+                                let dest = crate::ddp::DdpAddress::new(dest_addr, 2);
 
                                 if let Err(e) = self.sock.send_to(&buf[..size], dest).await {
                                     tracing::error!("NBP LkUp: failed to send: {e}");

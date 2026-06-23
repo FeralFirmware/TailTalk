@@ -15,6 +15,7 @@ use tokio::sync::{
 use crate::{
     DataLinkPacket, DataLinkProtocol, OutboundHandle,
     addressing::{Addressing, AddressingHandle, Node},
+    route_table::{NextHop, RouteTable},
 };
 
 pub struct Packet {
@@ -112,6 +113,7 @@ pub struct DdpProcessor {
     ethertalk: OutboundHandle,
     et_addressing: Option<AddressingHandle>,
     lt_addressing: Option<AddressingHandle>,
+    route_table: RouteTable,
 }
 
 impl DdpProcessor {
@@ -119,6 +121,7 @@ impl DdpProcessor {
         et_addressing: Option<AddressingHandle>,
         lt_addressing: Option<AddressingHandle>,
         ethertalk: OutboundHandle,
+        route_table: RouteTable,
     ) -> DdpHandle {
         let (command_tx, command_rx) = mpsc::channel(100);
 
@@ -129,6 +132,7 @@ impl DdpProcessor {
             ethertalk,
             et_addressing,
             lt_addressing,
+            route_table,
         };
 
         tokio::spawn(async move { processor.run().await });
@@ -311,7 +315,13 @@ impl DdpProcessor {
                 );
                 return;
             };
-            et.lookup(packet.dest.addr).await.expect("unknown addr")
+            // If the route table has an explicit via-router for this network,
+            // forward to the router's address instead of resolving the destination directly.
+            let next_hop = self.route_table.route_for(packet.dest.addr.network_number);
+            match next_hop {
+                Some(NextHop::Via(router)) => et.lookup(router).await.expect("unknown router addr"),
+                _ => et.lookup(packet.dest.addr).await.expect("unknown addr"),
+            }
         };
 
         let our_addr = match &dest_node {

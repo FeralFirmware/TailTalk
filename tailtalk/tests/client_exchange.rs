@@ -6,6 +6,7 @@ use tailtalk::{
     addressing::Addressing,
     atp::Atp,
     ddp::DdpProcessor,
+    route_table::{LearningMode, RouteTable},
     echo::Echo,
     nbp::{Nbp, RegisteredName},
 };
@@ -74,7 +75,7 @@ impl TestClient {
         });
 
         let addressing = Addressing::spawn(Some(mac), outbound_handle.clone(), None, AddressSource::EtherTalkPhase2);
-        let ddp = DdpProcessor::spawn(Some(addressing.clone()), None, outbound_handle.clone());
+        let ddp = DdpProcessor::spawn(Some(addressing.clone()), None, outbound_handle.clone(), RouteTable::new(LearningMode::Static));
 
         let echo = Echo::spawn(&ddp).await;
         let (_atp_socket, atp_req, mut atp_resp) = Atp::spawn(&ddp, atp_socket).await;
@@ -86,7 +87,7 @@ impl TestClient {
             }
         });
 
-        let nbp = Nbp::spawn(&ddp, Some(addressing.clone()), None).await;
+        let nbp = Nbp::spawn(&ddp, Some(addressing.clone()), None, RouteTable::new(LearningMode::Static)).await;
 
         let mut rx = hub_rx;
         let ddp_handle = ddp.clone();

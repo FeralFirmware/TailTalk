@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tailtalk::{
     CancellationToken, DataLinkPacket, OutboundHandle, addressing::Addressing, asp::Asp, atp::Atp,
-    ddp::DdpProcessor, echo::Echo, nbp::Nbp,
+    ddp::DdpProcessor,
+    route_table::{LearningMode, RouteTable}, echo::Echo, nbp::Nbp,
 };
 use tailtalk_packets::{
     aarp::AddressSource,
@@ -73,7 +74,7 @@ impl TestClient {
         });
 
         let addressing = Addressing::spawn(Some(mac), outbound_handle.clone(), None, AddressSource::EtherTalkPhase2);
-        let ddp = DdpProcessor::spawn(Some(addressing.clone()), None, outbound_handle.clone());
+        let ddp = DdpProcessor::spawn(Some(addressing.clone()), None, outbound_handle.clone(), RouteTable::new(LearningMode::Static));
 
         let echo = Echo::spawn(&ddp).await;
         let (_atp_socket, atp_req, mut atp_resp) = Atp::spawn(&ddp, None).await;
@@ -85,7 +86,7 @@ impl TestClient {
             }
         });
 
-        let nbp = Nbp::spawn(&ddp, Some(addressing.clone()), None).await;
+        let nbp = Nbp::spawn(&ddp, Some(addressing.clone()), None, RouteTable::new(LearningMode::Static)).await;
 
         let mut rx = hub_rx;
         let ddp_handle = ddp.clone();
@@ -166,9 +167,9 @@ async fn test_asp_get_status() {
     });
 
     let addr_server = Addressing::spawn(Some(mac_server), outbound_server.clone(), None, AddressSource::EtherTalkPhase2);
-    let ddp_server = DdpProcessor::spawn(Some(addr_server.clone()), None, outbound_server.clone());
+    let ddp_server = DdpProcessor::spawn(Some(addr_server.clone()), None, outbound_server.clone(), RouteTable::new(LearningMode::Static));
     // Start NBP for server
-    let nbp_server = Nbp::spawn(&ddp_server, Some(addr_server.clone()), None).await;
+    let nbp_server = Nbp::spawn(&ddp_server, Some(addr_server.clone()), None, RouteTable::new(LearningMode::Static)).await;
 
     // Start incoming packet loop for server
     let mut rx_server = hub_ref.subscribe();
