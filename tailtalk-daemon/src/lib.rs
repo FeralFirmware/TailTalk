@@ -265,6 +265,7 @@ impl Session {
         match kind {
             Kind::ListInterfaces(_) => self.list_interfaces(id).await,
             Kind::SetAddress(r) => self.set_address(id, r).await,
+            Kind::ProbeAddress(r) => self.probe_address(id, r).await,
             Kind::AddMulticast(r) => self.add_multicast(id, r),
             Kind::OpenSocket(r) => self.open_socket(id, r).await,
             Kind::CloseSocket(r) => {
@@ -365,6 +366,43 @@ impl Session {
             .await
         {
             Ok(()) => proto::Reply::ok(id),
+            Err(e) => proto::Reply::error(id, proto::ErrorCode::Internal, e.to_string()),
+        }
+    }
+
+    async fn probe_address(&self, id: u64, r: proto::ProbeAddressRequest) -> proto::Reply {
+        let Some(iface) = self.state.interfaces.iter().find(|i| i.name == r.interface) else {
+            return proto::Reply::error(
+                id,
+                proto::ErrorCode::NotFound,
+                format!("no interface named '{}'", r.interface),
+            );
+        };
+        let Some(addr) = r.address else {
+            return invalid(id, "probe_address requires an address");
+        };
+        let (Ok(network), Ok(node)) = (u16::try_from(addr.network), u8::try_from(addr.node)) else {
+            return invalid(id, "address out of range");
+        };
+        if node == 0 || node == 255 {
+            return invalid(id, "node must be 1-254");
+        }
+        if iface.kind == proto::InterfaceType::Localtalk && network != 0 {
+            return invalid(id, "LocalTalk network number must be 0");
+        }
+
+        match iface
+            .addressing
+            .probe(AppleTalkAddress {
+                network_number: network,
+                node_number: node,
+            })
+            .await
+        {
+            Ok(available) => proto::Reply::new(
+                id,
+                proto::reply::Kind::ProbeAddress(proto::ProbeAddressReply { available }),
+            ),
             Err(e) => proto::Reply::error(id, proto::ErrorCode::Internal, e.to_string()),
         }
     }

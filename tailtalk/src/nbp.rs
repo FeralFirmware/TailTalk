@@ -19,6 +19,11 @@ struct NbpRegisterRequest {
     chan: oneshot::Sender<Result<(), io::Error>>,
 }
 
+struct NbpUnregisterRequest {
+    request: RegisteredName,
+    chan: oneshot::Sender<Result<(), io::Error>>,
+}
+
 struct NbpLookupRequest {
     request: EntityName,
     chan: oneshot::Sender<Result<Vec<NbpTuple>, io::Error>>,
@@ -26,10 +31,11 @@ struct NbpLookupRequest {
 
 enum NbpCommand {
     Register(NbpRegisterRequest),
+    Unregister(NbpUnregisterRequest),
     Lookup(NbpLookupRequest),
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RegisteredName {
     pub name: EntityName,
     pub sock_num: u8,
@@ -106,6 +112,9 @@ impl Nbp {
                         match command {
                             NbpCommand::Register(register) => {
                                 self.handle_register_req(register);
+                            },
+                            NbpCommand::Unregister(unregister) => {
+                                self.handle_unregister_req(unregister);
                             },
                             NbpCommand::Lookup(lookup) => {
                                 let tid = self.next_tid;
@@ -223,6 +232,24 @@ impl Nbp {
             req.request.sock_num
         );
         self.registered_names.push(req.request);
+    }
+
+    fn handle_unregister_req(&mut self, req: NbpUnregisterRequest) {
+        let before = self.registered_names.len();
+        self.registered_names.retain(|n| n != &req.request);
+        if self.registered_names.len() < before {
+            tracing::info!(
+                "unregistered NBP: {} sock num {}",
+                req.request.name,
+                req.request.sock_num
+            );
+            let _ = req.chan.send(Ok(()));
+        } else {
+            let _ = req.chan.send(Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "entity name and sock num not registered",
+            )));
+        }
     }
 
     async fn handle_packet(&mut self, ddp: DdpPacket, payload: &mut [u8]) {
@@ -350,6 +377,20 @@ impl NbpHandle {
         let (tx, rx) = oneshot::channel();
 
         let request = NbpCommand::Register(NbpRegisterRequest { request, chan: tx });
+
+        self.request_send
+            .send(request)
+            .await
+            .map_err(io::Error::other)?;
+
+        rx.await.map_err(io::Error::other)?
+    }
+
+    /// Remove a previously registered name so lookups no longer match it.
+    pub async fn unregister(&self, request: RegisteredName) -> Result<(), io::Error> {
+        let (tx, rx) = oneshot::channel();
+
+        let request = NbpCommand::Unregister(NbpUnregisterRequest { request, chan: tx });
 
         self.request_send
             .send(request)

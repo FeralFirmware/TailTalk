@@ -25,6 +25,11 @@ export component AppWindow inherits Window {
     in-out property <bool> pcap-enabled: false;
     in-out property <string> pcap-path;
     in-out property <bool> ipp-bridge-enabled: false;
+    in-out property <bool> lw-bridge-enabled: false;
+    in-out property <bool> laserwriter-enabled: false;
+    in-out property <string> laserwriter-name: "Color LaserWriter 12/600";
+    in-out property <string> laserwriter-output-path;
+    in-out property <bool> laserwriter-convert-pdf: false;
     in-out property <string> info-message: "";
 
     in-out property <bool> import-progress-visible: false;
@@ -45,6 +50,7 @@ export component AppWindow inherits Window {
     callback start-stop();
     callback browse-volume();
     callback browse-pcap();
+    callback browse-laserwriter-output();
     callback import-files();
     callback inspect-finder-info();
     callback save-finder-info();
@@ -196,6 +202,66 @@ export component AppWindow inherits Window {
                         enabled: !root.running;
                     }
                     Text { text: "Expose printers via IPP (port 8631)"; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
+                HorizontalBox {
+                    padding-top: 0; padding-bottom: 0;
+                    Text { text: "Network Printers"; min-width: 140px; vertical-alignment: center; }
+                    CheckBox {
+                        checked <=> root.lw-bridge-enabled;
+                        enabled: !root.running;
+                    }
+                    Text { text: "Print to modern network printers (requires Ghostscript)"; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
+                HorizontalBox {
+                    padding-top: 0; padding-bottom: 0;
+                    Text { text: "LaserWriter"; min-width: 140px; vertical-alignment: center; }
+                    CheckBox {
+                        checked <=> root.laserwriter-enabled;
+                        enabled: !root.running;
+                    }
+                    Text { text: "Emulate a LaserWriter printer"; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
+                if root.laserwriter-enabled : HorizontalBox {
+                    padding-top: 0; padding-bottom: 0;
+                    Text { text: "Printer Name"; min-width: 140px; vertical-alignment: center; }
+                    LineEdit {
+                        text <=> root.laserwriter-name;
+                        placeholder-text: "Color LaserWriter 12/600";
+                        horizontal-stretch: 1;
+                        enabled: !root.running;
+                    }
+                }
+
+                if root.laserwriter-enabled : HorizontalBox {
+                    padding-top: 0; padding-bottom: 0;
+                    Text { text: "Save Jobs To"; min-width: 140px; vertical-alignment: center; }
+                    LineEdit {
+                        text <=> root.laserwriter-output-path;
+                        placeholder-text: "Path to save print jobs";
+                        horizontal-stretch: 1;
+                        enabled: !root.running;
+                    }
+                    Button {
+                        text: "Browse…";
+                        enabled: !root.running;
+                        clicked => { root.browse-laserwriter-output(); }
+                    }
+                }
+
+                if root.laserwriter-enabled : HorizontalBox {
+                    padding-top: 0; padding-bottom: 0;
+                    Text { text: "Convert to PDF"; min-width: 140px; vertical-alignment: center; }
+                    CheckBox {
+                        checked <=> root.laserwriter-convert-pdf;
+                        enabled: !root.running;
+                    }
+                    Text { text: "Requires Ghostscript"; vertical-alignment: center; }
                     Rectangle { horizontal-stretch: 1; }
                 }
             }

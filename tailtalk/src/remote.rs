@@ -245,6 +245,26 @@ impl RemoteClient {
         Ok(())
     }
 
+    pub(crate) async fn probe_address(
+        &self,
+        name: &str,
+        addr: AppleTalkAddress,
+    ) -> io::Result<bool> {
+        let kind = self
+            .request(proto::request::Kind::ProbeAddress(proto::ProbeAddressRequest {
+                interface: name.to_string(),
+                address: Some(proto::AppleTalkAddress::new(
+                    addr.network_number,
+                    addr.node_number,
+                )),
+            }))
+            .await?;
+        match kind {
+            proto::reply::Kind::ProbeAddress(reply) => Ok(reply.available),
+            _ => Err(unexpected_reply()),
+        }
+    }
+
     // ── Routing rules ────────────────────────────────────────────────────────
 
     pub(crate) async fn list_routes(&self) -> io::Result<proto::ListRoutesReply> {

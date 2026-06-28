@@ -295,3 +295,143 @@ async fn test_pap_print_job() {
 
     hub_task.abort();
 }
+
+/// A sink that collects received jobs for assertions.
+struct CollectSink(Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>);
+
+impl tailtalk::pap::PrintSink for CollectSink {
+    fn receive_job(
+        &self,
+        job: tailtalk::pap::PrintJob,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        let store = self.0.clone();
+        Box::pin(async move {
+            store.lock().await.push(job.data);
+            Ok(())
+        })
+    }
+}
+
+/// A PQP query job and a print job over one connection, each followed by a
+/// stdout read, then a client-initiated close.
+#[tokio::test]
+async fn test_pap_server_query_session() {
+    let _ = tracing_subscriber::fmt().try_init();
+
+    let hub = TestHub::new();
+    let (hub_in_tx, hub_in_rx) = mpsc::channel(100);
+    let hub_ref = Arc::new(hub);
+    let hub_runner = hub_ref.clone();
+    let hub_task = tokio::spawn(async move {
+        hub_runner.run(hub_in_rx).await;
+    });
+
+    let mac_printer = [0x00, 0x01, 0x02, 0x03, 0x04, 0xCC];
+    let mac_client = [0x00, 0x01, 0x02, 0x03, 0x04, 0xDD];
+
+    let workstation =
+        TestClient::new(mac_client, hub_in_tx.clone(), hub_ref.subscribe(), None).await;
+    // A second workstation that polls status / tries to connect mid-session.
+    let observer = TestClient::new(
+        [0x00, 0x01, 0x02, 0x03, 0x04, 0xEE],
+        hub_in_tx.clone(),
+        hub_ref.subscribe(),
+        None,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let printer = TestClient::new(
+        mac_printer,
+        hub_in_tx.clone(),
+        hub_ref.subscribe(),
+        Some(131),
+    )
+    .await;
+    printer
+        .nbp
+        .register(RegisteredName {
+            name: "QueryPrinter:LaserWriter@*".try_into().unwrap(),
+            sock_num: 131,
+        })
+        .await
+        .expect("Printer registration failed");
+
+    let jobs = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let mut server = tailtalk::pap::PapServer::new(
+        printer.atp_resp,
+        printer.ddp.clone(),
+        131,
+        tailtalk::pap::PrinterAttributes::default(),
+        Box::new(CollectSink(jobs.clone())),
+    );
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let results = workstation
+        .nbp
+        .lookup("QueryPrinter:LaserWriter@*".try_into().unwrap())
+        .await
+        .expect("Lookup failed");
+    assert!(!results.is_empty());
+    let target = &results[0];
+    let printer_addr = tailtalk::atp::AtpAddress {
+        network_number: target.network_number,
+        node_number: target.node_id,
+        socket_number: target.socket_number,
+    };
+
+    let mut pap = workstation.into_pap_client();
+    pap.connect(printer_addr).await.expect("Connect failed");
+
+    // The listener must keep answering while a session is open: status polls
+    // succeed, but another client's OpenConn gets a busy result.
+    let status = PapClient::get_status(observer.atp_req.clone(), printer_addr)
+        .await
+        .expect("Status poll during session failed");
+    assert!(
+        status.contains("busy"),
+        "status during a session should report busy, got: {status}"
+    );
+    let mut second = observer.into_pap_client();
+    assert!(
+        second
+            .connect_with_timeout(printer_addr, Duration::from_millis(100))
+            .await
+            .is_err(),
+        "second connection during a session must be refused as busy"
+    );
+
+    // 1. PQP query job.
+    let query = b"%!PS-Adobe-3.0 Query\r%%?BeginQuery: RBIUAMListQuery\r(*)= flush\r%%?EndQuery: *\r%%EOF\r";
+    pap.print(query).await.expect("Query job failed");
+    let answer = pap.read_response().await.expect("Query answer failed");
+    assert_eq!(
+        answer,
+        b"*\r",
+        "RBIUAMListQuery must be answered with '*' (no authentication)"
+    );
+
+    // 2. A real print job over the same connection.
+    let ps_job = b"%!PS-Adobe-3.0\rshowpage\r%%EOF\r".to_vec();
+    pap.print(&ps_job).await.expect("Print job failed");
+    let stdout = pap.read_response().await.expect("Job stdout read failed");
+    assert!(stdout.is_empty(), "print job should produce no stdout");
+
+    // 3. Client closes the connection; the server must answer CloseConnReply.
+    tokio::time::timeout(Duration::from_secs(10), pap.close())
+        .await
+        .expect("Close timed out")
+        .expect("Close failed");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let jobs = jobs.lock().await;
+    assert_eq!(jobs.len(), 1, "sink must receive exactly the one print job");
+    assert_eq!(jobs[0], ps_job);
+
+    println!("✓ PAP query session test passed!");
+
+    hub_task.abort();
+}

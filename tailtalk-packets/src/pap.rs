@@ -47,8 +47,9 @@ impl TryFrom<u8> for PapFunction {
 /// PAP packets are sent over ATP. For Data/SendData the ATP user bytes are:
 /// - Byte 0: Connection ID
 /// - Byte 1: Function code
-/// - Byte 2: EOF flag (Data only; 0 = more data, non-zero = end of job)
-/// - Byte 3: Sequence number (Data and SendData; wraps mod 256)
+/// - Byte 2: EOF flag (Data only; 0 = more data, non-zero = end of job);
+///   high byte of sequence number (SendData only)
+/// - Byte 3: Low byte of sequence number (SendData only; always 0 for Data)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PapPacket {
     pub connection_id: u8,
@@ -77,7 +78,8 @@ impl PapPacket {
         let connection_id = buf[0];
         let function = PapFunction::try_from(buf[1])?;
 
-        // Data and SendData carry a sequence number in byte 3; Data also has an EOF flag in byte 2.
+        // SendData carries a sequence number in bytes 2-3 (big-endian u16).
+        // Data carries the EOF flag in byte 2; byte 3 is unused.
         let (sequence_num, eof, data_start) = match function {
             PapFunction::SendData | PapFunction::Data => {
                 if buf.len() < 4 {
@@ -87,7 +89,12 @@ impl PapPacket {
                     });
                 }
                 let eof = function == PapFunction::Data && buf[2] != 0;
-                (buf[3] as u16, eof, 4)
+                let seq = if function == PapFunction::SendData {
+                    ((buf[2] as u16) << 8) | buf[3] as u16
+                } else {
+                    0
+                };
+                (seq, eof, 4)
             }
             _ => (0, false, 2),
         };
@@ -121,9 +128,15 @@ impl PapPacket {
         buf[1] = self.function as u8;
 
         if has_seq_num {
-            // Byte 2: EOF flag (Data only), byte 3: sequence number (mod 256).
-            buf[2] = if self.function == PapFunction::Data { self.eof as u8 } else { 0 };
-            buf[3] = self.sequence_num as u8;
+            // Data: byte 2 = EOF flag, byte 3 unused (Data has no sequence number).
+            // SendData: bytes 2-3 = sequence number big-endian.
+            if self.function == PapFunction::Data {
+                buf[2] = self.eof as u8;
+                buf[3] = 0;
+            } else {
+                buf[2] = (self.sequence_num >> 8) as u8;
+                buf[3] = self.sequence_num as u8;
+            }
             buf[4..total_len].copy_from_slice(&self.data);
         } else {
             buf[2..total_len].copy_from_slice(&self.data);
@@ -159,12 +172,12 @@ impl PapPacket {
 
         match self.function {
             PapFunction::Data => {
-                // Byte 2: EOF flag, byte 3: sequence number (mod 256).
+                // Byte 2: EOF flag; byte 3 unused (Data has no sequence number).
                 user_bytes[2] = self.eof as u8;
-                user_bytes[3] = self.sequence_num as u8;
             }
             PapFunction::SendData => {
-                // Byte 2: reserved (0), byte 3: sequence number (mod 256).
+                // Bytes 2-3: sequence number big-endian (spec p.10-11).
+                user_bytes[2] = (self.sequence_num >> 8) as u8;
                 user_bytes[3] = self.sequence_num as u8;
             }
             _ => {}
@@ -179,8 +192,8 @@ impl PapPacket {
         let function = PapFunction::try_from(user_bytes[1])?;
 
         let (sequence_num, eof) = match function {
-            PapFunction::Data => (user_bytes[3] as u16, user_bytes[2] != 0),
-            PapFunction::SendData => (user_bytes[3] as u16, false),
+            PapFunction::Data => (0, user_bytes[2] != 0),
+            PapFunction::SendData => (((user_bytes[2] as u16) << 8) | user_bytes[3] as u16, false),
             _ => (0, false),
         };
 
@@ -258,7 +271,7 @@ mod tests {
         assert_eq!(buf[0], 3); // connection_id
         assert_eq!(buf[1], 4); // function code for Data
         assert_eq!(buf[2], 0); // EOF flag (false)
-        assert_eq!(buf[3], 42); // sequence_num
+        assert_eq!(buf[3], 0); // unused (Data has no sequence number)
         assert_eq!(&buf[4..len], b"PostScript data");
     }
 

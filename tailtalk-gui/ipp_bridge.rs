@@ -152,7 +152,12 @@ struct BridgeState {
     job_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
-pub async fn run(nbp: NbpHandle, ddp: DdpHandle, token: CancellationToken) {
+pub async fn run(
+    nbp: NbpHandle,
+    ddp: DdpHandle,
+    token: CancellationToken,
+    bridged_names: crate::lw_bridge::BridgedNames,
+) {
     let printers: Arc<RwLock<Vec<Printer>>> = Arc::new(RwLock::new(Vec::new()));
 
     let mdns = match ServiceDaemon::new() {
@@ -168,8 +173,9 @@ pub async fn run(nbp: NbpHandle, ddp: DdpHandle, token: CancellationToken) {
     let printers2 = printers.clone();
     let mdns2 = mdns.clone();
     let token2 = token.clone();
+    let bridged2 = bridged_names.clone();
 
-    discover(&nbp, &ddp, &printers, &mdns).await;
+    discover(&nbp, &ddp, &printers, &mdns, &bridged_names).await;
 
     let state = Arc::new(BridgeState {
         printers: printers.clone(),
@@ -205,7 +211,7 @@ pub async fn run(nbp: NbpHandle, ddp: DdpHandle, token: CancellationToken) {
         loop {
             tokio::select! {
                 _ = token2.cancelled() => break,
-                _ = interval.tick() => discover(&nbp2, &ddp2, &printers2, &mdns2).await,
+                _ = interval.tick() => discover(&nbp2, &ddp2, &printers2, &mdns2, &bridged2).await,
             }
         }
     });
@@ -276,6 +282,7 @@ async fn discover(
     ddp: &DdpHandle,
     printers: &Arc<RwLock<Vec<Printer>>>,
     mdns: &ServiceDaemon,
+    bridged_names: &crate::lw_bridge::BridgedNames,
 ) {
     // (kind, NBP type pattern) for each supported printer family.
     let lookups: [(PrinterKind, &str); 2] = [
@@ -307,6 +314,13 @@ async fn discover(
             }
         }
         Err(e) => tracing::warn!("IPP bridge: NBP lookup failed: {e}"),
+    }
+
+    // Names lw_bridge registered are modern IPP devices already on mDNS;
+    // re-exporting them here would advertise a duplicate.
+    {
+        let bridged = bridged_names.lock().unwrap();
+        tuples.retain(|(_, t)| !bridged.contains(&(t.entity_name.object.clone(), t.socket_number)));
     }
 
     let new_keys: HashSet<String> = tuples.iter()
@@ -1210,7 +1224,7 @@ async fn urf_to_rasterizable(data: Vec<u8>, job_token: u32) -> anyhow::Result<Ve
 /// Return the name of the Ghostscript executable on this platform.
 /// On Windows, Ghostscript may be installed as `gswin64c` or `gswin32c`
 /// rather than `gs`; try each in order and return the first one found.
-fn gs_command() -> &'static str {
+pub(crate) fn gs_command() -> &'static str {
     #[cfg(target_os = "windows")]
     {
         for candidate in &["gswin64c", "gswin32c", "gs"] {

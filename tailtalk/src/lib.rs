@@ -758,6 +758,52 @@ impl TalkStack {
         let (_, atp_requestor, _) = atp::Atp::spawn(&self.ddp, None).await;
         pap::PapClient::get_status(atp_requestor, address).await
     }
+
+    /// Create a PAP printer emulator.
+    ///
+    /// Allocates an ATP socket and returns a [`pap::PapServer`].  The socket
+    /// number is available as `server.socket_number`; register it with NBP
+    /// manually, or use [`add_printer`](TalkStack::add_printer) which does both
+    /// in one call.
+    pub async fn pap_server(
+        &self,
+        attributes: pap::PrinterAttributes,
+        sink: impl pap::PrintSink + 'static,
+    ) -> pap::PapServer {
+        let (socket_num, _requestor, responder) = atp::Atp::spawn(&self.ddp, None).await;
+        pap::PapServer::new(responder, self.ddp.clone(), socket_num, attributes, Box::new(sink))
+    }
+
+    /// Create a PAP printer emulator and register it with NBP as `{name}:LaserWriter@*`.
+    ///
+    /// This is the high-level convenience wrapper: it allocates an ATP socket,
+    /// constructs the [`pap::PapServer`], and registers the NBP name so the Mac
+    /// Chooser can discover the printer.  Call [`pap::PapServer::run`] (or loop
+    /// on [`pap::PapServer::accept`]) to start serving connections.
+    pub async fn add_printer(
+        &self,
+        name: &str,
+        attributes: pap::PrinterAttributes,
+        sink: impl pap::PrintSink + 'static,
+    ) -> anyhow::Result<pap::PapServer> {
+        let server = self.pap_server(attributes, sink).await;
+
+        let entity_str = format!("{}:LaserWriter@*", name);
+        let entity: tailtalk_packets::nbp::EntityName = entity_str
+            .as_str()
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Invalid printer name: {}", e))?;
+
+        self.nbp
+            .register(nbp::RegisteredName {
+                name: entity,
+                sock_num: server.socket_number,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("NBP registration failed: {}", e))?;
+
+        Ok(server)
+    }
 }
 
 /// The lower half of the stack: interfaces, addressing (AARP/LLAP), DDP and

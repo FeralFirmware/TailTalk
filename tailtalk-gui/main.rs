@@ -17,6 +17,7 @@ use tracing_subscriber::{EnvFilter, prelude::*};
 slint::include_modules!();
 
 mod ipp_bridge;
+mod lw_bridge;
 
 // ── Persisted user configuration ──────────────────────────────────────────────
 
@@ -32,6 +33,11 @@ struct AppConfig {
     pcap_enabled: bool,
     pcap_path: Option<String>,
     ipp_bridge_enabled: bool,
+    lw_bridge_enabled: bool,
+    laserwriter_enabled: bool,
+    laserwriter_name: Option<String>,
+    laserwriter_output_path: Option<String>,
+    laserwriter_convert_pdf: bool,
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -68,6 +74,12 @@ fn save_config(config: &AppConfig) {
 
 // ── Commands sent from the UI thread to the tokio server task ─────────────────
 
+struct LaserWriterConfig {
+    name: String,
+    output_path: PathBuf,
+    convert_to_pdf: bool,
+}
+
 enum ServerCommand {
     Start {
         server_name: String,
@@ -79,6 +91,8 @@ enum ServerCommand {
         volume: PathBuf,
         pcap_path: Option<PathBuf>,
         ipp_bridge_enabled: bool,
+        lw_bridge_enabled: bool,
+        laserwriter: Option<LaserWriterConfig>,
     },
     Stop,
 }
@@ -272,6 +286,16 @@ fn main() -> anyhow::Result<()> {
         model
     };
 
+    // Default LaserWriter save location, used unless overridden by a saved config.
+    ui.set_laserwriter_output_path(
+        dirs::document_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("TailTalk Print Jobs")
+            .to_string_lossy()
+            .into_owned()
+            .into(),
+    );
+
     // Restore previously saved settings
     {
         let config = load_config();
@@ -302,6 +326,15 @@ fn main() -> anyhow::Result<()> {
             ui.set_pcap_path(path.as_str().into());
         }
         ui.set_ipp_bridge_enabled(config.ipp_bridge_enabled);
+        ui.set_lw_bridge_enabled(config.lw_bridge_enabled);
+        ui.set_laserwriter_enabled(config.laserwriter_enabled);
+        if let Some(ref v) = config.laserwriter_name {
+            ui.set_laserwriter_name(v.as_str().into());
+        }
+        if let Some(ref v) = config.laserwriter_output_path {
+            ui.set_laserwriter_output_path(v.as_str().into());
+        }
+        ui.set_laserwriter_convert_pdf(config.laserwriter_convert_pdf);
     }
 
     let ui_handle = ui.as_weak();
@@ -369,17 +402,10 @@ fn main() -> anyhow::Result<()> {
             }
 
             if ui.get_ipp_bridge_enabled() {
-                let gs_ok = ipp_bridge::gs_probe();
-                if !gs_ok {
-                    #[cfg(target_os = "macos")]
-                    let hint = "Please install it via \"brew install ghostscript\".";
-                    #[cfg(target_os = "linux")]
-                    let hint = "Please install it via \"sudo apt install ghostscript\" or your distro's equivalent.";
-                    #[cfg(target_os = "windows")]
-                    let hint = "Please install it from https://www.ghostscript.com/releases/gsdnld.html and ensure gswin64c or gs is in your PATH.";
+                if !ipp_bridge::gs_probe() {
                     show_error(
                         ui_weak.clone(),
-                        format!("Ghostscript is required for the LaserWriter printing bridge but was not found.\n{hint}"),
+                        ghostscript_missing_message("for the LaserWriter printing bridge"),
                     );
                     return;
                 }
@@ -403,6 +429,42 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
+            if ui.get_lw_bridge_enabled() && !ipp_bridge::gs_probe() {
+                show_error(
+                    ui_weak.clone(),
+                    ghostscript_missing_message("to print to network printers"),
+                );
+                return;
+            }
+
+            let laserwriter = if ui.get_laserwriter_enabled() {
+                let name = ui.get_laserwriter_name().to_string();
+                if name.trim().is_empty() {
+                    show_error(ui_weak.clone(), "LaserWriter is enabled but no printer name is set.".to_string());
+                    return;
+                }
+                let output_str = ui.get_laserwriter_output_path().to_string();
+                if output_str.trim().is_empty() {
+                    show_error(ui_weak.clone(), "LaserWriter is enabled but no folder to save jobs is selected.".to_string());
+                    return;
+                }
+                let convert_to_pdf = ui.get_laserwriter_convert_pdf();
+                if convert_to_pdf && !ipp_bridge::gs_probe() {
+                    show_error(
+                        ui_weak.clone(),
+                        ghostscript_missing_message("to auto-convert LaserWriter jobs to PDF"),
+                    );
+                    return;
+                }
+                Some(LaserWriterConfig {
+                    name,
+                    output_path: PathBuf::from(shellexpand::tilde(&output_str).as_ref()),
+                    convert_to_pdf,
+                })
+            } else {
+                None
+            };
+
             save_config(&AppConfig {
                 server_name: Some(ui.get_server_name().to_string()),
                 volume_name: Some(ui.get_volume_name().to_string()),
@@ -425,6 +487,17 @@ fn main() -> anyhow::Result<()> {
                     if s.is_empty() { None } else { Some(s) }
                 },
                 ipp_bridge_enabled: ui.get_ipp_bridge_enabled(),
+                lw_bridge_enabled: ui.get_lw_bridge_enabled(),
+                laserwriter_enabled: ui.get_laserwriter_enabled(),
+                laserwriter_name: {
+                    let s = ui.get_laserwriter_name().to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                },
+                laserwriter_output_path: {
+                    let s = ui.get_laserwriter_output_path().to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                },
+                laserwriter_convert_pdf: ui.get_laserwriter_convert_pdf(),
             });
 
             let pcap_path: Option<PathBuf> = if ui.get_pcap_enabled() {
@@ -447,6 +520,8 @@ fn main() -> anyhow::Result<()> {
                 volume,
                 pcap_path,
                 ipp_bridge_enabled: ui.get_ipp_bridge_enabled(),
+                lw_bridge_enabled: ui.get_lw_bridge_enabled(),
+                laserwriter,
             });
             if send_result.is_err() {
                 tracing::warn!("Server command queue full; ignoring Start");
@@ -489,6 +564,24 @@ fn main() -> anyhow::Result<()> {
                 slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_weak.upgrade() {
                         ui.set_pcap_path(path_str);
+                    }
+                })
+                .ok();
+            }
+        });
+    });
+
+    let ui_weak = ui.as_weak();
+    let rt_handle_blw = rt_handle.clone();
+    ui.on_browse_laserwriter_output(move || {
+        let ui_weak = ui_weak.clone();
+        rt_handle_blw.spawn(async move {
+            if let Some(handle) = rfd::AsyncFileDialog::new().pick_folder().await {
+                let path_str: slint::SharedString =
+                    handle.path().to_string_lossy().into_owned().into();
+                slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_laserwriter_output_path(path_str);
                     }
                 })
                 .ok();
@@ -798,6 +891,8 @@ async fn server_loop(
                 volume,
                 pcap_path,
                 ipp_bridge_enabled,
+                lw_bridge_enabled,
+                laserwriter,
             } => {
                 if let Some(h) = shutdown_handle.take() {
                     active.lock().await.take();
@@ -816,6 +911,8 @@ async fn server_loop(
                     volume,
                     pcap_path,
                     ipp_bridge_enabled,
+                    lw_bridge_enabled,
+                    laserwriter,
                     ready_tx,
                     ui_w.clone(),
                 ));
@@ -856,6 +953,16 @@ async fn server_loop(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn ghostscript_missing_message(context: &str) -> String {
+    #[cfg(target_os = "macos")]
+    let hint = "Please install it via \"brew install ghostscript\".";
+    #[cfg(target_os = "linux")]
+    let hint = "Please install it via \"sudo apt install ghostscript\" or your distro's equivalent.";
+    #[cfg(target_os = "windows")]
+    let hint = "Please install it from https://www.ghostscript.com/releases/gsdnld.html and ensure gswin64c or gs is in your PATH.";
+    format!("Ghostscript is required {context} but was not found.\n{hint}")
+}
 
 fn show_error(ui_weak: slint::Weak<AppWindow>, message: String) {
     slint::invoke_from_event_loop(move || {
@@ -1652,6 +1759,75 @@ async fn extract_hfs_image(img_path: &Path, volume_path: &Path) -> Result<(usize
     Ok((file_count, skipped))
 }
 
+// ── LaserWriter print sink ────────────────────────────────────────────────────
+
+
+/// Saves each job as a numbered file, optionally converting PostScript to PDF
+/// first. Falls back to saving the raw PostScript if conversion fails.
+struct LaserWriterSink {
+    dir: PathBuf,
+    convert_to_pdf: bool,
+    counter: std::sync::atomic::AtomicU32,
+}
+
+impl LaserWriterSink {
+    fn new(dir: impl Into<PathBuf>, convert_to_pdf: bool) -> Self {
+        Self {
+            dir: dir.into(),
+            convert_to_pdf,
+            counter: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+impl tailtalk::pap::PrintSink for LaserWriterSink {
+    fn receive_job(
+        &self,
+        job: tailtalk::pap::PrintJob,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        let dir = self.dir.clone();
+        let n = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let convert_to_pdf = self.convert_to_pdf;
+        Box::pin(async move {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            tokio::fs::create_dir_all(&dir).await?;
+
+            if convert_to_pdf {
+                match lw_bridge::gs_convert(&job.data, "pdfwrite", &[]).await {
+                    Ok(pdf) => {
+                        let path = dir.join(format!("job_{n:04}_{ts}.pdf"));
+                        tokio::fs::write(&path, &pdf).await?;
+                        tracing::info!(
+                            "LaserWriter: saved job {n} ({} bytes) → {}",
+                            pdf.len(),
+                            path.display()
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "LaserWriter: PDF conversion failed for job {n}, saving raw PostScript instead: {e}"
+                        );
+                    }
+                }
+            }
+
+            let path = dir.join(format!("job_{n:04}_{ts}.ps"));
+            tokio::fs::write(&path, &job.data).await?;
+            tracing::info!(
+                "LaserWriter: saved job {n} ({} bytes) → {}",
+                job.data.len(),
+                path.display()
+            );
+            Ok(())
+        })
+    }
+}
+
 // ── AFP server task ───────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -1663,6 +1839,8 @@ async fn run_server(
     volume: PathBuf,
     pcap_path: Option<PathBuf>,
     ipp_bridge_enabled: bool,
+    lw_bridge_enabled: bool,
+    laserwriter: Option<LaserWriterConfig>,
     ready_tx: tokio::sync::oneshot::Sender<(ShutdownHandle, ShutdownHandle)>,
     ui_weak: slint::Weak<AppWindow>,
 ) {
@@ -1774,12 +1952,62 @@ async fn run_server(
         return;
     }
 
+    let bridged_names: lw_bridge::BridgedNames = Default::default();
+
     if ipp_bridge_enabled {
         tokio::spawn(ipp_bridge::run(
             stack.nbp.clone(),
             stack.ddp.clone(),
             stack.token(),
+            bridged_names.clone(),
         ));
+    }
+
+    if lw_bridge_enabled {
+        tokio::spawn(lw_bridge::run(
+            stack.nbp.clone(),
+            stack.ddp.clone(),
+            stack.token(),
+            bridged_names.clone(),
+        ));
+    }
+
+    if let Some(cfg) = laserwriter {
+        use tailtalk::pap::{PaperSize, PrinterAttributes};
+
+        let attrs = PrinterAttributes {
+            product_name: cfg.name.clone(),
+            color: true,
+            resolutions_dpi: vec![600],
+            paper_sizes: vec![PaperSize::Letter, PaperSize::A4],
+            ..PrinterAttributes::default()
+        };
+
+        let sink = LaserWriterSink::new(&cfg.output_path, cfg.convert_to_pdf);
+
+        match stack.add_printer(&cfg.name, attrs, sink).await {
+            Ok(mut server) => {
+                tracing::info!(
+                    "LaserWriter emulator advertising \"{}\"; jobs saved to {}",
+                    cfg.name,
+                    cfg.output_path.display()
+                );
+                // Ends when the stack shuts down (the listener socket closes).
+                tokio::spawn(async move {
+                    if let Err(e) = server.run().await {
+                        tracing::warn!("LaserWriter emulator stopped: {e}");
+                    }
+                });
+            }
+            Err(e) => {
+                let msg = format!("Failed to start LaserWriter emulator:\n{e}");
+                tracing::error!("{msg}");
+                show_error(ui_weak.clone(), msg);
+                stack.shutdown_handle().shutdown();
+                set_stopped(ui_weak);
+                return;
+            }
+        }
     }
 
     #[cfg(any(feature = "ethertalk", feature = "tashtalk"))]

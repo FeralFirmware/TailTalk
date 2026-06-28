@@ -31,10 +31,16 @@ struct SetAddress {
     chan: oneshot::Sender<()>,
 }
 
+struct ProbeAddress {
+    addr: AppleTalkAddress,
+    chan: oneshot::Sender<bool>,
+}
+
 enum AarpCommand {
     Lookup(AarpRequest),
     OurAddr(SelfAddress),
     SetAddr(SetAddress),
+    Probe(ProbeAddress),
 }
 
 pub struct Addressing {
@@ -254,43 +260,7 @@ impl Addressing {
             tokio::select! {
                 pkt = self.packet_recv.recv() => {
                     if let Some((pkt, source)) = pkt {
-                        match pkt.opcode {
-                            AarpOpcode::Request => {
-                                if pkt.target_protocol.node_number == our_addr.node_number {
-                                    self.send_response(pkt, our_addr, source).await;
-                                }
-                            },
-                            AarpOpcode::Response => {
-                                if let Some(reqs) = self.pending.remove(&pkt.sender_protocol) {
-                                    for req in reqs {
-                                        let inner_req = Arc::<AarpRequest>::into_inner(req).unwrap();
-
-                                        let node = match source {
-                                            AddressSource::EtherTalkPhase2 => {
-                                                Node::EtherTalkPhase2(pkt.sender_addr)
-                                            },
-                                            AddressSource::EtherTalkPhase1 => {
-                                                Node::EtherTalkPhase1(pkt.sender_addr)
-                                            }
-                                            AddressSource::LocalTalk => {
-                                                continue;
-                                            },
-                                        };
-
-                                        if let Err(e) = inner_req.chan.send(Ok(node)) {
-                                            tracing::error!("error responding to AarpRequest: {e:?}");
-                                        }
-                                        self.cache.insert(pkt.sender_protocol, node);
-                                    }
-                                }
-                            },
-                            AarpOpcode::Probe => {
-                                if pkt.target_protocol == our_addr {
-                                    self.send_response(pkt, our_addr, source).await;
-                                    tracing::info!("send response to probe that matched our addr");
-                                }
-                            },
-                        }
+                        self.handle_aarp_packet(pkt, source, our_addr).await;
                     }
                 }
                 req = self.request_recv.recv() => {
@@ -313,6 +283,14 @@ impl Addressing {
                                 our_addr = req.addr;
                                 let _ = self.addr_tx.send(Some(our_addr));
                                 let _ = req.chan.send(());
+                            },
+                            AarpCommand::Probe(req) => {
+                                // A controlling client (e.g. a router that
+                                // drives its own address selection) is testing
+                                // a candidate before overriding our address.
+                                // This does not change our_addr.
+                                let available = self.probe_candidate(req.addr, Some(our_addr)).await;
+                                let _ = req.chan.send(available);
                             },
                         }
                     }
@@ -357,6 +335,116 @@ impl Addressing {
             .send(packet)
             .await
             .expect("failed to dispatch response");
+    }
+
+    /// Probe `candidate` on the wire to discover whether another node is
+    /// already defending it: an AARP probe on EtherTalk, an LLAP ENQ on
+    /// LocalTalk. Returns `true` if nothing answered within the probe window
+    /// (the address is free to claim), `false` if it is in use. Does not
+    async fn handle_aarp_packet(&mut self, pkt: AarpPacket, source: AddressSource, our_addr: AppleTalkAddress) {
+        match pkt.opcode {
+            AarpOpcode::Request => {
+                if pkt.target_protocol.node_number == our_addr.node_number {
+                    self.send_response(pkt, our_addr, source).await;
+                }
+            },
+            AarpOpcode::Response => {
+                if let Some(reqs) = self.pending.remove(&pkt.sender_protocol) {
+                    for req in reqs {
+                        let inner_req = Arc::<AarpRequest>::into_inner(req).unwrap();
+
+                        let node = match source {
+                            AddressSource::EtherTalkPhase2 => {
+                                Node::EtherTalkPhase2(pkt.sender_addr)
+                            },
+                            AddressSource::EtherTalkPhase1 => {
+                                Node::EtherTalkPhase1(pkt.sender_addr)
+                            }
+                            AddressSource::LocalTalk => {
+                                continue;
+                            },
+                        };
+
+                        if let Err(e) = inner_req.chan.send(Ok(node)) {
+                            tracing::error!("error responding to AarpRequest: {e:?}");
+                        }
+                        self.cache.insert(pkt.sender_protocol, node);
+                    }
+                }
+            },
+            AarpOpcode::Probe => {
+                if pkt.target_protocol == our_addr {
+                    self.send_response(pkt, our_addr, source).await;
+                    tracing::info!("send response to probe that matched our addr");
+                }
+            },
+        }
+    }
+
+    /// Probe a candidate address on the network to see if it is in use. Does not
+    /// change our own address.
+    async fn probe_candidate(&mut self, candidate: AppleTalkAddress, our_addr: Option<AppleTalkAddress>) -> bool {
+        if self.our_mac.is_none() {
+            // LocalTalk: send an LLAP ENQ for the node; an ACK from that node
+            // means it is taken.
+            let enq = DataLinkPacket {
+                dest_node: Node::LocalTalk(candidate.node_number),
+                protocol: DataLinkProtocol::LlapEnq,
+                payload: Box::new([]),
+                src_node_id: candidate.node_number,
+            };
+            if self.outbound.send(enq).await.is_err() {
+                return false;
+            }
+
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => return true,
+                    ack = self.lt_ack_recv.recv() => {
+                        if matches!(ack, Some(src) if src == candidate.node_number) {
+                            return false;
+                        }
+                    }
+                    _ = self.cancel.cancelled() => return false,
+                }
+            }
+        } else {
+            // EtherTalk: AARP-probe the candidate. A Response from it, or a
+            // competing Probe for it, means the address is taken.
+            let probe = self.create_packet(
+                candidate,
+                Self::broadcast_mac(self.phase),
+                candidate,
+                AarpOpcode::Probe,
+                self.phase,
+            );
+            if self.outbound.send(probe).await.is_err() {
+                return false;
+            }
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => return true,
+                    pkt = self.packet_recv.recv() => {
+                        if let Some((pkt, source)) = pkt {
+                            let taken = (pkt.opcode == AarpOpcode::Response
+                                    && pkt.sender_protocol == candidate)
+                                || (pkt.opcode == AarpOpcode::Probe
+                                    && pkt.target_protocol == candidate);
+                            if taken {
+                                return false;
+                            }
+                            if let Some(our_addr) = our_addr {
+                                self.handle_aarp_packet(pkt, source, our_addr).await;
+                            }
+                        }
+                    }
+                    _ = self.cancel.cancelled() => return false,
+                }
+            }
+        }
     }
 }
 
@@ -520,6 +608,29 @@ impl AddressingHandle {
             }
             AddressingInner::Remote { client, interface } => {
                 client.set_interface_addr(interface, addr).await
+            }
+        }
+    }
+
+    /// Probe a candidate address on the wire without claiming it.
+    ///
+    /// Returns `true` if no node is defending it (free to claim), `false` if
+    /// it is already in use. Lets a client that drives its own address
+    /// selection test a candidate before committing it with `set_addr`.
+    pub async fn probe(&self, addr: AppleTalkAddress) -> Result<bool, Error> {
+        match &self.inner {
+            AddressingInner::Local { request_send, .. } => {
+                let (tx, rx) = oneshot::channel();
+                let request = AarpCommand::Probe(ProbeAddress { addr, chan: tx });
+
+                if let Err(e) = request_send.send(request).await {
+                    return Err(Error::other(e));
+                }
+
+                rx.await.map_err(Error::other)
+            }
+            AddressingInner::Remote { client, interface } => {
+                client.probe_address(interface, addr).await
             }
         }
     }

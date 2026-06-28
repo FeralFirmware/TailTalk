@@ -85,6 +85,22 @@ message SetAddressRequest {
   AppleTalkAddress address = 2;
 }
 
+// Probe a candidate AppleTalk address on an interface to discover whether
+// another node already defends it: AARP for EtherTalk, an LLAP ENQ for
+// LocalTalk. This performs no assignment; it lets a client that drives its
+// own address selection (e.g. a router) test a candidate before committing
+// it with SetAddressRequest. For LocalTalk the network must be 0.
+message ProbeAddressRequest {
+  string interface = 1;
+  AppleTalkAddress address = 2; // candidate to probe
+}
+
+message ProbeAddressReply {
+  // true if no node answered within the probe window (the address is free to
+  // claim), false if another node is already using it.
+  bool available = 1;
+}
+
 // Enable reception of an Ethernet multicast address on an interface, e.g.
 // the hardware multicast group a zone's NBP lookups are sent to. Only
 // meaningful on EtherTalk; LocalTalk has no hardware multicast, so calling
@@ -210,6 +226,7 @@ message Request {
     SetLocalRangeRequest set_local_range = 12;
     PingRequest ping = 13;
     AddMulticastRequest add_multicast = 14;
+    ProbeAddressRequest probe_address = 15;
   }
 }
 
@@ -238,6 +255,7 @@ message Reply {
     ListInterfacesReply interfaces = 4;
     OpenSocketReply socket = 5;
     ListRoutesReply routes = 6;
+    ProbeAddressReply probe_address = 7;
   }
 }
 
