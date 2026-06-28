@@ -698,7 +698,7 @@ impl TalkStack {
     }
 
     /// Start an AFP file server on this stack.
-    pub async fn spawn_afp(&self, socket: Option<u8>, config: afp::AfpServerConfig) -> anyhow::Result<afp::AfpServer> {
+    pub async fn spawn_afp(&self, socket: Option<u8>, config: afp::AfpServerConfig) -> anyhow::Result<()> {
         afp::AfpServer::spawn(&self.ddp, &self.nbp, socket, config, self.service_token.clone(), self.services_done.clone()).await
     }
 

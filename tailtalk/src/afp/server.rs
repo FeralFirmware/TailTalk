@@ -33,8 +33,8 @@ pub struct AfpServerConfig {
 
 impl Default for AfpServerConfig {
     fn default() -> Self {
-        // Default volume icon (same as example)
-        let _volume_icon = [
+        // Default volume icon taken from Mac OS 9
+        let volume_icon = [
             0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x2, 0x9f, 0xe0, 0x0,
             0x4, 0x50, 0x30, 0x0, 0x8, 0x30, 0x28, 0x0, 0x10, 0x10, 0x3c, 0x7, 0xa0, 0x8, 0x4,
             0x18, 0x7f, 0x4, 0x4, 0x10, 0x0, 0x82, 0x4, 0x10, 0x0, 0x81, 0x4, 0x10, 0x0, 0x82, 0x4,
@@ -59,7 +59,7 @@ impl Default for AfpServerConfig {
             machine_type: "Macintosh".to_string(),
             afp_versions: vec![AfpVersion::Version2, AfpVersion::Version2_1],
             uams: vec![AfpUam::NoUserAuthent],
-            volume_icon: None,
+            volume_icon: Some(volume_icon),
             flags: 0x3,
             volume_path: PathBuf::from("./"),
             volume_name: "MacShare".to_string(),
@@ -71,6 +71,8 @@ impl Default for AfpServerConfig {
 pub struct AfpServer {
     asp_handle: AspHandle,
     config: Arc<AfpServerConfig>,
+    db: sled::Db,
+    shutdown: CancellationToken,
 }
 
 impl AfpServer {
@@ -85,7 +87,7 @@ impl AfpServer {
         config: AfpServerConfig,
         shutdown: CancellationToken,
         services_done: CancellationToken,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<()> {
         let config = Arc::new(config);
 
         // Create server status information
@@ -114,60 +116,44 @@ impl AfpServer {
 
         info!("AFP server '{}' started", config.server_name);
 
-        let server = Self { asp_handle, config };
+        // Open the desktop DB before spawning so failures surface as errors to the caller.
+        // sled::Db is internally reference-counted so all clones share the same on-disk DB.
+        let db = crate::afp::DesktopDatabase::open_or_create(&config.volume_path)
+            .map_err(|e| anyhow::anyhow!("Failed to open desktop database: {e:?}"))?;
 
-        // Spawn session handler
-        let server_clone_config = server.config.clone();
-        let server_clone_handle = server.asp_handle.clone();
-        tokio::spawn(async move {
-            run_server(server_clone_handle, server_clone_config, shutdown).await;
-        });
+        tokio::spawn(Self { asp_handle, config, db, shutdown }.run());
 
-        Ok(server)
+        Ok(())
     }
-}
 
-/// Run the AFP server session loop
-async fn run_server(asp_handle: AspHandle, config: Arc<AfpServerConfig>, token: CancellationToken) {
-    info!(
-        "AFP server '{}' waiting for sessions...",
-        config.server_name
-    );
+    async fn run(self) {
+        info!("AFP server '{}' waiting for sessions...", self.config.server_name);
 
-    // Open the desktop DB once and share the handle across all sessions via clone.
-    // sled::Db is internally reference-counted so all clones share the same on-disk DB.
-    let shared_db = match crate::afp::DesktopDatabase::open_or_create(&config.volume_path) {
-        Ok(db) => db,
-        Err(e) => {
-            error!("Failed to open desktop database: {:?}", e);
-            return;
+        let mut session_count = 0;
+
+        loop {
+            let session = tokio::select! {
+                _ = self.shutdown.cancelled() => break,
+                result = self.asp_handle.get_session() => match result {
+                    Ok(s) => s,
+                    Err(e) => { error!("Failed to accept AFP session: {}", e); break; }
+                },
+            };
+
+            session_count += 1;
+            info!(
+                "AFP session {} accepted from {:?}",
+                session_count, session.remote_addr
+            );
+
+            let session_config = self.config.clone();
+            let session_db = self.db.clone();
+            tokio::spawn(async move {
+                if let Err(e) = session.handle_session(session_config, session_db).await {
+                    error!("Session error: {}", e);
+                }
+            });
         }
-    };
-
-    let mut session_count = 0;
-
-    loop {
-        let session = tokio::select! {
-            _ = token.cancelled() => break,
-            result = asp_handle.get_session() => match result {
-                Ok(s) => s,
-                Err(e) => { error!("Failed to accept AFP session: {}", e); break; }
-            },
-        };
-
-        session_count += 1;
-        info!(
-            "AFP session {} accepted from {:?}",
-            session_count, session.remote_addr
-        );
-
-        let session_config = config.clone();
-        let session_db = shared_db.clone();
-        tokio::spawn(async move {
-            if let Err(e) = session.handle_session(session_config, session_db).await {
-                error!("Session error: {}", e);
-            }
-        });
     }
 }
 

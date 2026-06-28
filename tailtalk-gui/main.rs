@@ -322,7 +322,7 @@ fn main() -> anyhow::Result<()> {
                 return;
             }
 
-            let volume = PathBuf::from(ui.get_volume_path().as_str());
+            let volume = PathBuf::from(shellexpand::tilde(ui.get_volume_path().as_str()).as_ref());
             if volume.as_os_str().is_empty() {
                 tracing::error!("No volume path selected");
                 return;
@@ -389,7 +389,7 @@ fn main() -> anyhow::Result<()> {
 
             let pcap_path: Option<PathBuf> = if ui.get_pcap_enabled() {
                 let s = ui.get_pcap_path().to_string();
-                if s.is_empty() { None } else { Some(PathBuf::from(s)) }
+                if s.is_empty() { None } else { Some(PathBuf::from(shellexpand::tilde(&s).as_ref())) }
             } else {
                 None
             };
@@ -1632,16 +1632,14 @@ async fn run_server(
         ..AfpServerConfig::default()
     };
 
-    let _afp = match stack.spawn_afp(Some(254), afp_config).await {
-        Ok(s) => s,
-        Err(e) => {
-            let msg = format!("Failed to start AFP server:\n{e}");
-            tracing::error!("{msg}");
-            show_error(ui_weak.clone(), msg);
-            set_stopped(ui_weak);
-            return;
-        }
-    };
+    if let Err(e) = stack.spawn_afp(Some(254), afp_config).await {
+        let msg = format!("Failed to start AFP server:\n{e}");
+        tracing::error!("{msg}");
+        show_error(ui_weak.clone(), msg);
+        stack.shutdown_handle().shutdown();
+        set_stopped(ui_weak);
+        return;
+    }
 
     if ipp_bridge_enabled {
         tokio::spawn(ipp_bridge::run(

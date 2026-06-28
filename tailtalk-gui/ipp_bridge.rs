@@ -516,16 +516,14 @@ fn extract_job_id(parsed: &IppRequestResponse) -> Option<u32> {
         .groups_of(DelimiterTag::OperationAttributes)
         .next()
         .and_then(|g| {
-            if let Some(a) = g.attributes().get("job-id") {
-                if let IppValue::Integer(id) = a.value() {
+            if let Some(a) = g.attributes().get("job-id")
+                && let IppValue::Integer(id) = a.value() {
                     return Some(*id as u32);
                 }
-            }
-            if let Some(a) = g.attributes().get("job-uri") {
-                if let IppValue::Uri(u) = a.value() {
+            if let Some(a) = g.attributes().get("job-uri")
+                && let IppValue::Uri(u) = a.value() {
                     return u.as_str().rsplit('/').next()?.parse::<u32>().ok();
                 }
-            }
             None
         })
 }
@@ -1085,7 +1083,7 @@ fn parse_pbm_pages(data: &[u8]) -> anyhow::Result<Vec<(u32, u32, Vec<u8>)>> {
     let mut pos = 0;
     while pos < data.len() {
         let Some((w, h, header_len)) = parse_pbm_header(&data[pos..]) else { break };
-        let row_bytes = (w as usize + 7) / 8;
+        let row_bytes = (w as usize).div_ceil(8);
         let page_bytes = row_bytes * h as usize;
         let data_start = pos + header_len;
         let data_end = data_start + page_bytes;

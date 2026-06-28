@@ -51,7 +51,7 @@ async fn main() {
         ..AfpServerConfig::default()
     };
 
-    let _afp_server = stack.spawn_afp(Some(254), afp_config)
+    stack.spawn_afp(Some(254), afp_config)
         .await
         .expect("failed to spawn AFP server");
 

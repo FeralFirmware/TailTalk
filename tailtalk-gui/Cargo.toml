@@ -23,6 +23,7 @@ if-addrs = "0.15"
 ipp = "6.0.1"
 mdns-sd = "0.20.0"
 rfd = "0.17"
+shellexpand = "3"
 serde = { version = "1", features = ["derive"] }
 serialport = { version = "4", optional = true }
 slint = "1"
