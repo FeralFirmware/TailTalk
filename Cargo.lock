@@ -6121,6 +6121,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "sw-rename"
+version = "0.7.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tailtalk",
+ "tailtalk-packets",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "swash"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

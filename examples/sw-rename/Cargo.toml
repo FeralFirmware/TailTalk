@@ -1,0 +1,18 @@
+[package]
+name = "sw-rename"
+version.workspace = true
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "sw-rename"
+path = "main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+tailtalk = { workspace = true, features = ["ethertalk"] }
+tailtalk-packets = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

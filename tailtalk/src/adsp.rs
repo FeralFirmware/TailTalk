@@ -41,6 +41,9 @@ enum ConnectionState {
 }
 
 struct AdspConnection {
+    /// Our own ConnID — placed in every outgoing packet's connection_id field.
+    /// The HashMap key is the peer's ConnID (what arrives in inbound packets).
+    our_conn_id: u16,
     state: ConnectionState,
     remote_addr: AdspAddress,
     send_seq: u32,
@@ -51,6 +54,8 @@ struct AdspConnection {
     flight_buffer: Vec<u8>,
     last_tx: std::time::Instant,
     retries: u8,
+    /// Sequence number of the next attention message to send.
+    attn_send_seq: u32,
     /// Delivers received data to the AdspStream reader.
     data_tx: mpsc::Sender<Vec<u8>>,
 }
@@ -66,6 +71,12 @@ enum ActorCmd {
         conn_id: u16,
         data: Vec<u8>,
         eom: bool,
+        reply: oneshot::Sender<io::Result<()>>,
+    },
+    SendAttention {
+        conn_id: u16,
+        code: u16,
+        data: Vec<u8>,
         reply: oneshot::Sender<io::Result<()>>,
     },
     Close {
@@ -153,15 +164,19 @@ impl Adsp {
         }
     }
 
-    /// Register a new open connection and return the user-facing stream.
+    // Connections are always keyed by the peer's ConnID: that is the value carried in the
+    // connection_id field of every inbound packet, so it is what we must dispatch on.
+    // `our_conn_id` (placed in every outbound packet) is stored separately per connection.
     fn open_connection(
         &mut self,
-        conn_id: u16,
+        map_key: u16,
+        our_conn_id: u16,
         remote_addr: AdspAddress,
         peer_window: u16,
     ) -> AdspStream {
         let (data_tx, data_rx) = mpsc::channel(32);
-        self.connections.insert(conn_id, AdspConnection {
+        self.connections.insert(map_key, AdspConnection {
+            our_conn_id,
             state: ConnectionState::Open,
             remote_addr,
             send_seq: 0,
@@ -171,9 +186,10 @@ impl Adsp {
             flight_buffer: Vec::new(),
             last_tx: std::time::Instant::now(),
             retries: 0,
+            attn_send_seq: 0,
             data_tx,
         });
-        self.make_stream(conn_id, remote_addr, data_rx)
+        self.make_stream(map_key, remote_addr, data_rx)
     }
 
     // ── Event loop ────────────────────────────────────────────────────────────
@@ -212,6 +228,10 @@ impl Adsp {
                 let result = self.send_data(conn_id, &data, eom).await;
                 let _ = reply.send(result);
             }
+            ActorCmd::SendAttention { conn_id, code, data, reply } => {
+                let result = self.send_attention_msg(conn_id, code, &data).await;
+                let _ = reply.send(result);
+            }
             ActorCmd::Close { conn_id, reply } => {
                 let result = self.close_connection(conn_id).await;
                 let _ = reply.send(result);
@@ -227,10 +247,7 @@ impl Adsp {
 
         let conn_ids: Vec<u16> = self.connections.keys().copied().collect();
         for conn_id in conn_ids {
-            let conn = match self.connections.get_mut(&conn_id) {
-                Some(c) => c,
-                None => continue,
-            };
+            let Some(conn) = self.connections.get_mut(&conn_id) else { continue };
 
             if conn.flight_buffer.is_empty()
                 || now.duration_since(conn.last_tx) <= timeout
@@ -255,16 +272,17 @@ impl Adsp {
             let remote_addr = conn.remote_addr;
             let oldest_seq = conn.oldest_unacked_seq;
             let recv_seq = conn.recv_seq;
+            let our_conn_id = conn.our_conn_id;
 
             for (i, chunk) in data.chunks(ADSP_MAX_DATA).enumerate() {
                 let chunk_seq = oldest_seq.wrapping_add((i * ADSP_MAX_DATA) as u32);
                 let pkt = AdspPacket {
-                    descriptor: AdspDescriptor::ControlPacket,
-                    connection_id: conn_id,
+                    descriptor: AdspDescriptor::DataPacket,
+                    connection_id: our_conn_id,
                     first_byte_seq: chunk_seq,
                     next_recv_seq: recv_seq,
                     recv_window: ADSP_RECV_WINDOW,
-                    flags: 0,
+                    flags: AdspPacket::FLAG_ACK,
                 };
                 let mut buf = vec![0u8; AdspPacket::HEADER_LEN + chunk.len()];
                 if pkt.to_bytes(&mut buf).is_ok() {
@@ -312,9 +330,10 @@ impl Adsp {
                 self.handle_open_request(ddp, packet).await;
             }
             AdspDescriptor::OpenConnAck | AdspDescriptor::OpenConnReqAck => {
-                self.handle_open_ack(ddp, packet).await;
+                self.handle_open_ack(ddp, packet, payload).await;
             }
-            AdspDescriptor::ControlPacket => {
+            // DataPacket (bit7=0): data from peer. ControlPacket (0x80): probe/ack, may carry data.
+            AdspDescriptor::DataPacket | AdspDescriptor::ControlPacket => {
                 self.handle_data(packet, &payload[AdspPacket::HEADER_LEN..]).await;
             }
             AdspDescriptor::Acknowledgment => {
@@ -344,14 +363,16 @@ impl Adsp {
         let remote_addr = conn.remote_addr;
         let send_seq = conn.send_seq;
         let recv_seq = conn.recv_seq;
+        let our_conn_id = conn.our_conn_id;
 
+        // Attention ack: descriptor 0x90 = ControlPacket(0x80) | Attention(0x10).
         let ack = AdspPacket {
             descriptor: AdspDescriptor::ControlPacket,
-            connection_id: packet.connection_id,
+            connection_id: our_conn_id,
             first_byte_seq: send_seq,
             next_recv_seq: recv_seq,
-            recv_window: ADSP_RECV_WINDOW,
-            flags: AdspPacket::FLAG_ATTENTION | AdspPacket::FLAG_ACK,
+            recv_window: 0,
+            flags: AdspPacket::FLAG_ATTENTION,
         };
         let mut buf = vec![0u8; AdspPacket::HEADER_LEN + 2];
         if ack.to_bytes(&mut buf).is_ok() {
@@ -368,27 +389,31 @@ impl Adsp {
         ddp: tailtalk_packets::ddp::DdpPacket,
         packet: AdspPacket,
     ) {
-        let conn_id = packet.connection_id;
+        let client_conn_id = packet.connection_id;
+        let our_conn_id: u16 = rand::random();
         let remote_addr = AdspAddress {
             network_number: ddp.src_network_num,
             node_number: ddp.src_node_id,
             socket_number: ddp.src_sock_num,
         };
 
-        tracing::info!("ADSP accepting conn {} from {:?}", conn_id, remote_addr);
+        tracing::info!("ADSP accepting conn {} from {:?}", client_conn_id, remote_addr);
 
-        let stream = self.open_connection(conn_id, remote_addr, packet.recv_window);
+        let stream = self.open_connection(client_conn_id, our_conn_id, remote_addr, packet.recv_window);
 
+        // OpenConnReqAck carries 8-byte open-conn params (spec §12, Figure 12-11).
         let ack = AdspPacket {
-            descriptor: AdspDescriptor::OpenConnAck,
-            connection_id: conn_id,
+            descriptor: AdspDescriptor::OpenConnReqAck,
+            connection_id: our_conn_id,
             first_byte_seq: 0,
             next_recv_seq: 0,
             recv_window: ADSP_RECV_WINDOW,
             flags: 0,
         };
-        let mut buf = [0u8; AdspPacket::HEADER_LEN];
+        let mut buf = [0u8; AdspPacket::HEADER_LEN + 8];
         if ack.to_bytes(&mut buf).is_ok() {
+            byteorder::BigEndian::write_u16(&mut buf[AdspPacket::HEADER_LEN..], 0x0100);
+            byteorder::BigEndian::write_u16(&mut buf[AdspPacket::HEADER_LEN + 2..], client_conn_id);
             let _ = self.sock.send_to(&buf, ddp_dest(remote_addr)).await;
         }
 
@@ -401,9 +426,18 @@ impl Adsp {
         &mut self,
         ddp: tailtalk_packets::ddp::DdpPacket,
         packet: AdspPacket,
+        payload: &[u8],
     ) {
-        let conn_id = packet.connection_id;
-        let Some(ready_tx) = self.pending_opens.remove(&conn_id) else { return };
+        // Our ConnID echoed back in the open-conn params at payload[15..17]
+        // (DestConnID field, bytes 2-3 of the 8-byte block following the header).
+        let server_conn_id = packet.connection_id;
+        let our_conn_id = if payload.len() >= 17 {
+            u16::from_be_bytes([payload[15], payload[16]])
+        } else {
+            server_conn_id
+        };
+
+        let Some(ready_tx) = self.pending_opens.remove(&our_conn_id) else { return };
 
         let remote_addr = AdspAddress {
             network_number: ddp.src_network_num,
@@ -411,9 +445,30 @@ impl Adsp {
             socket_number: ddp.src_sock_num,
         };
 
-        tracing::info!("ADSP conn {} established to {:?}", conn_id, remote_addr);
+        tracing::info!(
+            "ADSP conn established: our={} server={} remote={:?}",
+            our_conn_id, server_conn_id, remote_addr
+        );
 
-        let stream = self.open_connection(conn_id, remote_addr, packet.recv_window);
+        let stream = self.open_connection(server_conn_id, our_conn_id, remote_addr, packet.recv_window);
+
+        // OpenConnAck completes the 3-way handshake; carries 8-byte open-conn params
+        // like the other two handshake packets (spec §12, Figure 12-11).
+        let ack = AdspPacket {
+            descriptor: AdspDescriptor::OpenConnAck,
+            connection_id: our_conn_id,
+            first_byte_seq: 0,
+            next_recv_seq: 0,
+            recv_window: ADSP_RECV_WINDOW,
+            flags: 0,
+        };
+        let mut buf = [0u8; AdspPacket::HEADER_LEN + 8];
+        if ack.to_bytes(&mut buf).is_ok() {
+            byteorder::BigEndian::write_u16(&mut buf[AdspPacket::HEADER_LEN..], 0x0100);
+            byteorder::BigEndian::write_u16(&mut buf[AdspPacket::HEADER_LEN + 2..], server_conn_id);
+            let _ = self.sock.send_to(&buf, ddp_dest(remote_addr)).await;
+        }
+
         let _ = ready_tx.send(Ok(stream));
     }
 
@@ -463,8 +518,11 @@ impl Adsp {
             recv_window: ADSP_RECV_WINDOW,
             flags: 0,
         };
-        let mut buf = [0u8; AdspPacket::HEADER_LEN];
+        // Header + 8-byte open-conn params (spec §12, Figure 12-11).
+        // DestConnID is 0 — we don't know the server's ConnID yet.
+        let mut buf = [0u8; AdspPacket::HEADER_LEN + 8];
         if pkt.to_bytes(&mut buf).is_ok() {
+            byteorder::BigEndian::write_u16(&mut buf[AdspPacket::HEADER_LEN..], 0x0100);
             let _ = self.sock.send_to(&buf, ddp_dest(remote_addr)).await;
         }
     }
@@ -484,15 +542,15 @@ impl Adsp {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "connection closing"));
         }
 
-        // Empty EOM flush (just a control packet with EOM set, no data).
+        // Empty EOM flush (data packet with EOM set, no payload bytes).
         if data.is_empty() && eom {
             let pkt = AdspPacket {
-                descriptor: AdspDescriptor::ControlPacket,
-                connection_id: conn_id,
+                descriptor: AdspDescriptor::DataPacket,
+                connection_id: conn.our_conn_id,
                 first_byte_seq: conn.send_seq,
                 next_recv_seq: conn.recv_seq,
                 recv_window: ADSP_RECV_WINDOW,
-                flags: AdspPacket::FLAG_EOM,
+                flags: AdspPacket::FLAG_ACK | AdspPacket::FLAG_EOM,
             };
             let mut buf = [0u8; AdspPacket::HEADER_LEN];
             pkt.to_bytes(&mut buf)
@@ -504,19 +562,18 @@ impl Adsp {
                 .map_err(io::Error::other);
         }
 
-        let chunks: Vec<&[u8]> = data.chunks(ADSP_MAX_DATA).collect();
-        let last_idx = chunks.len().saturating_sub(1);
+        let last_idx = data.chunks(ADSP_MAX_DATA).count().saturating_sub(1);
 
-        for (i, chunk) in chunks.iter().enumerate() {
-            let flags = if eom && i == last_idx { AdspPacket::FLAG_EOM } else { 0 };
+        for (i, chunk) in data.chunks(ADSP_MAX_DATA).enumerate() {
+            let eom_flag = if eom && i == last_idx { AdspPacket::FLAG_EOM } else { 0 };
 
             let pkt = AdspPacket {
-                descriptor: AdspDescriptor::ControlPacket,
-                connection_id: conn_id,
+                descriptor: AdspDescriptor::DataPacket,
+                connection_id: conn.our_conn_id,
                 first_byte_seq: conn.send_seq,
                 next_recv_seq: conn.recv_seq,
                 recv_window: ADSP_RECV_WINDOW,
-                flags,
+                flags: AdspPacket::FLAG_ACK | eom_flag,
             };
 
             let mut buf = vec![0u8; AdspPacket::HEADER_LEN + chunk.len()];
@@ -545,7 +602,7 @@ impl Adsp {
 
         let pkt = AdspPacket {
             descriptor: AdspDescriptor::Acknowledgment,
-            connection_id: conn_id,
+            connection_id: conn.our_conn_id,
             first_byte_seq: conn.send_seq,
             next_recv_seq: conn.recv_seq,
             recv_window: ADSP_RECV_WINDOW,
@@ -562,6 +619,37 @@ impl Adsp {
             .map_err(io::Error::other)
     }
 
+    async fn send_attention_msg(&mut self, conn_id: u16, code: u16, data: &[u8]) -> io::Result<()> {
+        let (remote_addr, attn_send_seq, recv_seq, our_conn_id) = {
+            let conn = self.connections.get_mut(&conn_id).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "no such connection")
+            })?;
+            let seq = conn.attn_send_seq;
+            conn.attn_send_seq = conn.attn_send_seq.wrapping_add(1);
+            (conn.remote_addr, seq, conn.recv_seq, conn.our_conn_id)
+        };
+
+        // Attention packet (spec §12, Figure 12-7): desc byte 0x50.
+        let mut buf = vec![0u8; AdspPacket::HEADER_LEN + 2 + data.len()];
+        let pkt = AdspPacket {
+            descriptor: AdspDescriptor::DataPacket,
+            connection_id: our_conn_id,
+            first_byte_seq: attn_send_seq,
+            next_recv_seq: recv_seq,
+            recv_window: 0, // must be 0 for attention per spec
+            flags: AdspPacket::FLAG_ACK | AdspPacket::FLAG_ATTENTION,
+        };
+        pkt.to_bytes(&mut buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        byteorder::BigEndian::write_u16(&mut buf[AdspPacket::HEADER_LEN..], code);
+        buf[AdspPacket::HEADER_LEN + 2..].copy_from_slice(data);
+
+        self.sock
+            .send_to(&buf, ddp_dest(remote_addr))
+            .await
+            .map_err(io::Error::other)
+    }
+
     async fn close_connection(&mut self, conn_id: u16) -> io::Result<()> {
         let Some(conn) = self.connections.get(&conn_id) else {
             return Ok(()); // already gone
@@ -569,7 +657,7 @@ impl Adsp {
 
         let pkt = AdspPacket {
             descriptor: AdspDescriptor::CloseAdvice,
-            connection_id: conn_id,
+            connection_id: conn.our_conn_id,
             first_byte_seq: conn.send_seq,
             next_recv_seq: conn.recv_seq,
             recv_window: 0,
@@ -611,6 +699,26 @@ pub struct AdspStream {
 impl AdspStream {
     pub fn remote_addr(&self) -> AdspAddress {
         self.remote_addr
+    }
+
+    /// Send an ADSP attention message with the given 16-bit code and payload.
+    ///
+    /// Attention messages are out-of-band from the normal data stream; they
+    /// are delivered to the peer using a separate sequence number space and
+    /// a dedicated descriptor (Control=0, AckReq=1, Attn=1).
+    pub async fn send_attention(&mut self, code: u16, data: &[u8]) -> io::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ActorCmd::SendAttention {
+                conn_id: self.conn_id,
+                code,
+                data: data.to_vec(),
+                reply: tx,
+            })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "adsp actor dead"))?;
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "adsp actor dead"))?
     }
 
     /// Flush the write buffer and mark the message boundary with the EOM flag.

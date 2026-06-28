@@ -10,10 +10,17 @@ pub enum AdspError {
 }
 
 /// ADSP descriptor (packet type) codes
+///
+/// The descriptor byte is the LAST byte of the 13-byte ADSP header (per spec Figure 12-2).
+/// Bit 7 = Control flag. When clear, the packet carries stream data (DataPacket).
+/// When set, bits 3-0 encode the control code; bits 6-4 are additional flags
+/// (AckReq, EOM, Attention) stored separately in `AdspPacket::flags`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AdspDescriptor {
-    /// Control packet (probe, acknowledgment)
+    /// Data packet (Control bit = 0); flag bits live in `AdspPacket::flags`
+    DataPacket = 0x00,
+    /// Control packet / probe-ack (Control=1, code=0)
     ControlPacket = 0x80,
     /// Connection open request
     OpenConnRequest = 0x81,
@@ -37,7 +44,10 @@ impl TryFrom<u8> for AdspDescriptor {
     type Error = AdspError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
+        if value & 0x80 == 0 {
+            return Ok(AdspDescriptor::DataPacket);
+        }
+        match value & 0x8F {
             0x80 => Ok(AdspDescriptor::ControlPacket),
             0x81 => Ok(AdspDescriptor::OpenConnRequest),
             0x82 => Ok(AdspDescriptor::OpenConnAck),
@@ -57,12 +67,12 @@ impl TryFrom<u8> for AdspDescriptor {
 /// ADSP (AppleTalk Data Stream Protocol) provides connection-oriented,
 /// full-duplex byte-stream communication over DDP.
 ///
-/// Packet format:
-/// - Byte 0: Descriptor (packet type)
-/// - Bytes 1-2: Connection ID (u16, big-endian)
-/// - Bytes 3-6: First Byte Sequence number (u32, big-endian)
-/// - Bytes 7-10: Next Receive Sequence number (u32, big-endian)
-/// - Bytes 11-12: Receive Window size (u16, big-endian)
+/// Packet format (per spec Figure 12-2):
+/// - Bytes 0-1:  Connection ID (u16, big-endian)
+/// - Bytes 2-5:  First Byte Sequence number (u32, big-endian)
+/// - Bytes 6-9:  Next Receive Sequence number (u32, big-endian)
+/// - Bytes 10-11: Receive Window size (u16, big-endian)
+/// - Byte 12:    Descriptor (packet type + flag bits)
 /// - Remaining bytes: Data payload (not owned by this struct)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdspPacket {
@@ -101,12 +111,13 @@ impl AdspPacket {
             });
         }
 
-        let descriptor = AdspDescriptor::try_from(buf[0])?;
-        let connection_id = BigEndian::read_u16(&buf[1..3]);
-        let first_byte_seq = BigEndian::read_u32(&buf[3..7]);
-        let next_recv_seq = BigEndian::read_u32(&buf[7..11]);
-        let recv_window = BigEndian::read_u16(&buf[11..13]);
-        let flags = buf[0] & 0xF0; // Top 4 bits are flags on ControlPacket/Ack/etc but we'll store the whole byte since descriptor is just 0x8x
+        let connection_id = BigEndian::read_u16(&buf[0..2]);
+        let first_byte_seq = BigEndian::read_u32(&buf[2..6]);
+        let next_recv_seq = BigEndian::read_u32(&buf[6..10]);
+        let recv_window = BigEndian::read_u16(&buf[10..12]);
+        let desc_byte = buf[12];
+        let descriptor = AdspDescriptor::try_from(desc_byte)?;
+        let flags = desc_byte & 0xF0;
 
         Ok(Self {
             descriptor,
@@ -130,12 +141,11 @@ impl AdspPacket {
             });
         }
 
-        // The descriptor byte effectively contains both the control flags and the descriptor code
-        buf[0] = (self.descriptor as u8) | self.flags;
-        BigEndian::write_u16(&mut buf[1..3], self.connection_id);
-        BigEndian::write_u32(&mut buf[3..7], self.first_byte_seq);
-        BigEndian::write_u32(&mut buf[7..11], self.next_recv_seq);
-        BigEndian::write_u16(&mut buf[11..13], self.recv_window);
+        BigEndian::write_u16(&mut buf[0..2], self.connection_id);
+        BigEndian::write_u32(&mut buf[2..6], self.first_byte_seq);
+        BigEndian::write_u32(&mut buf[6..10], self.next_recv_seq);
+        BigEndian::write_u16(&mut buf[10..12], self.recv_window);
+        buf[12] = (self.descriptor as u8) | self.flags;
 
         Ok(Self::HEADER_LEN)
     }
@@ -198,10 +208,12 @@ mod tests {
 
     #[test]
     fn test_parse_open_conn_request() {
-        // OpenConnRequest: descriptor=0x81, conn_id=0x1234,
-        // first_byte_seq=0, next_recv_seq=0, recv_window=4096
         let data: &[u8] = &[
-            0x81, 0x12, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+            0x12, 0x34, // conn_id
+            0x00, 0x00, 0x00, 0x00, // first_byte_seq
+            0x00, 0x00, 0x00, 0x00, // next_recv_seq
+            0x10, 0x00, // recv_window = 4096
+            0x81,       // descriptor = OpenConnRequest
         ];
 
         let packet = AdspPacket::parse(data).expect("failed to parse");
@@ -215,9 +227,12 @@ mod tests {
 
     #[test]
     fn test_parse_control_packet() {
-        // ControlPacket with sequence numbers and window
         let data: &[u8] = &[
-            0x80, 0xAB, 0xCD, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x20, 0x00,
+            0xAB, 0xCD, // conn_id
+            0x00, 0x01, 0x00, 0x00, // first_byte_seq
+            0x00, 0x02, 0x00, 0x00, // next_recv_seq
+            0x20, 0x00, // recv_window = 8192
+            0x80,       // descriptor = ControlPacket
         ];
 
         let packet = AdspPacket::parse(data).expect("failed to parse");
@@ -231,9 +246,12 @@ mod tests {
 
     #[test]
     fn test_parse_acknowledgment() {
-        // Acknowledgment packet
         let data: &[u8] = &[
-            0x88, 0x00, 0x42, 0x00, 0x00, 0x03, 0xE8, 0x00, 0x00, 0x07, 0xD0, 0x08, 0x00,
+            0x00, 0x42, // conn_id
+            0x00, 0x00, 0x03, 0xE8, // first_byte_seq = 1000
+            0x00, 0x00, 0x07, 0xD0, // next_recv_seq = 2000
+            0x08, 0x00, // recv_window = 2048
+            0x88,       // descriptor = Acknowledgment
         ];
 
         let packet = AdspPacket::parse(data).expect("failed to parse");
@@ -243,6 +261,36 @@ mod tests {
         assert_eq!(packet.first_byte_seq, 1000);
         assert_eq!(packet.next_recv_seq, 2000);
         assert_eq!(packet.recv_window, 2048);
+    }
+
+    #[test]
+    fn test_parse_data_packet() {
+        let data: &[u8] = &[
+            0x00, 0x0A, // conn_id = 10
+            0x00, 0x00, 0x00, 0x00, // first_byte_seq
+            0x00, 0x00, 0x00, 0x00, // next_recv_seq
+            0x06, 0xB4, // recv_window = 1716
+            0x40,       // descriptor = DataPacket (AckReq flag)
+        ];
+        let packet = AdspPacket::parse(data).expect("failed to parse");
+        assert_eq!(packet.descriptor, AdspDescriptor::DataPacket);
+        assert_eq!(packet.connection_id, 0x000A);
+        assert_eq!(packet.flags & AdspPacket::FLAG_ACK, AdspPacket::FLAG_ACK);
+        assert_eq!(packet.flags & AdspPacket::FLAG_ATTENTION, 0);
+    }
+
+    #[test]
+    fn test_parse_attention_ack() {
+        let data: &[u8] = &[
+            0x00, 0x0A, // conn_id
+            0x00, 0x00, 0x00, 0x00, // first_byte_seq
+            0x00, 0x00, 0x00, 0x01, // next_recv_seq
+            0x00, 0x00, // recv_window
+            0x90,       // Control=1, Attention=1, code=0
+        ];
+        let packet = AdspPacket::parse(data).expect("failed to parse");
+        assert_eq!(packet.descriptor, AdspDescriptor::ControlPacket);
+        assert_ne!(packet.flags & AdspPacket::FLAG_ATTENTION, 0);
     }
 
     #[test]
@@ -257,7 +305,11 @@ mod tests {
         };
 
         let expected: &[u8] = &[
-            0x82, 0x56, 0x78, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00,
+            0x56, 0x78, // conn_id
+            0x00, 0x00, 0x00, 0x00, // first_byte_seq
+            0x00, 0x00, 0x00, 0x00, // next_recv_seq
+            0x20, 0x00, // recv_window = 8192
+            0x82,       // descriptor = OpenConnAck
         ];
 
         let mut buf = [0u8; 13];
@@ -282,11 +334,11 @@ mod tests {
         let len = packet.to_bytes(&mut buf).expect("failed to encode");
 
         assert_eq!(len, AdspPacket::HEADER_LEN);
-        assert_eq!(buf[0], 0x85); // CloseAdvice
-        assert_eq!(BigEndian::read_u16(&buf[1..3]), 0x9999);
-        assert_eq!(BigEndian::read_u32(&buf[3..7]), 1234567);
-        assert_eq!(BigEndian::read_u32(&buf[7..11]), 7654321);
-        assert_eq!(BigEndian::read_u16(&buf[11..13]), 0);
+        assert_eq!(BigEndian::read_u16(&buf[0..2]), 0x9999);
+        assert_eq!(BigEndian::read_u32(&buf[2..6]), 1234567);
+        assert_eq!(BigEndian::read_u32(&buf[6..10]), 7654321);
+        assert_eq!(BigEndian::read_u16(&buf[10..12]), 0);
+        assert_eq!(buf[12], 0x85);
     }
 
     #[test]
@@ -297,7 +349,7 @@ mod tests {
             first_byte_seq: 0xDEADBEEF,
             next_recv_seq: 0xCAFEBABE,
             recv_window: 0xFFFF,
-            flags: 0x80, // Descriptor is 0x86, so when parsed the top nibble (0x80) is saved as flags
+            flags: 0x80,
         };
 
         let mut buf = [0u8; 13];
@@ -310,9 +362,8 @@ mod tests {
 
     #[test]
     fn test_invalid_descriptor() {
-        // Invalid descriptor code 0x99
         let data: &[u8] = &[
-            0x99, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x99,
         ];
 
         let result = AdspPacket::parse(data);
@@ -363,9 +414,12 @@ mod tests {
 
     #[test]
     fn test_parse_with_data_payload() {
-        // ADSP header followed by data payload
         let data: &[u8] = &[
-            0x80, 0x11, 0x22, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x10, 0x00,
+            0x11, 0x22, // conn_id
+            0x00, 0x00, 0x00, 0x01, // first_byte_seq
+            0x00, 0x00, 0x00, 0x02, // next_recv_seq
+            0x10, 0x00, // recv_window = 4096
+            0x80,       // descriptor = ControlPacket
             // Data payload follows:
             b'H', b'e', b'l', b'l', b'o',
         ];
