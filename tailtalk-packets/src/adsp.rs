@@ -34,10 +34,13 @@ pub enum AdspDescriptor {
     CloseAdvice = 0x85,
     /// Forward reset
     ForwardReset = 0x86,
-    /// Retransmit advice
-    RetransmitAdvice = 0x87,
-    /// Acknowledgment
-    Acknowledgment = 0x88,
+    /// Forward reset acknowledgment
+    ForwardResetAck = 0x87,
+    /// Retransmit advice — the receiver is missing data from
+    /// `next_recv_seq` onward and asks the sender to roll back its send
+    /// queue and retransmit from there (Inside AppleTalk ch. 12, code 8).
+    /// Not a routine ack — plain acks are `ControlPacket` (code 0).
+    RetransmitAdvice = 0x88,
 }
 
 impl TryFrom<u8> for AdspDescriptor {
@@ -55,8 +58,8 @@ impl TryFrom<u8> for AdspDescriptor {
             0x84 => Ok(AdspDescriptor::OpenConnDeny),
             0x85 => Ok(AdspDescriptor::CloseAdvice),
             0x86 => Ok(AdspDescriptor::ForwardReset),
-            0x87 => Ok(AdspDescriptor::RetransmitAdvice),
-            0x88 => Ok(AdspDescriptor::Acknowledgment),
+            0x87 => Ok(AdspDescriptor::ForwardResetAck),
+            0x88 => Ok(AdspDescriptor::RetransmitAdvice),
             _ => Err(AdspError::UnknownDescriptor { code: value }),
         }
     }
@@ -245,18 +248,18 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_acknowledgment() {
+    fn test_parse_retransmit_advice() {
         let data: &[u8] = &[
             0x00, 0x42, // conn_id
             0x00, 0x00, 0x03, 0xE8, // first_byte_seq = 1000
             0x00, 0x00, 0x07, 0xD0, // next_recv_seq = 2000
             0x08, 0x00, // recv_window = 2048
-            0x88,       // descriptor = Acknowledgment
+            0x88,       // descriptor = RetransmitAdvice (control code 8)
         ];
 
         let packet = AdspPacket::parse(data).expect("failed to parse");
 
-        assert_eq!(packet.descriptor, AdspDescriptor::Acknowledgment);
+        assert_eq!(packet.descriptor, AdspDescriptor::RetransmitAdvice);
         assert_eq!(packet.connection_id, 0x0042);
         assert_eq!(packet.first_byte_seq, 1000);
         assert_eq!(packet.next_recv_seq, 2000);

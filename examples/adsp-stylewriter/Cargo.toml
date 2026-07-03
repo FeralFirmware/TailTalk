@@ -13,5 +13,5 @@ anyhow = { workspace = true } #unified
 clap = { workspace = true } #unified
 tailtalk = { workspace = true, features = ["ethertalk"] } #unified
 tailtalk-packets = { workspace = true } #unified
-tokio = { workspace = true, features = ["io-util"] } #unified
+tokio = { workspace = true, features = ["io-util", "time"] } #unified
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
