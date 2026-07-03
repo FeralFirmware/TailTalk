@@ -15,6 +15,8 @@ export component AppWindow inherits Window {
     in-out property <string> volume-path;
     in-out property <string> volume-name: "MacShare";
     in property <bool> running: false;
+    // True while the stack is initialising (AARP probe etc.), before running flips.
+    in property <bool> starting: false;
 
     // Set from Rust at startup to reflect compiled-in features
     in property <bool> feature-ethertalk: false;
@@ -206,12 +208,12 @@ export component AppWindow inherits Window {
                 width: 10px;
                 height: 10px;
                 border-radius: 5px;
-                background: root.running ? #22c55e : #9ca3af;
+                background: root.running ? #22c55e : (root.starting ? #f59e0b : #9ca3af);
                 y: (parent.height - self.height) / 2;
             }
 
             Text {
-                text: root.running ? "Running" : "Stopped";
+                text: root.running ? "Running" : (root.starting ? "Starting…" : "Stopped");
                 vertical-alignment: center;
                 horizontal-stretch: 1;
             }
@@ -219,7 +221,8 @@ export component AppWindow inherits Window {
             Button {
                 text: root.running ? "Stop" : "Start";
                 enabled: root.running || (
-                    root.server-name != ""
+                    !root.starting
+                    && root.server-name != ""
                     && root.volume-name != ""
                     && root.volume-path != ""
                     && ((root.feature-ethertalk && root.selected-ethernet != 0)

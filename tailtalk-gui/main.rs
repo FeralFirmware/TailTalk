@@ -39,10 +39,16 @@ fn config_path() -> Option<PathBuf> {
 }
 
 fn load_config() -> AppConfig {
-    config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| toml::from_str(&s).ok())
-        .unwrap_or_default()
+    let Some(path) = config_path() else { return AppConfig::default() };
+    // A missing config file is normal on first launch; only parse failures are noteworthy.
+    let Ok(s) = std::fs::read_to_string(&path) else { return AppConfig::default() };
+    match toml::from_str(&s) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::warn!("Ignoring malformed config {}: {e}", path.display());
+            AppConfig::default()
+        }
+    }
 }
 
 fn save_config(config: &AppConfig) {
@@ -50,8 +56,13 @@ fn save_config(config: &AppConfig) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(s) = toml::to_string(config) {
-        let _ = std::fs::write(path, s);
+    match toml::to_string(config) {
+        Ok(s) => {
+            if let Err(e) = std::fs::write(&path, s) {
+                tracing::warn!("Could not save config to {}: {e}", path.display());
+            }
+        }
+        Err(e) => tracing::warn!("Could not serialize config: {e}"),
     }
 }
 
@@ -159,6 +170,7 @@ fn init_logging() -> (Option<WorkerGuard>, Option<PathBuf>) {
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
         let _ = std::fs::create_dir_all(&log_dir);
+        prune_old_logs(&log_dir);
         let file_appender = tracing_appender::rolling::daily(&log_dir, "tailtalk.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
         let filter = EnvFilter::try_from_default_env()
@@ -179,6 +191,24 @@ fn init_logging() -> (Option<WorkerGuard>, Option<PathBuf>) {
             .with(tracing_subscriber::fmt::layer())
             .init();
         (None, None)
+    }
+}
+
+/// Delete rotated `tailtalk.log.*` files older than two weeks so the log
+/// directory doesn't grow without bound.
+fn prune_old_logs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(14 * 24 * 3600);
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("tailtalk.log") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata()
+            && let Ok(modified) = meta.modified()
+            && modified < cutoff
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -287,7 +317,9 @@ fn main() -> anyhow::Result<()> {
         let Some(ui) = ui_weak.upgrade() else { return };
 
         if ui.get_running() {
-            let _ = cmd_tx.try_send(ServerCommand::Stop);
+            if cmd_tx.try_send(ServerCommand::Stop).is_err() {
+                tracing::warn!("Server command queue full; ignoring Stop");
+            }
         } else {
             #[cfg(feature = "ethertalk")]
             let ethernet = {
@@ -318,13 +350,21 @@ fn main() -> anyhow::Result<()> {
                 any_transport = true;
             }
             if !any_transport {
-                tracing::error!("At least one transport must be selected");
+                show_error(ui_weak.clone(), "At least one transport must be selected.".to_string());
                 return;
             }
 
             let volume = PathBuf::from(shellexpand::tilde(ui.get_volume_path().as_str()).as_ref());
             if volume.as_os_str().is_empty() {
-                tracing::error!("No volume path selected");
+                show_error(ui_weak.clone(), "No volume path selected.".to_string());
+                return;
+            }
+
+            if ui.get_pcap_enabled() && ui.get_pcap_path().trim().is_empty() {
+                show_error(
+                    ui_weak.clone(),
+                    "Packet capture is enabled but no capture file is selected.".to_string(),
+                );
                 return;
             }
 
@@ -394,7 +434,10 @@ fn main() -> anyhow::Result<()> {
                 None
             };
 
-            let _ = cmd_tx.try_send(ServerCommand::Start {
+            // Show "Starting…" and disable the button until the stack reports
+            // ready (or fails); cleared in server_loop / run_server.
+            ui.set_starting(true);
+            let send_result = cmd_tx.try_send(ServerCommand::Start {
                 server_name: ui.get_server_name().to_string(),
                 volume_name: ui.get_volume_name().to_string(),
                 #[cfg(feature = "ethertalk")]
@@ -405,6 +448,10 @@ fn main() -> anyhow::Result<()> {
                 pcap_path,
                 ipp_bridge_enabled: ui.get_ipp_bridge_enabled(),
             });
+            if send_result.is_err() {
+                tracing::warn!("Server command queue full; ignoring Start");
+                ui.set_starting(false);
+            }
         }
     });
 
@@ -449,7 +496,14 @@ fn main() -> anyhow::Result<()> {
         });
     });
 
-    ui.on_clamp_to_one(|s| s.chars().next().map_or(String::new(), |c| c.to_string()).into());
+    // OSType codes are 4 single bytes, so reject non-ASCII input outright.
+    ui.on_clamp_to_one(|s| {
+        s.chars()
+            .next()
+            .filter(|c| c.is_ascii())
+            .map_or(String::new(), |c| c.to_string())
+            .into()
+    });
 
     {
         let ui_weak = ui.as_weak();
@@ -470,7 +524,7 @@ fn main() -> anyhow::Result<()> {
             .upgrade()
             .map(|ui| ui.get_volume_path().to_string())
             .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
+            .map(|s| PathBuf::from(shellexpand::tilde(&s).as_ref()));
         rt_handle_fi.spawn(async move {
             let mut dialog = rfd::AsyncFileDialog::new().set_title("Choose a file to inspect");
             if let Some(ref dir) = volume_path {
@@ -563,7 +617,7 @@ fn main() -> anyhow::Result<()> {
 
         let volume_path = {
             let Some(ui) = ui_weak.upgrade() else { return };
-            PathBuf::from(ui.get_volume_path().as_str())
+            PathBuf::from(shellexpand::tilde(ui.get_volume_path().as_str()).as_ref())
         };
 
         if volume_path.as_os_str().is_empty() {
@@ -624,8 +678,11 @@ fn main() -> anyhow::Result<()> {
                 .await;
 
                 match result {
-                    Ok(count) => {
-                        let msg = format!("Extracted {count} file(s) from the archive successfully.");
+                    Ok((count, skipped)) => {
+                        let mut msg = format!("Extracted {count} file(s) from the archive successfully.");
+                        if skipped > 0 {
+                            msg.push_str(&format!(" {skipped} item(s) were skipped; see the log for details."));
+                        }
                         slint::invoke_from_event_loop(move || {
                             if let Some(ui) = ui_weak.upgrade() {
                                 ui.set_import_progress_visible(false);
@@ -646,10 +703,13 @@ fn main() -> anyhow::Result<()> {
                 }
             } else {
                 match extract_hfs_image(&file_path, &volume_path).await {
-                    Ok(count) => show_info(
-                        ui_weak,
-                        format!("Imported {count} file(s) from the HFS image successfully."),
-                    ),
+                    Ok((count, skipped)) => {
+                        let mut msg = format!("Imported {count} file(s) from the HFS image successfully.");
+                        if skipped > 0 {
+                            msg.push_str(&format!(" {skipped} item(s) were skipped; see the log for details."));
+                        }
+                        show_info(ui_weak, msg)
+                    }
                     Err(e) => show_error(ui_weak, e),
                 }
             }
@@ -767,6 +827,7 @@ async fn server_loop(
                     shutdown_handle = Some(handle);
                     slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_w.upgrade() {
+                            ui.set_starting(false);
                             ui.set_running(true);
                         }
                     })
@@ -784,6 +845,7 @@ async fn server_loop(
                 let ui_w = ui_weak.clone();
                 slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_w.upgrade() {
+                        ui.set_starting(false);
                         ui.set_running(false);
                     }
                 })
@@ -835,11 +897,13 @@ fn ostype_to_string(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// Convert a user-supplied string to a 4-byte OSType, truncating or space-padding as needed.
+/// Convert a user-supplied string to a 4-byte OSType, truncating or space-padding
+/// as needed. One byte per character: non-ASCII characters become spaces rather
+/// than contributing multiple UTF-8 bytes and shifting the rest of the code.
 fn string_to_ostype(s: &str) -> [u8; 4] {
     let mut out = [b' '; 4];
-    for (dst, src) in out.iter_mut().zip(s.bytes()) {
-        *dst = src;
+    for (dst, src) in out.iter_mut().zip(s.chars()) {
+        *dst = if src.is_ascii() { src as u8 } else { b' ' };
     }
     out
 }
@@ -1186,15 +1250,43 @@ fn register_appl_from_resource_fork(
     Ok(())
 }
 
-// ── StuffIt extraction ────────────────────────────────────────────────────────
+// ── Archive extraction ────────────────────────────────────────────────────────
+
+/// Keep only normal path components, dropping empty/`.`/`..`/root/prefix parts,
+/// so archive-supplied names can never escape the destination directory.
+fn sanitize_rel_path(p: &Path) -> PathBuf {
+    p.components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Write a resource fork to TailTalk's sidecar location
+/// (`<volume_path>/.tailtalk/rsrc/<rel>`), creating parent directories as needed.
+async fn write_rsrc_sidecar(
+    volume_path: &Path,
+    rel: &Path,
+    rsrc_fork: &[u8],
+) -> std::io::Result<()> {
+    let rsrc_dest = volume_path.join(".tailtalk").join("rsrc").join(rel);
+    if let Some(parent) = rsrc_dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&rsrc_dest, rsrc_fork).await
+}
 
 /// Extract a StuffIt archive into `volume_path`, placing resource fork sidecars
 /// under `<volume_path>/.tailtalk/rsrc/<relative_path>` to match TailTalk's layout.
+///
+/// Entries that fail individually are skipped with a warning rather than
+/// aborting the whole import. Returns `(files_extracted, entries_skipped)`.
 async fn extract_sit(
     sit_path: &Path,
     volume_path: &Path,
     on_progress: impl Fn(usize, usize),
-) -> Result<usize, String> {
+) -> Result<(usize, usize), String> {
     let bytes = tokio::fs::read(sit_path).await
         .map_err(|e| format!("Failed to read archive: {e}"))?;
 
@@ -1208,43 +1300,63 @@ async fn extract_sit(
     let mut deferred_icon_cr: Vec<(PathBuf, Vec<u8>)> = Vec::new();
 
     let mut file_count = 0usize;
+    let mut skipped = 0usize;
     let total_entries = archive.entries.len();
 
     for (idx, entry) in archive.entries.iter().enumerate() {
         on_progress(idx, total_entries);
-        // Build a sanitized relative path: skip empty/`.`/`..` components.
-        let rel: PathBuf = entry.name
-            .split('/')
-            .filter(|c| !c.is_empty() && *c != "." && *c != "..")
-            .collect();
+        let rel = sanitize_rel_path(Path::new(&entry.name));
 
         if rel.as_os_str().is_empty() {
             continue;
         }
 
         if entry.is_folder {
-            tokio::fs::create_dir_all(volume_path.join(&rel)).await
-                .map_err(|e| format!("Failed to create '{}': {e}", rel.display()))?;
+            if let Err(e) = tokio::fs::create_dir_all(volume_path.join(&rel)).await {
+                tracing::warn!("Skipping folder '{}': {e}", rel.display());
+                skipped += 1;
+            }
             continue;
         }
 
-        // Ensure parent directory exists in the volume.
-        if let Some(parent) = rel.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            tokio::fs::create_dir_all(volume_path.join(parent)).await
-                .map_err(|e| format!("Failed to create parent for '{}': {e}", rel.display()))?;
-        }
+        let (data_fork, rsrc_fork) = match entry.decompressed_forks() {
+            Ok(forks) => forks,
+            Err(e) => {
+                tracing::warn!("Skipping '{}': failed to decompress: {e}", entry.name);
+                skipped += 1;
+                continue;
+            }
+        };
 
-        let (data_fork, rsrc_fork) = entry
-            .decompressed_forks()
-            .map_err(|e| format!("Failed to decompress '{}': {e}", entry.name))?;
+        // Icon\r (a folder's custom icon) is written to disk like any other
+        // file; only on Windows is it aliased to a filesystem-safe name (its
+        // raw carriage return isn't legal there). Its resource fork also gets
+        // registered in the desktop database below for creator+type lookups.
+        let is_icon_cr = rel.file_name().and_then(|n| n.to_str()) == Some(tailtalk::afp::ICON_CR_NAME);
+        let on_disk_rel: PathBuf = if is_icon_cr {
+            rel.parent().unwrap_or(Path::new("")).join(tailtalk::afp::icon_cr_on_disk_name())
+        } else {
+            rel.clone()
+        };
+
+        // Ensure parent directory exists in the volume.
+        if let Some(parent) = on_disk_rel.parent()
+            && !parent.as_os_str().is_empty()
+            && let Err(e) = tokio::fs::create_dir_all(volume_path.join(parent)).await
+        {
+            tracing::warn!("Skipping '{}': failed to create parent: {e}", rel.display());
+            skipped += 1;
+            continue;
+        }
 
         // Always create the data fork file, even when empty, so that AFP can
         // serve the resource fork sidecar for resource-only files (e.g. apps).
-        let dest = volume_path.join(&rel);
-        tokio::fs::write(&dest, &data_fork).await
-            .map_err(|e| format!("Failed to write '{}': {e}", dest.display()))?;
+        let dest = volume_path.join(&on_disk_rel);
+        if let Err(e) = tokio::fs::write(&dest, &data_fork).await {
+            tracing::warn!("Skipping '{}': {e}", dest.display());
+            skipped += 1;
+            continue;
+        }
         file_count += 1;
 
         // Preserve the Mac file type and creator from the archive so that AFP
@@ -1259,17 +1371,12 @@ async fn extract_sit(
         }
 
         if !rsrc_fork.is_empty() {
-            let rsrc_dest = volume_path.join(".tailtalk").join("rsrc").join(&rel);
-            if let Some(parent) = rsrc_dest.parent() {
-                tokio::fs::create_dir_all(parent).await
-                    .map_err(|e| format!("Failed to create rsrc dir for '{}': {e}", rel.display()))?;
+            if let Err(e) = write_rsrc_sidecar(volume_path, &on_disk_rel, &rsrc_fork).await {
+                tracing::warn!("Could not write resource fork for '{}': {e}", rel.display());
+                continue;
             }
-            tokio::fs::write(&rsrc_dest, &rsrc_fork).await
-                .map_err(|e| format!("Failed to write resource fork for '{}': {e}", rel.display()))?;
 
-            let file_name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-            if file_name == "Icon\r" {
+            if is_icon_cr {
                 // Defer: we may not have seen the BNDL for this directory yet.
                 let parent_dir = rel.parent().unwrap_or(Path::new("")).to_path_buf();
                 deferred_icon_cr.push((parent_dir, rsrc_fork));
@@ -1298,18 +1405,14 @@ async fn extract_sit(
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
-            let mut c = [b' '; 4];
-            for (dst, src) in c.iter_mut().zip(folder_name.bytes()) {
-                *dst = src;
-            }
-            c
+            string_to_ostype(folder_name)
         });
         if let Err(e) = load_icon_rsrc_into_desktop_db(rsrc_fork, creator, volume_path) {
             tracing::warn!("Could not load Icon\\r into desktop db: {e}");
         }
     }
 
-    Ok(file_count)
+    Ok((file_count, skipped))
 }
 
 // ── BinHex extraction ─────────────────────────────────────────────────────────
@@ -1374,12 +1477,7 @@ async fn extract_hqx(hqx_path: &Path, volume_path: &Path) -> Result<(), String> 
     }
 
     if !rsrc_fork.is_empty() {
-        let rsrc_dest = volume_path.join(".tailtalk").join("rsrc").join(&safe_name);
-        if let Some(parent) = rsrc_dest.parent() {
-            tokio::fs::create_dir_all(parent).await
-                .map_err(|e| format!("Failed to create rsrc dir: {e}"))?;
-        }
-        tokio::fs::write(&rsrc_dest, &rsrc_fork).await
+        write_rsrc_sidecar(volume_path, &safe_name, &rsrc_fork).await
             .map_err(|e| format!("Failed to write resource fork for '{}': {e}", dest.display()))?;
 
         if let Err(e) = register_appl_from_resource_fork(&rsrc_fork, &safe_name, volume_path) {
@@ -1398,8 +1496,9 @@ async fn extract_hqx(hqx_path: &Path, volume_path: &Path) -> Result<(), String> 
 /// `<volume_path>/.tailtalk/rsrc/<relative_path>`, matching the StuffIt layout.
 /// FinderInfo (type + creator) is preserved via xattr.
 ///
-/// Returns the number of files extracted on success.
-async fn extract_hfs_image(img_path: &Path, volume_path: &Path) -> Result<usize, String> {
+/// Files that fail individually are skipped with a warning rather than
+/// aborting the whole import. Returns `(files_extracted, entries_skipped)`.
+async fn extract_hfs_image(img_path: &Path, volume_path: &Path) -> Result<(usize, usize), String> {
     let img = tokio::fs::read(img_path).await
         .map_err(|e| format!("Failed to read disk image: {e}"))?;
 
@@ -1407,49 +1506,90 @@ async fn extract_hfs_image(img_path: &Path, volume_path: &Path) -> Result<usize,
         .map_err(|e| format!("Failed to parse HFS image: {e}"))?;
 
     // Place all extracted files inside a subdirectory named after the HFS volume.
-    // Fall back to the image filename stem when the volume has no name.
-    let vol_subdir: PathBuf = if vol.volume_name.is_empty() {
-        img_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "untitled".to_string())
-            .into()
-    } else {
-        vol.volume_name.clone().into()
+    // Fall back to the image filename stem when the volume has no (usable) name.
+    // Catalog names come straight from the image, so sanitize before touching disk.
+    let vol_subdir: PathBuf = {
+        let name = sanitize_rel_path(Path::new(&vol.volume_name));
+        if name.as_os_str().is_empty() {
+            img_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "untitled".to_string())
+                .into()
+        } else {
+            name
+        }
     };
     let dest_root = volume_path.join(&vol_subdir);
     tokio::fs::create_dir_all(&dest_root).await
         .map_err(|e| format!("Failed to create destination directory '{}': {e}", dest_root.display()))?;
 
-    let mut dir_creators: std::collections::HashMap<u32, [u8; 4]> =
+    // directory (relative to volume_path) → creator code found via BNDL in that directory
+    let mut dir_creators: std::collections::HashMap<PathBuf, [u8; 4]> =
         std::collections::HashMap::new();
     let mut deferred_icon_cr: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     let mut file_count = 0usize;
+    let mut skipped = 0usize;
 
     // Walk every file record in the catalog B-tree.
     for file in &vol.files {
-        let rel = &file.rel_path;
+        let rel = sanitize_rel_path(&file.rel_path);
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
         // AFP looks up sidecars as volume_path/.tailtalk/rsrc/<full_rel_from_volume_root>.
         // Since dest_root is volume_path/<vol_subdir>, the full path relative to volume_path is
         // <vol_subdir>/<rel>.
-        let full_rel = vol_subdir.join(rel);
+        let full_rel = vol_subdir.join(&rel);
+
+        let data_fork = match vol.read_data_fork(file) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("Skipping '{}': failed to read data fork: {e}", rel.display());
+                skipped += 1;
+                continue;
+            }
+        };
+        let rsrc_fork = match vol.read_rsrc_fork(file) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("Skipping '{}': failed to read resource fork: {e}", rel.display());
+                skipped += 1;
+                continue;
+            }
+        };
+
+        // Icon\r is the classic Mac magic filename for a folder's custom icon;
+        // see the matching comment in extract_sit for why it's aliased on disk
+        // only on Windows, and also registered in the desktop database.
+        let is_icon_cr = rel.file_name().and_then(|n| n.to_str()) == Some(tailtalk::afp::ICON_CR_NAME);
+        let on_disk_rel: PathBuf = if is_icon_cr {
+            rel.parent().unwrap_or(Path::new("")).join(tailtalk::afp::icon_cr_on_disk_name())
+        } else {
+            rel.clone()
+        };
+        let on_disk_full_rel: PathBuf = if is_icon_cr {
+            full_rel.parent().unwrap_or(Path::new("")).join(tailtalk::afp::icon_cr_on_disk_name())
+        } else {
+            full_rel.clone()
+        };
 
         // Ensure parent directory exists.
-        if let Some(parent) = rel.parent()
+        if let Some(parent) = on_disk_rel.parent()
             && !parent.as_os_str().is_empty()
+            && let Err(e) = tokio::fs::create_dir_all(dest_root.join(parent)).await
         {
-            tokio::fs::create_dir_all(dest_root.join(parent)).await
-                .map_err(|e| format!("Failed to create parent for '{}': {e}", rel.display()))?;
+            tracing::warn!("Skipping '{}': failed to create parent: {e}", rel.display());
+            skipped += 1;
+            continue;
         }
 
-        let data_fork = vol.read_data_fork(file)
-            .map_err(|e| format!("Failed to read data fork for '{}': {e}", rel.display()))?;
-        let rsrc_fork = vol.read_rsrc_fork(file)
-            .map_err(|e| format!("Failed to read resource fork for '{}': {e}", rel.display()))?;
-
-        let dest = dest_root.join(rel);
-        tokio::fs::write(&dest, &data_fork).await
-            .map_err(|e| format!("Failed to write '{}': {e}", dest.display()))?;
+        let dest = dest_root.join(&on_disk_rel);
+        if let Err(e) = tokio::fs::write(&dest, &data_fork).await {
+            tracing::warn!("Skipping '{}': {e}", dest.display());
+            skipped += 1;
+            continue;
+        }
         file_count += 1;
 
         let finder_info = tailtalk::afp::FinderInfo {
@@ -1462,24 +1602,18 @@ async fn extract_hfs_image(img_path: &Path, volume_path: &Path) -> Result<usize,
         }
 
         if !rsrc_fork.is_empty() {
-            // Sidecar must live under volume_path/.tailtalk/rsrc/<vol_subdir>/<rel>
-            // so that the AFP server (which is rooted at volume_path) finds it.
-            let rsrc_dest = volume_path.join(".tailtalk").join("rsrc").join(&full_rel);
-            if let Some(parent) = rsrc_dest.parent() {
-                tokio::fs::create_dir_all(parent).await
-                    .map_err(|e| format!("Failed to create rsrc dir for '{}': {e}", rel.display()))?;
+            if let Err(e) = write_rsrc_sidecar(volume_path, &on_disk_full_rel, &rsrc_fork).await {
+                tracing::warn!("Could not write resource fork for '{}': {e}", rel.display());
+                continue;
             }
-            tokio::fs::write(&rsrc_dest, &rsrc_fork).await
-                .map_err(|e| format!("Failed to write resource fork for '{}': {e}", rel.display()))?;
 
-            let file_name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-            if file_name == "Icon\r" {
+            if is_icon_cr {
                 let parent_dir = full_rel.parent().unwrap_or(Path::new("")).to_path_buf();
                 deferred_icon_cr.push((parent_dir, rsrc_fork));
             } else {
                 if let Some(creator) = extract_bndl_creator(&rsrc_fork) {
-                    dir_creators.entry(file.parent_cnid).or_insert(creator);
+                    let parent_dir = full_rel.parent().unwrap_or(Path::new("")).to_path_buf();
+                    dir_creators.entry(parent_dir).or_insert(creator);
                 }
                 if let Err(e) = register_appl_from_resource_fork(&rsrc_fork, &full_rel, volume_path) {
                     tracing::warn!("Could not register APPL for '{}': {e}", rel.display());
@@ -1490,34 +1624,32 @@ async fn extract_hfs_image(img_path: &Path, volume_path: &Path) -> Result<usize,
 
     // Also create any directories that existed in the image but had no files.
     for dir in &vol.dirs {
-        let abs = dest_root.join(&dir.rel_path);
-        tokio::fs::create_dir_all(&abs).await
-            .map_err(|e| format!("Failed to create directory '{}': {e}", dir.rel_path.display()))?;
+        let rel = sanitize_rel_path(&dir.rel_path);
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        if let Err(e) = tokio::fs::create_dir_all(dest_root.join(&rel)).await {
+            tracing::warn!("Failed to create directory '{}': {e}", rel.display());
+        }
     }
 
     // Process deferred Icon\r entries now that we have the full creator map.
     for (parent_dir, rsrc_fork) in &deferred_icon_cr {
-        let creator = dir_creators
-            .values()
-            .next()
-            .copied()
-            .unwrap_or_else(|| {
-                let folder_name = parent_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
-                let mut c = [b' '; 4];
-                for (dst, src) in c.iter_mut().zip(folder_name.bytes()) {
-                    *dst = src;
-                }
-                c
-            });
+        // Use the real creator from a BNDL in the same directory if available.
+        let creator = dir_creators.get(parent_dir).copied().unwrap_or_else(|| {
+            // Fallback: derive from the folder name (space-padded to 4 bytes).
+            let folder_name = parent_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            string_to_ostype(folder_name)
+        });
         if let Err(e) = load_icon_rsrc_into_desktop_db(rsrc_fork, creator, volume_path) {
             tracing::warn!("Could not load Icon\\r into desktop db: {e}");
         }
     }
 
-    Ok(file_count)
+    Ok((file_count, skipped))
 }
 
 // ── AFP server task ───────────────────────────────────────────────────────────
@@ -1542,6 +1674,7 @@ async fn run_server(
     let set_stopped = |ui_weak: slint::Weak<AppWindow>| {
         slint::invoke_from_event_loop(move || {
             if let Some(ui) = ui_weak.upgrade() {
+                ui.set_starting(false);
                 ui.set_running(false);
             }
         })
