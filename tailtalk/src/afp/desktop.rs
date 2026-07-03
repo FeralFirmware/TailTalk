@@ -140,19 +140,16 @@ impl DesktopDatabase {
             Err(AfpError::ItemNotFound)
         }
     }
+
+    /// Return (IconTag, FileType, Size) for the 1-based `index`-th icon
+    /// registered for `creator`; clients walk index 1, 2, … until ItemNotFound.
     pub fn get_icon_info(
         &self,
         creator: [u8; 4],
-        _icon_type: u16,
+        index: u16,
     ) -> Result<(u32, u32, u16), AfpError> {
-        // Since sled stores the entire icon, we can iterate over the keys matching the creator
-        // and find an icon type that matches the request. Or return basic size info.
-
-        // Format is:
-        // tag (4 bytes)
-        // file_type (4 bytes)
-        // icon_type (1 byte, padding, or matching requested size)
-        // size (2 bytes)
+        let target = index.saturating_sub(1) as usize;
+        let mut seen = 0usize;
 
         for result in self.icons.iter() {
             if let Ok((key, value)) = result
@@ -161,17 +158,15 @@ impl DesktopDatabase {
                 let mut key_creator = [0u8; 4];
                 key_creator.copy_from_slice(&key[0..4]);
                 if key_creator == creator {
-                    let mut file_type = [0u8; 4];
-                    file_type.copy_from_slice(&key[4..8]);
-
-                    // We just return the first icon we find for this creator
-                    // For a full implementation we would want to correctly parse the icon_type u16 request into the actual icon_type u8
-                    // Return: IconTag (4 bytes), FileCreator/Type (4 bytes), Size (2 bytes)
-                    let icon_tag = 0; // Or whatever tag you want
-                    let file_type_u32 = u32::from_be_bytes(file_type);
-                    let size = value.len() as u16;
-
-                    return Ok((icon_tag, file_type_u32, size));
+                    if seen == target {
+                        let mut file_type = [0u8; 4];
+                        file_type.copy_from_slice(&key[4..8]);
+                        let icon_tag = 0;
+                        let file_type_u32 = u32::from_be_bytes(file_type);
+                        let size = value.len() as u16;
+                        return Ok((icon_tag, file_type_u32, size));
+                    }
+                    seen += 1;
                 }
             }
         }

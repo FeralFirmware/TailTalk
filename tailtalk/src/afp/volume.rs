@@ -195,9 +195,11 @@ impl Node {
         }
     }
 
-    /// Read Finder Info from the platform-native metadata store.
-    /// If no Finder Info exists for a file, attempts to infer type/creator from
-    /// the file extension and persists the result so future reads are consistent.
+    /// Read Finder Info from the platform-native metadata store. If none is
+    /// set, infers type/creator from the file's content (or extension) for
+    /// this response only — not written back, since this is called from
+    /// read-only ops like FPGetFileParms/FPEnumerate and persisting a guess
+    /// there would mutate files as a side effect of listing them.
     pub async fn get_finder_info(&self, volume_root: &Path) -> FinderInfo {
         let absolute_path = volume_root.join(&self.path);
         let stored = read_finder_info(&absolute_path).await.unwrap_or_default();
@@ -211,15 +213,11 @@ impl Node {
                 .await
                 .unwrap_or(None);
             if let Some(tc) = maybe_tc {
-                let inferred = FinderInfo {
+                return FinderInfo {
                     file_type: tc.file_type,
                     creator: tc.creator,
                     ..Default::default()
                 };
-                if let Err(e) = write_finder_info(&absolute_path, &inferred).await {
-                    error!("Failed to persist inferred Finder Info for {:?}: {:?}", self.path, e);
-                }
-                return inferred;
             }
         }
 
@@ -281,13 +279,14 @@ impl Node {
         }
 
         if bitmap.contains(FPFileBitmap::CREATE_DATE) {
-            let created_at_bytes = time_to_afp_v1(metadata.created().unwrap()).to_be_bytes();
+            let created_at_bytes = time_to_afp_v1(creation_time(&metadata)).to_be_bytes();
             output[offset..offset + 4].copy_from_slice(&created_at_bytes);
             offset += 4;
         }
 
         if bitmap.contains(FPFileBitmap::MODIFICATION_DATE) {
-            let modified_at_bytes = time_to_afp_v1(metadata.modified().unwrap()).to_be_bytes();
+            let modified = metadata.modified().unwrap_or_else(|_| creation_time(&metadata));
+            let modified_at_bytes = time_to_afp_v1(modified).to_be_bytes();
             output[offset..offset + 4].copy_from_slice(&modified_at_bytes);
             offset += 4;
         }
@@ -324,7 +323,8 @@ impl Node {
         }
 
         if bitmap.contains(FPFileBitmap::DATA_FORK_LENGTH) {
-            output[offset..offset + 4].copy_from_slice(&(metadata.len() as u32).to_be_bytes());
+            let data_len = clamp_len_u32(metadata.len(), "data fork length", &self.path);
+            output[offset..offset + 4].copy_from_slice(&data_len.to_be_bytes());
             offset += 4;
         }
 
@@ -356,11 +356,46 @@ pub struct Volume {
     path_to_id: HashMap<PathBuf, u32>,
     next_id: u32,
     fork_ref_to_node_id: HashMap<u16, (u32, ForkType)>,
+    /// FPOpenFork access mode per fork_ref_num, used to reject writes to a
+    /// read-only fork. 0 means the client left it unspecified (writes allowed).
+    fork_access: HashMap<u16, u16>,
     next_fork_ref_num: u16,
     /// Tracks byte-range locks per fork. Key is fork_ref_num, value is a vector of (offset, length) tuples
     fork_locks: HashMap<u16, Vec<(u64, u64)>>,
+    /// Per-directory snapshot of sorted `(name, is_dir)` for FPEnumerate. Built on
+    /// the first page of a listing (start_index==1) and reused for continuation
+    /// pages, so paging is O(n) rather than O(n²) and stays consistent across pages.
+    /// Cleared on any structural mutation in this session.
+    enum_cache: HashMap<u32, Vec<(String, bool)>>,
     desktop_database: crate::afp::DesktopDatabase,
     mangle_tree: sled::Tree,
+}
+
+/// AFP FPOpenFork access-mode bit granting write permission.
+const AFP_ACCESS_WRITE: u16 = 0x0002;
+
+/// Clamp a 64-bit byte length to the u32 field width used by AFP 2.x, logging
+/// once if the file is genuinely larger than 4 GiB so the truncation isn't silent.
+fn clamp_len_u32(len: u64, what: &str, path: &Path) -> u32 {
+    if len > u32::MAX as u64 {
+        tracing::warn!(
+            "{what} of {:?} is {len} bytes, exceeds the AFP 2.x 4 GiB limit; reporting {}",
+            path, u32::MAX
+        );
+        u32::MAX
+    } else {
+        len as u32
+    }
+}
+
+/// Best-effort creation time: some filesystems/platforms don't record btime and
+/// return an error from `created()`. Fall back to mtime, then the Unix epoch,
+/// rather than panicking the session.
+fn creation_time(metadata: &std::fs::Metadata) -> SystemTime {
+    metadata
+        .created()
+        .or_else(|_| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 /// Returns the path to the resource fork sidecar for a given file.
@@ -398,13 +433,13 @@ async fn resolve_resource_fork_path(volume_root: &Path, relative_path: &Path) ->
         if let Ok(meta) = tokio::fs::metadata(&native).await
             && meta.len() > 0
         {
-            return (native, meta.len() as u32);
+            return (native, clamp_len_u32(meta.len(), "resource fork length", relative_path));
         }
         let sidecar = rsrc_path(volume_root, relative_path);
         if let Ok(meta) = tokio::fs::metadata(&sidecar).await
             && meta.len() > 0
         {
-            return (sidecar, meta.len() as u32);
+            return (sidecar, clamp_len_u32(meta.len(), "resource fork length", relative_path));
         }
         (native, 0)
     }
@@ -414,9 +449,39 @@ async fn resolve_resource_fork_path(volume_root: &Path, relative_path: &Path) ->
         if let Ok(meta) = tokio::fs::metadata(&sidecar).await
             && meta.len() > 0
         {
-            return (sidecar, meta.len() as u32);
+            return (sidecar, clamp_len_u32(meta.len(), "resource fork length", relative_path));
         }
         (sidecar, 0)
+    }
+}
+
+/// Classic Mac OS's magic filename for a folder's custom icon. Finder creates
+/// it with this exact spelling, raw carriage return included — which NTFS
+/// rejects as a filename character, so Windows needs an on-disk alias (see
+/// `icon_cr_on_disk_name`); macOS/Linux round-trip the literal name fine.
+pub const ICON_CR_NAME: &str = "Icon\r";
+
+/// On-disk filename to use in place of [`ICON_CR_NAME`]: a Windows-safe alias
+/// there, the literal name everywhere else.
+pub fn icon_cr_on_disk_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "Icon%0D"
+    }
+    #[cfg(not(windows))]
+    {
+        ICON_CR_NAME
+    }
+}
+
+/// Converts a single AFP-visible filename component to its on-disk POSIX
+/// form: aliases `Icon\r` per [`icon_cr_on_disk_name`], otherwise maps AFP's
+/// literal '/' to POSIX ':'.
+fn afp_name_to_posix_component(name: &str) -> String {
+    if name == ICON_CR_NAME {
+        icon_cr_on_disk_name().to_string()
+    } else {
+        name.replace('/', ":")
     }
 }
 
@@ -428,17 +493,30 @@ async fn resolve_resource_fork_path(volume_root: &Path, relative_path: &Path) ->
 pub(super) fn afp_path_to_posix(afp_path: &str) -> PathBuf {
     let mut result = PathBuf::new();
     for component in afp_path.split(':') {
-        if !component.is_empty() {
-            result.push(component.replace('/', ":"));
+        if component.is_empty() {
+            continue;
         }
+        // AFP has no "."/".." path semantics — a client sending them is trying to
+        // escape the volume root. Drop them so a later `join` can't traverse upward.
+        // This is the single choke point every client path passes through, so all
+        // callers (including create_file/create_dir, which don't go via resolve_node)
+        // inherit the protection.
+        if component == "." || component == ".." {
+            continue;
+        }
+        result.push(afp_name_to_posix_component(component));
     }
     result
 }
 
 /// Converts a POSIX filename to the AFP name sent to Mac clients.
-/// POSIX ':' represents what HFS calls '/', so we map it back.
+/// Reverses the Icon\r alias, and maps POSIX ':' back to '/'.
 fn posix_name_to_afp(name: &str) -> String {
-    name.replace(':', "/")
+    if name == icon_cr_on_disk_name() {
+        ICON_CR_NAME.to_string()
+    } else {
+        name.replace(':', "/")
+    }
 }
 
 /// If `afp_name` encodes to more than AFP2_MAX_NAME_LEN MacRoman bytes, registers the
@@ -483,8 +561,10 @@ impl Volume {
             path_to_id: HashMap::new(),
             next_id: 3, // Start IDs at 3 (1=Parent of Root, 2=Root)
             fork_ref_to_node_id: HashMap::new(),
+            fork_access: HashMap::new(),
             next_fork_ref_num: 1,
             fork_locks: HashMap::new(),
+            enum_cache: HashMap::new(),
             desktop_database,
             mangle_tree,
         };
@@ -778,15 +858,17 @@ impl Volume {
         let new_id = self.next_id;
         self.next_id += 1;
 
+        let on_disk_name = path_name
+            .file_name()
+            .ok_or(AfpError::ObjectNotFound)?
+            .to_string_lossy()
+            .into_owned();
+        let afp_name = posix_name_to_afp(&on_disk_name);
+
         let node = Node {
             id: new_id,
             parent_id: directory_id,
-            name: posix_name_to_afp(
-                &path_name
-                    .file_name()
-                    .ok_or(AfpError::ObjectNotFound)?
-                    .to_string_lossy(),
-            ),
+            name: afp_name.clone(),
             is_dir: true,
             path: full_relative_path.clone(),
             data_fork: None,
@@ -795,6 +877,8 @@ impl Volume {
 
         self.nodes.insert(new_id, node);
         self.path_to_id.insert(full_relative_path, new_id);
+        register_mangle_if_needed(&self.mangle_tree, &afp_name, &on_disk_name);
+        self.enum_cache.clear();
 
         Ok(new_id)
     }
@@ -838,15 +922,17 @@ impl Volume {
         let new_id = self.next_id;
         self.next_id += 1;
 
+        let on_disk_name = full_relative_path
+            .file_name()
+            .ok_or(AfpError::ObjectNotFound)?
+            .to_string_lossy()
+            .into_owned();
+        let afp_name = posix_name_to_afp(&on_disk_name);
+
         let node = Node {
             id: new_id,
             parent_id: directory_id,
-            name: posix_name_to_afp(
-                &full_relative_path
-                    .file_name()
-                    .ok_or(AfpError::ObjectNotFound)?
-                    .to_string_lossy(),
-            ),
+            name: afp_name.clone(),
             is_dir: false,
             path: full_relative_path.clone(),
             data_fork: None,
@@ -855,6 +941,10 @@ impl Volume {
 
         self.nodes.insert(new_id, node);
         self.path_to_id.insert(full_relative_path, new_id);
+        // A newly created long name must be reversible immediately, without
+        // waiting for a restart to re-walk the tree.
+        register_mangle_if_needed(&self.mangle_tree, &afp_name, &on_disk_name);
+        self.enum_cache.clear();
 
         Ok(new_id)
     }
@@ -1266,6 +1356,7 @@ impl Volume {
         &mut self,
         fork_type: ForkType,
         bitmap: FPFileBitmap,
+        access_mode: u16,
         dir_id: u32,
         relative_path: &Path,
         output: &mut [u8],
@@ -1303,6 +1394,7 @@ impl Volume {
                     self.next_fork_ref_num = 1;
                 }
                 self.fork_ref_to_node_id.insert(fork_ref_num, (id, fork_type));
+                self.fork_access.insert(fork_ref_num, access_mode);
 
                 output[offset..offset + 2].copy_from_slice(&bitmap.bits().to_be_bytes());
                 offset += 2;
@@ -1340,6 +1432,7 @@ impl Volume {
                     self.next_fork_ref_num = 1;
                 }
                 self.fork_ref_to_node_id.insert(fork_ref_num, (id, fork_type));
+                self.fork_access.insert(fork_ref_num, access_mode);
 
                 output[offset..offset + 2].copy_from_slice(&bitmap.bits().to_be_bytes());
                 offset += 2;
@@ -1427,6 +1520,7 @@ impl Volume {
         }
 
         self.fork_ref_to_node_id.remove(&fork_id);
+        self.fork_access.remove(&fork_id);
         self.fork_locks.remove(&fork_id);
 
         Ok(())
@@ -1584,45 +1678,49 @@ impl Volume {
             return Err(AfpError::ObjectTypeErr);
         }
 
-        let full_path = self.path.join(&node_path);
-        let mut entries = Vec::new();
-
-        let mut read_dir = tokio::fs::read_dir(&full_path)
-            .await
-            .map_err(|_| AfpError::ObjectNotFound)?;
-
-        while let Some(entry) = read_dir
-            .next_entry()
-            .await
-            .map_err(|_| AfpError::ObjectNotFound)?
-        {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name == ".tailtalk" || name == ".AppleDesktop" {
-                continue;
-            }
-
-            let file_type = entry
-                .file_type()
-                .await
-                .map_err(|_| AfpError::ObjectNotFound)?;
-            let is_dir = file_type.is_dir();
-
-            entries.push((entry, is_dir, name));
-        }
-
-        entries.sort_by(|a, b| match (a.1, b.1) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.2.cmp(&b.2),
-        });
-
-        if entries.is_empty() {
+        let start_index = enumerate_cmd.start_index as usize;
+        if start_index == 0 {
             return Err(AfpError::ObjectNotFound);
         }
 
-        let start_index = enumerate_cmd.start_index as usize;
+        // Build (or reuse) a sorted snapshot of this directory's entries. The first
+        // page of a listing (start_index == 1) always rebuilds it from disk; later
+        // pages reuse the snapshot, so paging is O(n) rather than O(n²) and stays
+        // consistent even if the directory changes mid-enumeration.
+        if start_index == 1 || !self.enum_cache.contains_key(&node_id) {
+            let full_path = self.path.join(&node_path);
+            let mut entries: Vec<(String, bool)> = Vec::new();
+            let mut read_dir = tokio::fs::read_dir(&full_path)
+                .await
+                .map_err(|_| AfpError::ObjectNotFound)?;
+            while let Some(entry) = read_dir
+                .next_entry()
+                .await
+                .map_err(|_| AfpError::ObjectNotFound)?
+            {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name == ".tailtalk" || name == ".AppleDesktop" {
+                    continue;
+                }
+                let is_dir = entry
+                    .file_type()
+                    .await
+                    .map_err(|_| AfpError::ObjectNotFound)?
+                    .is_dir();
+                entries.push((name, is_dir));
+            }
+            entries.sort_by(|a, b| match (a.1, b.1) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.0.cmp(&b.0),
+            });
+            self.enum_cache.insert(node_id, entries);
+        }
 
-        if start_index == 0 {
+        let entries = self.enum_cache.get(&node_id).ok_or(AfpError::ObjectNotFound)?;
+
+        if entries.is_empty() {
+            self.enum_cache.remove(&node_id);
             return Err(AfpError::ObjectNotFound);
         }
 
@@ -1630,19 +1728,19 @@ impl Volume {
         let end_idx = std::cmp::min(start_idx + enumerate_cmd.req_count as usize, entries.len());
 
         // start_idx may be past the end of the directory; produce an empty page (count=0).
-        let entries_to_return: &[(tokio::fs::DirEntry, bool, String)] =
-            if start_idx < entries.len() {
-                &entries[start_idx..end_idx]
-            } else {
-                &[]
-            };
+        // Clone the page so the immutable cache borrow ends before we mutate node maps below.
+        let entries_to_return: Vec<(String, bool)> = if start_idx < entries.len() {
+            entries[start_idx..end_idx].to_vec()
+        } else {
+            Vec::new()
+        };
 
         let mut offset = 0;
         let count_offset = offset;
         offset += 2;
         let mut actual_count: u16 = 0;
 
-        for (_entry, is_dir, name) in entries_to_return {
+        for (name, is_dir) in &entries_to_return {
             let entry_relative_path = node_path.join(name);
 
             if !self.path_to_id.contains_key(&entry_relative_path) {
@@ -1900,7 +1998,7 @@ impl Volume {
         } else {
             new_name.to_string()
         };
-        let effective_posix_name = effective_afp_name.replace('/', ":");
+        let effective_posix_name = afp_name_to_posix_component(&effective_afp_name);
 
         let new_relative = dst_relative.join(&effective_posix_name);
 
@@ -1936,7 +2034,7 @@ impl Volume {
         {
             let node = self.nodes.get_mut(&src_node_id).unwrap();
             node.parent_id = dst_node_id;
-            node.name = effective_afp_name;
+            node.name = effective_afp_name.clone();
             node.path = new_relative.clone();
         }
 
@@ -1969,6 +2067,10 @@ impl Volume {
             let new_path_str = new_relative.to_string_lossy();
             let _ = self.desktop_database.move_appl_path(&old_path_str, &new_path_str, src_dir_id, dst_node_id);
         }
+
+        // A rename to a long name must be reversible immediately.
+        register_mangle_if_needed(&self.mangle_tree, &effective_afp_name, &effective_posix_name);
+        self.enum_cache.clear();
 
         Ok(())
     }
@@ -2051,6 +2153,7 @@ impl Volume {
 
         self.nodes.remove(&node_id);
         self.path_to_id.remove(&relative_path);
+        self.enum_cache.clear();
 
         Ok(())
     }
@@ -2089,7 +2192,7 @@ impl Volume {
 
         // src_name is the AFP name (node.name invariant); new_name is AFP from the client.
         let effective_afp_name = if new_name.is_empty() { src_name.as_str() } else { new_name };
-        let effective_posix_name = effective_afp_name.replace('/', ":");
+        let effective_posix_name = afp_name_to_posix_component(effective_afp_name);
 
         let new_relative = dst_relative.join(&effective_posix_name);
         if self.path_to_id.contains_key(&new_relative) {
@@ -2151,6 +2254,8 @@ impl Volume {
 
         self.nodes.insert(new_id, node);
         self.path_to_id.insert(new_relative, new_id);
+        register_mangle_if_needed(&self.mangle_tree, effective_afp_name, &effective_posix_name);
+        self.enum_cache.clear();
 
         Ok(new_id)
     }
@@ -2180,12 +2285,42 @@ impl Volume {
         Ok(())
     }
 
+    /// Sync only the single fork named by `fork_id` to disk, for FPFlushFork.
+    /// Unknown fork IDs are treated as a no-op success.
+    pub async fn sync_fork(&mut self, fork_id: u16) -> Result<(), AfpError> {
+        let Some(&(node_id, fork_type)) = self.fork_ref_to_node_id.get(&fork_id) else {
+            return Ok(());
+        };
+        let node = self.nodes.get_mut(&node_id).ok_or(AfpError::ObjectNotFound)?;
+        let file = match fork_type {
+            ForkType::Data => node.data_fork.as_mut(),
+            ForkType::Resource => node.resource_fork.as_mut(),
+        };
+        if let Some(file) = file {
+            file.sync_all().await.map_err(|e| {
+                error!("Failed to sync fork {fork_id}: {:?}", e);
+                AfpError::AccessDenied
+            })?;
+        }
+        Ok(())
+    }
+
     pub async fn write_fork(
         &mut self,
         fork_id: u16,
         offset: u64,
         data: &[u8],
     ) -> Result<usize, AfpError> {
+        // Reject writes to a fork the client opened without write access. A mode of
+        // 0 means the client left access unspecified, which we allow (matching prior
+        // behaviour); only an explicit read-only open is enforced.
+        if let Some(&mode) = self.fork_access.get(&fork_id)
+            && mode != 0
+            && mode & AFP_ACCESS_WRITE == 0
+        {
+            return Err(AfpError::AccessDenied);
+        }
+
         let (node_id, fork_type) = self
             .fork_ref_to_node_id
             .get(&fork_id)
@@ -2286,6 +2421,70 @@ mod tests {
     async fn make_test_volume(name: String, path: PathBuf) -> Volume {
         let db = crate::afp::DesktopDatabase::open_or_create(&path).unwrap();
         Volume::new(name, path, 1, db).await
+    }
+
+    #[test]
+    fn afp_path_to_posix_strips_traversal() {
+        // "." and ".." components are dropped so a join can't escape the volume root.
+        assert_eq!(afp_path_to_posix("..:..:etc:passwd"), PathBuf::from("etc/passwd"));
+        assert_eq!(afp_path_to_posix(".:foo"), PathBuf::from("foo"));
+        assert_eq!(afp_path_to_posix("a:..:b"), PathBuf::from("a/b"));
+        // A normal path is unaffected; ':' is the AFP separator, '/' maps to ':'.
+        assert_eq!(afp_path_to_posix("dir:file.txt"), PathBuf::from("dir/file.txt"));
+    }
+
+    #[test]
+    fn icon_cr_round_trips_through_posix_conversion() {
+        // On Windows the magic name is aliased on disk; elsewhere it passes through
+        // unchanged (the raw carriage return round-trips fine on macOS/Linux today).
+        let on_disk = afp_path_to_posix(ICON_CR_NAME);
+        assert_eq!(on_disk, PathBuf::from(icon_cr_on_disk_name()));
+        assert_eq!(posix_name_to_afp(icon_cr_on_disk_name()), ICON_CR_NAME);
+        #[cfg(not(windows))]
+        assert_eq!(icon_cr_on_disk_name(), ICON_CR_NAME, "non-Windows must not alias Icon\\r");
+        #[cfg(windows)]
+        assert_ne!(icon_cr_on_disk_name(), ICON_CR_NAME, "Windows must alias Icon\\r");
+    }
+
+    #[tokio::test]
+    async fn create_file_cannot_escape_volume_root() {
+        let outer = tempdir().unwrap();
+        let root_path = outer.path().join("share");
+        tokio::fs::create_dir(&root_path).await.unwrap();
+        let mut volume = make_test_volume("TestVol".to_string(), root_path.clone()).await;
+
+        // A client path of "..:escaped.txt" must not create a file in the parent
+        // of the volume root; the ".." is stripped so it lands inside the volume.
+        volume
+            .create_file(CreateFlag::Soft, 2, afp_path_to_posix("..:escaped.txt"))
+            .await
+            .unwrap();
+
+        assert!(!outer.path().join("escaped.txt").exists(), "file escaped the volume root");
+        assert!(root_path.join("escaped.txt").exists(), "file should stay inside the volume");
+    }
+
+    #[tokio::test]
+    async fn write_to_read_only_fork_is_denied() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        File::create(root_path.join("ro.txt")).await.unwrap();
+        let mut volume = make_test_volume("TestVol".to_string(), root_path).await;
+
+        let mut output = [0u8; 256];
+        // Open with the Read bit only (0x01), no Write bit.
+        volume
+            .open_fork(ForkType::Data, FPFileBitmap::FILE_NUMBER, 0x0001, 2,
+                       &PathBuf::from("ro.txt"), &mut output)
+            .await
+            .unwrap();
+        let fork_ref = u16::from_be_bytes(output[2..4].try_into().unwrap());
+
+        assert_eq!(
+            volume.write_fork(fork_ref, 0, b"nope").await,
+            Err(AfpError::AccessDenied),
+            "writing a read-only fork must be denied"
+        );
     }
 
     #[tokio::test]
@@ -2410,6 +2609,7 @@ mod tests {
             .open_fork(
                 ForkType::Data,
                 FPFileBitmap::FILE_NUMBER,
+                0,
                 2,
                 &PathBuf::from("root_file.txt"),
                 &mut output,
@@ -2430,6 +2630,7 @@ mod tests {
             .open_fork(
                 ForkType::Data,
                 FPFileBitmap::FILE_NUMBER,
+                0,
                 2,
                 &PathBuf::from("root_file.txt"),
                 &mut output,
@@ -2449,6 +2650,7 @@ mod tests {
             .open_fork(
                 ForkType::Data,
                 FPFileBitmap::FILE_NUMBER,
+                0,
                 subdir_id,
                 &PathBuf::from("sub_file.txt"),
                 &mut output,
@@ -2491,6 +2693,7 @@ mod tests {
             .open_fork(
                 ForkType::Resource,
                 FPFileBitmap::RESOURCE_FORK_LENGTH,
+                0,
                 2,
                 &PathBuf::from("rsrc_test.txt"),
                 &mut output,
@@ -2544,6 +2747,7 @@ mod tests {
             .open_fork(
                 ForkType::Resource,
                 FPFileBitmap::RESOURCE_FORK_LENGTH,
+                0,
                 subdir_id,
                 &PathBuf::from("rsrc_sub.txt"),
                 &mut output,
@@ -2639,6 +2843,7 @@ mod tests {
             .open_fork(
                 ForkType::Resource,
                 FPFileBitmap::RESOURCE_FORK_LENGTH,
+                0,
                 2,
                 &PathBuf::from("MacApp"),
                 &mut output,
@@ -3332,6 +3537,7 @@ mod tests {
             .open_fork(
                 ForkType::Data,
                 FPFileBitmap::FILE_NUMBER,
+                0,
                 2,
                 &PathBuf::from(&mangled_str),
                 &mut output,
