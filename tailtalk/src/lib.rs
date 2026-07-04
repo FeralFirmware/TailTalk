@@ -24,6 +24,7 @@ pub mod ddp;
 pub mod echo;
 pub mod nbp;
 pub mod pap;
+pub mod remote;
 pub mod route_table;
 pub mod stylewriter;
 
@@ -303,6 +304,12 @@ impl PacketProcessor {
             let tx_watch = tashtalk_tx_watch_tx;
 
             tokio::spawn(async move {
+                // Watch for address changes (e.g. via a daemon SetAddress
+                // request) so the TashTalk node ID bits can be reprogrammed.
+                let mut addr_watch = addressing_handle
+                    .addr_watch()
+                    .expect("TashTalk requires locally-owned addressing");
+                let mut addr_watch_alive = true;
                 let mut first_connect = true;
                 loop {
                     // ── Open serial port ────────────────────────────────
@@ -358,6 +365,9 @@ impl PacketProcessor {
                             continue;
                         }
                     }
+                    // The node bits above reflect the current address; don't
+                    // replay an already-seen change notification.
+                    let _ = addr_watch.borrow_and_update();
 
                     // ── Create TX channel for this connection ────────────
                     let (tx, mut tashtalk_rx) = mpsc::channel::<Vec<u8>>(100);
@@ -369,6 +379,24 @@ impl PacketProcessor {
                     loop {
                         tokio::select! {
                             _ = tash_token.cancelled() => return,
+                            changed = addr_watch.changed(), if addr_watch_alive => {
+                                let new_addr = if changed.is_err() {
+                                    addr_watch_alive = false;
+                                    None
+                                } else {
+                                    *addr_watch.borrow_and_update()
+                                };
+                                if let Some(addr) = new_addr {
+                                    let node_id = addr.node_number;
+                                    tracing::info!("TashTalk: address changed, setting node ID bits for node {node_id}");
+                                    let mut node_bits = [0u8; 32];
+                                    node_bits[(node_id / 8) as usize] |= 1 << (node_id % 8);
+                                    if let Err(e) = tashtalk_instance.set_node_ids(node_bits).await {
+                                        tracing::error!("TashTalk set_node_ids failed: {:?}", e);
+                                        break;
+                                    }
+                                }
+                            }
                             frame_opt = tashtalk_rx.recv() => {
                                 if let Some(frame) = frame_opt {
                                     if let Err(e) = tashtalk_instance.send_frame(&frame).await {
@@ -735,7 +763,28 @@ impl TalkStack {
     }
 }
 
+/// The lower half of the stack: interfaces, addressing (AARP/LLAP), DDP and
+/// the routing table — without NBP/AEP services on top.
+///
+/// Produced by [`TalkStackBuilder::build_underlay`]. This is what the
+/// TailTalk daemon (`tailtalkd`) runs to own the interfaces on behalf of
+/// remote clients.
+pub struct Underlay {
+    pub et_addressing: Option<addressing::AddressingHandle>,
+    pub lt_addressing: Option<addressing::AddressingHandle>,
+    pub ddp: ddp::DdpHandle,
+    pub route_table: route_table::RouteTable,
+    /// Cancel to stop the transport (PacketProcessor).
+    pub transport_token: CancellationToken,
+}
+
 /// Builder for [`TalkStack`].
+///
+/// The underlay (AARP/DDP + interfaces) either runs in-process — configure
+/// [`ethernet`](Self::ethernet) and/or [`localtalk`](Self::localtalk) — or in
+/// a separate TailTalk daemon reached via [`daemon_unix`](Self::daemon_unix)
+/// or [`daemon_udp`](Self::daemon_udp). Everything above DDP behaves
+/// identically in both modes.
 pub struct TalkStackBuilder {
     #[cfg(feature = "ethertalk")]
     ethernet_intf: Option<String>,
@@ -745,6 +794,7 @@ pub struct TalkStackBuilder {
     fixed_addr: Option<tailtalk_packets::aarp::AppleTalkAddress>,
     lt_fixed_node: Option<u8>,
     pcap_path: Option<PathBuf>,
+    daemon: Option<remote::DaemonEndpoint>,
 }
 
 impl TalkStack {
@@ -758,6 +808,7 @@ impl TalkStack {
             fixed_addr: None,
             lt_fixed_node: None,
             pcap_path: None,
+            daemon: None,
         }
     }
 }
@@ -808,11 +859,45 @@ impl TalkStackBuilder {
         self
     }
 
-    /// Launch the full AppleTalk stack and return handles to each layer.
+    /// Use a remote TailTalk daemon (reached over a Unix domain socket) as the
+    /// AARP/DDP underlay instead of handling interfaces in this process.
     ///
-    /// Spawns actors for AARP/Addressing, DDP, AEP (Echo), and NBP in dependency
-    /// order, then starts the [`PacketProcessor`] background task.
-    pub async fn build(self) -> Result<TalkStack, Error> {
+    /// Mutually exclusive with [`ethernet`](Self::ethernet) /
+    /// [`localtalk`](Self::localtalk): the daemon owns the interfaces.
+    #[cfg(unix)]
+    pub fn daemon_unix(mut self, path: impl Into<PathBuf>) -> Self {
+        self.daemon = Some(remote::DaemonEndpoint::Unix(path.into()));
+        self
+    }
+
+    /// Use a remote TailTalk daemon reached over UDP as the AARP/DDP underlay.
+    ///
+    /// See [`daemon_unix`](Self::daemon_unix).
+    pub fn daemon_udp(mut self, addr: std::net::SocketAddr) -> Self {
+        self.daemon = Some(remote::DaemonEndpoint::Udp(addr));
+        self
+    }
+
+    fn has_local_transport(&self) -> bool {
+        #[cfg(feature = "ethertalk")]
+        if self.ethernet_intf.is_some() {
+            return true;
+        }
+        self.localtalk_serial_path.is_some()
+    }
+
+    /// Launch only the lower half of the stack: interfaces, AARP/LLAP
+    /// addressing, DDP and the routing table — no NBP or AEP services.
+    ///
+    /// This is what the TailTalk daemon runs; most applications want
+    /// [`build`](Self::build) instead.
+    pub async fn build_underlay(self) -> Result<Underlay, Error> {
+        if self.daemon.is_some() {
+            return Err(anyhow::anyhow!(
+                "build_underlay creates a local underlay; use build() with a daemon endpoint"
+            ));
+        }
+
         let mut pp = PacketProcessor::builder().tashtalk_features(self.tashtalk_features);
         #[cfg(feature = "ethertalk")]
         if let Some(ref intf) = self.ethernet_intf {
@@ -858,12 +943,8 @@ impl TalkStackBuilder {
 
         let route_table = route_table::RouteTable::new(route_table::LearningMode::Static);
         let ddp = ddp::DdpProcessor::spawn(et_addressing.clone(), lt_addressing.clone(), outbound, route_table.clone());
-        let echo = echo::Echo::spawn(&ddp).await;
-        let nbp = nbp::Nbp::spawn(&ddp, et_addressing.clone(), lt_addressing.clone(), route_table.clone()).await;
 
-        let service_token = CancellationToken::new();
         let transport_token = CancellationToken::new();
-        let services_done = CancellationToken::new();
         tokio::spawn(processor.run(et_addressing.clone(), lt_addressing.clone(), ddp.clone(), transport_token.clone()));
 
         // Wait until addressing has settled on all active interfaces.
@@ -872,6 +953,109 @@ impl TalkStackBuilder {
         }
         if let Some(lt) = &lt_addressing {
             lt.addr().await?;
+        }
+
+        Ok(Underlay { et_addressing, lt_addressing, ddp, route_table, transport_token })
+    }
+
+    /// Launch the full AppleTalk stack and return handles to each layer.
+    ///
+    /// With local interfaces, spawns actors for AARP/Addressing, DDP, AEP
+    /// (Echo), and NBP in dependency order, then starts the
+    /// [`PacketProcessor`] background task. With a daemon endpoint, connects
+    /// to the daemon and runs the same AEP/NBP services over its DDP layer.
+    pub async fn build(self) -> Result<TalkStack, Error> {
+        if let Some(endpoint) = self.daemon.clone() {
+            return self.build_remote(endpoint).await;
+        }
+
+        let Underlay { et_addressing, lt_addressing, ddp, route_table, transport_token } =
+            self.build_underlay().await?;
+
+        let echo = echo::Echo::spawn(&ddp).await;
+        let nbp = nbp::Nbp::spawn(&ddp, et_addressing.clone(), lt_addressing.clone(), route_table.clone()).await;
+
+        let service_token = CancellationToken::new();
+        let services_done = CancellationToken::new();
+
+        Ok(TalkStack { et_addressing, lt_addressing, ddp, nbp, echo, route_table, service_token, transport_token, services_done })
+    }
+
+    /// Build the stack on top of a remote daemon's underlay.
+    async fn build_remote(self, endpoint: remote::DaemonEndpoint) -> Result<TalkStack, Error> {
+        if self.has_local_transport() {
+            return Err(anyhow::anyhow!(
+                "cannot combine local interfaces with a remote daemon; configure the interfaces on the daemon instead"
+            ));
+        }
+
+        let client = remote::RemoteClient::connect(&endpoint).await?;
+
+        // Map the daemon's interfaces onto addressing handles. If the daemon
+        // has several interfaces of one type, the first is used — same as the
+        // local builder, which supports one of each.
+        let interfaces = client.list_interfaces().await?;
+        let mut et_addressing: Option<addressing::AddressingHandle> = None;
+        let mut lt_addressing: Option<addressing::AddressingHandle> = None;
+        for iface in &interfaces {
+            match tailtalk_proto::InterfaceType::try_from(iface.r#type) {
+                Ok(tailtalk_proto::InterfaceType::Ethertalk) if et_addressing.is_none() => {
+                    et_addressing = Some(addressing::AddressingHandle::remote(
+                        client.clone(),
+                        iface.name.clone(),
+                        aarp::AddressSource::EtherTalkPhase2,
+                    ));
+                }
+                Ok(tailtalk_proto::InterfaceType::Localtalk) if lt_addressing.is_none() => {
+                    lt_addressing = Some(addressing::AddressingHandle::remote(
+                        client.clone(),
+                        iface.name.clone(),
+                        aarp::AddressSource::LocalTalk,
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        let ddp = ddp::DdpHandle::remote(client.clone());
+
+        // Routing is daemon-owned; local table is a cache for NBP zone dispatch.
+        let route_table = route_table::RouteTable::new(route_table::LearningMode::Static);
+        client.sync_routes_to(route_table.clone());
+        let routes = client.list_routes().await?;
+        route_table.replace_contents(remote::snapshot_from_proto(&routes));
+        let (rt_tx, mut rt_rx) = tokio::sync::mpsc::unbounded_channel();
+        route_table.set_publisher(rt_tx);
+        {
+            let client = client.clone();
+            tokio::spawn(async move {
+                while let Some(change) = rt_rx.recv().await {
+                    if let Err(e) = client.apply_route_change(&change).await {
+                        tracing::error!("failed to sync route change to daemon: {e}");
+                    }
+                }
+            });
+        }
+
+        let echo = echo::Echo::spawn(&ddp).await;
+        let nbp = nbp::Nbp::spawn(&ddp, et_addressing.clone(), lt_addressing.clone(), route_table.clone()).await;
+
+        let service_token = CancellationToken::new();
+        let transport_token = CancellationToken::new();
+        let services_done = CancellationToken::new();
+
+        // The daemon connection is our transport: shutting down the stack
+        // closes the connection, and a dead connection shuts down the stack.
+        {
+            let client = client.clone();
+            let transport_token = transport_token.clone();
+            tokio::spawn(async move {
+                let closed = client.closed_token();
+                tokio::select! {
+                    _ = transport_token.cancelled() => client.shutdown(),
+                    _ = closed.cancelled() => transport_token.cancel(),
+                }
+            });
         }
 
         Ok(TalkStack { et_addressing, lt_addressing, ddp, nbp, echo, route_table, service_token, transport_token, services_done })

@@ -1,0 +1,241 @@
+// TailTalk daemon wire protocol.
+//
+// The daemon (`tailtalkd`) owns the physical AppleTalk interfaces (EtherTalk
+// and/or LocalTalk) and performs AARP/LLAP addressing and DDP send/receive on
+// behalf of its clients. Clients talk to the daemon over a SOCK_STREAM Unix
+// domain socket or over UDP.
+//
+// Framing
+// =======
+// Every message is a varint-length-delimited protobuf message: a LEB128
+// varint holding the encoded message length, immediately followed by that
+// many bytes of message body (the same framing produced by
+// `writeDelimitedTo` in protobuf-java and `encode_length_delimited` in
+// prost).
+//
+//   * Unix stream socket: messages are simply concatenated on the stream.
+//   * UDP: each datagram carries one or more complete delimited messages.
+//     A message may not span datagrams.
+//
+// Clients send `Request`, the daemon sends `ServerMessage` (a `Reply`
+// correlated by `Request.id`, an unsolicited `ReceivedDatagram` for an open
+// socket, or an unsolicited `routes_changed` broadcast). Messages larger
+// than 65535 bytes are rejected.
+//
+// Correlation
+// ===========
+// `Request.id` is chosen by the client. If it is non-zero the daemon sends
+// exactly one `Reply` with the same id. If it is zero the request is
+// fire-and-forget and no reply is sent (typical for `SendDatagram`).
+//
+// Sessions
+// ========
+// All sockets opened by a client belong to its session and are closed when
+// the session ends. A Unix-socket session ends when the connection closes.
+// A UDP session is keyed by the client's source address and expires after
+// 300 seconds without traffic; clients should send `PingRequest`
+// periodically (e.g. every 30 s) to keep the session alive.
+
+syntax = "proto3";
+
+package tailtalk.v1;
+
+// ── Common types ──────────────────────────────────────────────────────────────
+
+// A DDP network/node pair. LocalTalk nodes always have network 0.
+message AppleTalkAddress {
+  uint32 network = 1; // 0-65535
+  uint32 node = 2;    // 0-255
+}
+
+enum InterfaceType {
+  INTERFACE_TYPE_UNSPECIFIED = 0;
+  INTERFACE_TYPE_ETHERTALK = 1;
+  INTERFACE_TYPE_LOCALTALK = 2;
+}
+
+message Interface {
+  // Stable identifier: the OS network interface name for EtherTalk
+  // ("en0"), or the serial device path for LocalTalk ("/dev/ttyUSB0").
+  string name = 1;
+  InterfaceType type = 2;
+  // The interface's current AppleTalk address, once acquired.
+  AppleTalkAddress address = 3;
+}
+
+// An inclusive range of network numbers (an AppleTalk cable range).
+message CableRange {
+  uint32 lo = 1;
+  uint32 hi = 2;
+}
+
+// ── Interface management ──────────────────────────────────────────────────────
+
+message ListInterfacesRequest {}
+
+message ListInterfacesReply {
+  repeated Interface interfaces = 1;
+}
+
+// Force an interface to a specific AppleTalk address. No probe is performed;
+// the caller is responsible for avoiding conflicts. For LocalTalk the
+// network must be 0 and the node 1-254.
+message SetAddressRequest {
+  string interface = 1;
+  AppleTalkAddress address = 2;
+}
+
+// ── DDP sockets ───────────────────────────────────────────────────────────────
+
+message OpenSocketRequest {
+  // Requested DDP socket number 1-254, or 0 to let the daemon pick one
+  // from the dynamic range (64-254).
+  uint32 socket = 1;
+  // DDP protocol type stamped on outbound datagrams from this socket
+  // (1=RTMP response, 2=NBP, 3=ATP, 4=AEP, 5=RTMP request, 6=ZIP, 7=ADSP).
+  uint32 ddp_type = 2;
+}
+
+message OpenSocketReply {
+  // The DDP socket number that was bound; use it as `socket_id` in
+  // SendDatagram / CloseSocketRequest and to match ReceivedDatagram.
+  uint32 socket_id = 1;
+}
+
+message CloseSocketRequest {
+  uint32 socket_id = 1;
+}
+
+// Client → daemon datagram. Usually sent with Request.id = 0.
+message SendDatagram {
+  uint32 socket_id = 1;
+  AppleTalkAddress dest = 2;
+  uint32 dest_socket = 3; // destination DDP socket number
+  bytes payload = 4;      // max 586 bytes
+}
+
+// Daemon → client datagram, delivered for any open socket.
+message ReceivedDatagram {
+  uint32 socket_id = 1; // the local socket this arrived on
+  AppleTalkAddress source = 2;
+  uint32 source_socket = 3;
+  // Destination as seen in the DDP header; node 255 indicates a broadcast.
+  AppleTalkAddress dest = 4;
+  uint32 dest_socket = 5;
+  uint32 ddp_type = 6;
+  bytes payload = 7;
+}
+
+// ── Routing rules ─────────────────────────────────────────────────────────────
+
+message Route {
+  CableRange range = 1;
+  // Router on the local segment that forwards traffic for `range`.
+  AppleTalkAddress next_hop = 2;
+}
+
+message Zone {
+  string name = 1;
+  repeated CableRange ranges = 2;
+}
+
+message ListRoutesRequest {}
+
+message ListRoutesReply {
+  repeated Route routes = 1;
+  repeated Zone zones = 2;
+  // Cable range of our own segment, if configured.
+  CableRange local_range = 3;
+}
+
+message AddRouteRequest {
+  Route route = 1;
+}
+
+message RemoveRouteRequest {
+  // Must match an existing route's range exactly.
+  CableRange range = 1;
+}
+
+message AddZoneRequest {
+  string zone = 1;
+  repeated CableRange ranges = 2;
+}
+
+message RemoveZoneRequest {
+  string zone = 1;
+}
+
+message SetLocalRangeRequest {
+  CableRange range = 1;
+}
+
+// ── Session keepalive ─────────────────────────────────────────────────────────
+
+message PingRequest {}
+
+// ── Envelopes ─────────────────────────────────────────────────────────────────
+
+// Every client → daemon message.
+message Request {
+  // Correlation id. Non-zero: the daemon replies once with the same id.
+  // Zero: fire-and-forget, no reply (success or failure).
+  uint64 id = 1;
+
+  oneof kind {
+    ListInterfacesRequest list_interfaces = 2;
+    SetAddressRequest set_address = 3;
+    OpenSocketRequest open_socket = 4;
+    CloseSocketRequest close_socket = 5;
+    SendDatagram send = 6;
+    ListRoutesRequest list_routes = 7;
+    AddRouteRequest add_route = 8;
+    RemoveRouteRequest remove_route = 9;
+    AddZoneRequest add_zone = 10;
+    RemoveZoneRequest remove_zone = 11;
+    SetLocalRangeRequest set_local_range = 12;
+    PingRequest ping = 13;
+  }
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_INVALID_ARGUMENT = 1; // malformed or out-of-range field
+  ERROR_CODE_NOT_FOUND = 2;        // unknown interface / socket / route
+  ERROR_CODE_ADDR_IN_USE = 3;      // requested DDP socket already bound
+  ERROR_CODE_INTERNAL = 4;
+}
+
+message Error {
+  ErrorCode code = 1;
+  string message = 2;
+}
+
+// Empty success reply for requests that return no data.
+message Ok {}
+
+message Reply {
+  uint64 id = 1; // matches Request.id
+
+  oneof kind {
+    Error error = 2;
+    Ok ok = 3;
+    ListInterfacesReply interfaces = 4;
+    OpenSocketReply socket = 5;
+    ListRoutesReply routes = 6;
+  }
+}
+
+// Every daemon → client message.
+message ServerMessage {
+  oneof kind {
+    Reply reply = 1;
+    ReceivedDatagram datagram = 2;
+    // Unsolicited: the daemon's routing rules changed (by any client, or by
+    // the daemon itself). Carries the complete new rule set and is sent to
+    // every connected session. Routing is owned by the daemon — clients that
+    // cache rules (e.g. for NBP zone dispatch) should replace their cache
+    // with this.
+    ListRoutesReply routes_changed = 3;
+  }
+}

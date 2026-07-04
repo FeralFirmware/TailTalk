@@ -207,6 +207,7 @@ fn make_key(name: &str) -> String {
         .to_string()
 }
 
+#[allow(dead_code)]
 fn urf_string(caps: &PrinterCaps) -> String {
     // CP1 = sRGB profile 1 (required by AirPrint spec; CP255 is not valid).
     // We always advertise SRGB24 so iOS sends colour jobs; ghostscript converts to mono.
@@ -933,7 +934,7 @@ async fn urf_to_rasterizable(data: Vec<u8>, job_token: u32) -> anyhow::Result<Ve
     tokio::fs::write(&urf_path, &data).await?;
 
     #[cfg(target_os = "macos")]
-    let result: anyhow::Result<Vec<u8>> = {
+    return {
         let pdf_path = tmp.join(format!("tailtalk-{job_token}.pdf"));
         let status = tokio::process::Command::new("sips")
             .args(["--setProperty", "format", "pdf"])
@@ -952,7 +953,7 @@ async fn urf_to_rasterizable(data: Vec<u8>, job_token: u32) -> anyhow::Result<Ve
     };
 
     #[cfg(target_os = "linux")]
-    let result: anyhow::Result<Vec<u8>> = {
+    return {
         // ippeveps converts URF → PostScript; gs accepts PS from a file just as well as PDF.
         let output = tokio::process::Command::new("ippeveps")
             .arg(&urf_path)
@@ -970,12 +971,10 @@ async fn urf_to_rasterizable(data: Vec<u8>, job_token: u32) -> anyhow::Result<Ve
     // should never reach here because URF is not advertised in the mDNS record on Windows,
     // but guard against it explicitly.
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let result: anyhow::Result<Vec<u8>> = {
+    {
         let _ = tokio::fs::remove_file(&urf_path).await;
         anyhow::bail!("URF format is not supported on this platform");
-    };
-
-    result
+    }
 }
 
 /// Return the name of the Ghostscript executable on this platform.

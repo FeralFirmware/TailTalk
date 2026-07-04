@@ -1,0 +1,18 @@
+[package]
+name = "tailtalk-proto"
+version.workspace = true
+edition = "2024"
+license-file = "../LICENSE"
+description = "Protobuf wire protocol for the TailTalk AppleTalk daemon"
+authors = ["FeralFirmware"]
+repository = "https://github.com/feralfirmware/tailtalk"
+
+[dependencies]
+prost = { workspace = true } #unified
+tokio = { workspace = true } #unified
+bytes = { workspace = true } #unified
+tokio-util = { version = "0.7", features = ["codec"] }
+
+[build-dependencies]
+prost-build = "0.14"
+protox = "0.9"

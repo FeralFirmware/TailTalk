@@ -31,6 +31,12 @@ Packet parsers and fully async APIs for almost all the major AppleTalk protocols
 
 It additionally supports running with TashTalk for LocalTalk Macs.
 
+The AARP/DDP underlay can run either in-process (the default) or in a shared
+daemon, `tailtalkd`, which owns the interfaces and serves DDP sockets,
+addressing, and routing rules to multiple clients over a protobuf protocol on
+a Unix or UDP socket — usable from TailTalk (`TalkStack::builder().daemon_unix(..)`)
+or plain C clients. See [docs/daemon-protocol.md](docs/daemon-protocol.md).
+
 ## Building
 
 ### Prerequisites
@@ -107,6 +113,7 @@ There are 4 demo programs I have written to verify the functionality of this sof
 - [afp-server](/examples/afp-server) - An AFP 1.0, 1.1 and 2.0 compatible AFP server. Very much a work in progress but is capable of reading and writing files to classic Mac systems. Basic directory browsing and file operations are supported.
 - [nbp-lookup](/examples/nbp-lookup) - Performs an NBP lookup based on the provided request string and returns the results
 - [pap-print](/examples/pap-print) - Sends a PostScript file to a PAP printer. Aimed at LaserWriters, and have only tested on my own 4/600 PS.
+- [tailtalkd](/tailtalk-daemon/) - The TailTalk underlay daemon. Owns the physical AppleTalk interfaces and serves DDP sockets, addressing, and routing to client applications over a Unix/UDP socket.
 - [tailtalk-gui](/examples/tailtalk-gui/) - A simple GUI for sharing a folder as a volume over EtherTalk and/or LocalTalk (via TashTalk).
 
 All of the examples run a complete copy of the stack using a raw socket (if EtherTalk is enabled) and thus need to be run as root,

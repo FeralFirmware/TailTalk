@@ -2,6 +2,8 @@
 members = [
   "tailtalk-packets",
   "tailtalk",
+  "tailtalk-proto",
+  "tailtalk-daemon",
   "examples/nbp-lookup",
   "examples/aep-echo",
   "examples/pap-print",
@@ -22,8 +24,10 @@ clap = { version = "^4.6.0", features = ["derive"] } #unified
 encoding_rs = "^0.8.35" #unified
 futures = "^0.3.32" #unified
 hfs-reader = { path = "hfs-reader", version = "^0.1.1" } #unified
+prost = "^0.14" #unified
 tailtalk = { path = "tailtalk" } #unified
 tailtalk-packets = { path = "tailtalk-packets", version = "^0.7" } #unified
+tailtalk-proto = { path = "tailtalk-proto", version = "^0.7" } #unified
 tashtalk = { path = "tashtalk", version = "^0.2" } #unified
 thiserror = "^1.0.69" #unified
 tokio = { version = "^1.51.1", features = ["full", "io-util"] } #unified

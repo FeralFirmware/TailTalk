@@ -1,0 +1,36 @@
+[package]
+name = "tailtalk-daemon"
+version.workspace = true
+edition = "2024"
+license-file = "../LICENSE"
+description = "AppleTalk underlay daemon (AARP/DDP) serving the TailTalk protobuf API"
+authors = ["FeralFirmware"]
+repository = "https://github.com/feralfirmware/tailtalk"
+
+[[bin]]
+name = "tailtalkd"
+path = "src/main.rs"
+
+[lib]
+name = "tailtalk_daemon"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true } #unified
+clap = { workspace = true } #unified
+prost = { workspace = true } #unified
+tailtalk = { workspace = true } #unified
+tailtalk-packets = { workspace = true } #unified
+tailtalk-proto = { workspace = true } #unified
+tashtalk = { workspace = true } #unified
+tokio = { workspace = true } #unified
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = { workspace = true }
+tracing = { workspace = true } #unified
+tracing-subscriber = { version = "^0.3", features = ["env-filter"] }
+
+[features]
+ethertalk = ["tailtalk/ethertalk"]
+
+[dev-dependencies]
+tempfile = "3.13"

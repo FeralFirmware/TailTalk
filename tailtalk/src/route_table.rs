@@ -143,6 +143,28 @@ impl ZipTable {
     }
 }
 
+// ── Change stream ─────────────────────────────────────────────────────────────
+
+/// A single mutation applied through the programmatic API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteChange {
+    SetLocalRange(CableRange),
+    InsertRoute { lo: u16, hi: u16, next_hop: AppleTalkAddress },
+    RemoveRoute { lo: u16, hi: u16 },
+    InsertZone { zone: String, ranges: Vec<CableRange> },
+    RemoveZone { zone: String },
+}
+
+/// A point-in-time copy of the table contents, for querying over an API.
+#[derive(Debug, Clone, Default)]
+pub struct RouteSnapshot {
+    pub local_range: Option<CableRange>,
+    /// `(range_lo, range_hi, next_hop)` for every RTMP entry.
+    pub routes: Vec<(u16, u16, AppleTalkAddress)>,
+    /// `(zone name, cable ranges)` for every known zone.
+    pub zones: Vec<(String, Vec<CableRange>)>,
+}
+
 // ── Inner state ───────────────────────────────────────────────────────────────
 
 struct Inner {
@@ -150,9 +172,16 @@ struct Inner {
     local_range: Option<CableRange>,
     rtmp: RtmpTable,
     zip: ZipTable,
+    publisher: Option<tokio::sync::mpsc::UnboundedSender<RouteChange>>,
 }
 
 impl Inner {
+    fn publish(&self, change: RouteChange) {
+        if let Some(tx) = &self.publisher {
+            let _ = tx.send(change);
+        }
+    }
+
     fn is_local(&self, net: u16) -> bool {
         self.local_range.is_some_and(|(lo, hi)| lo <= net && net <= hi)
     }
@@ -210,6 +239,12 @@ impl Inner {
 #[derive(Clone)]
 pub struct RouteTable(Arc<RwLock<Inner>>);
 
+impl std::fmt::Debug for RouteTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouteTable").finish_non_exhaustive()
+    }
+}
+
 impl RouteTable {
     pub fn new(mode: LearningMode) -> Self {
         Self(Arc::new(RwLock::new(Inner {
@@ -217,6 +252,7 @@ impl RouteTable {
             local_range: None,
             rtmp: RtmpTable::new(),
             zip: ZipTable::new(),
+            publisher: None,
         })))
     }
 
@@ -227,19 +263,33 @@ impl RouteTable {
     /// Required for [`is_local`](Self::is_local) and
     /// [`route_for`](Self::route_for) to distinguish on-segment destinations.
     pub fn set_local_range(&self, lo: u16, hi: u16) {
-        self.0.write().unwrap().local_range = Some((lo, hi));
+        let mut inner = self.0.write().unwrap();
+        inner.local_range = Some((lo, hi));
+        inner.publish(RouteChange::SetLocalRange((lo, hi)));
+    }
+
+    /// Attach a channel that receives every subsequent programmatic change.
+    ///
+    /// Seed the table *before* attaching the publisher to avoid echoing
+    /// the seed back.
+    pub fn set_publisher(&self, tx: tokio::sync::mpsc::UnboundedSender<RouteChange>) {
+        self.0.write().unwrap().publisher = Some(tx);
     }
 
     // ── Programmatic inserts ──────────────────────────────────────────────────
 
     /// Insert or replace a route: DDP packets for `[lo..=hi]` go to `next_hop`.
     pub fn insert_route(&self, lo: u16, hi: u16, next_hop: AppleTalkAddress) {
-        self.0.write().unwrap().rtmp.insert(lo, hi, next_hop, 1);
+        let mut inner = self.0.write().unwrap();
+        inner.rtmp.insert(lo, hi, next_hop, 1);
+        inner.publish(RouteChange::InsertRoute { lo, hi, next_hop });
     }
 
     /// Remove the route covering exactly `[lo..=hi]`.
     pub fn remove_route(&self, lo: u16, hi: u16) {
-        self.0.write().unwrap().rtmp.remove(lo, hi);
+        let mut inner = self.0.write().unwrap();
+        inner.rtmp.remove(lo, hi);
+        inner.publish(RouteChange::RemoveRoute { lo, hi });
     }
 
     /// Associate `zone` with one or more cable ranges.
@@ -251,11 +301,53 @@ impl RouteTable {
         for &range in ranges {
             inner.zip.insert_zone_range(zone, range);
         }
+        inner.publish(RouteChange::InsertZone {
+            zone: zone.to_string(),
+            ranges: ranges.to_vec(),
+        });
     }
 
     /// Remove all cable-range associations for `zone`.
     pub fn remove_zone(&self, zone: &str) {
-        self.0.write().unwrap().zip.remove_zone(zone);
+        let mut inner = self.0.write().unwrap();
+        inner.zip.remove_zone(zone);
+        inner.publish(RouteChange::RemoveZone { zone: zone.to_string() });
+    }
+
+    /// Replace the entire table contents with `snapshot`, without publishing.
+    pub fn replace_contents(&self, snapshot: RouteSnapshot) {
+        let mut inner = self.0.write().unwrap();
+        inner.local_range = snapshot.local_range;
+        inner.rtmp = RtmpTable::new();
+        for (lo, hi, next_hop) in snapshot.routes {
+            inner.rtmp.insert(lo, hi, next_hop, 1);
+        }
+        inner.zip = ZipTable::new();
+        for (zone, ranges) in snapshot.zones {
+            for range in ranges {
+                inner.zip.insert_zone_range(&zone, range);
+            }
+        }
+    }
+
+    /// Copy the entire table contents, for querying over an API.
+    pub fn snapshot(&self) -> RouteSnapshot {
+        let inner = self.0.read().unwrap();
+        RouteSnapshot {
+            local_range: inner.local_range,
+            routes: inner
+                .rtmp
+                .entries
+                .iter()
+                .map(|e| (e.range_lo, e.range_hi, e.next_hop))
+                .collect(),
+            zones: inner
+                .zip
+                .zone_to_ranges
+                .iter()
+                .map(|(name, ranges)| (name.clone(), ranges.clone()))
+                .collect(),
+        }
     }
 
     // ── Dynamic learning ──────────────────────────────────────────────────────

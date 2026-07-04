@@ -26,6 +26,7 @@ pcap = { version = "2", features = ["capture-stream"], optional = true }
 rand = "0.10"
 sled = "0.34"
 tailtalk-packets = { workspace = true } #unified
+tailtalk-proto = { workspace = true } #unified
 tashtalk = { workspace = true } #unified
 tokio = { workspace = true, features = ["io-util"] } #unified
 tokio-serial = "5.4.4"

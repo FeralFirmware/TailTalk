@@ -4,9 +4,10 @@ use rand::RngExt;
 use std::sync::Arc;
 use std::{io::Error, time::Duration};
 use tailtalk_packets::aarp::*;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
+use crate::remote::RemoteClient;
 use crate::{DataLinkPacket, DataLinkProtocol, OutboundHandle};
 
 #[derive(Debug, Copy, Clone)]
@@ -25,9 +26,15 @@ struct SelfAddress {
     chan: oneshot::Sender<AppleTalkAddress>,
 }
 
+struct SetAddress {
+    addr: AppleTalkAddress,
+    chan: oneshot::Sender<()>,
+}
+
 enum AarpCommand {
     Lookup(AarpRequest),
     OurAddr(SelfAddress),
+    SetAddr(SetAddress),
 }
 
 pub struct Addressing {
@@ -41,6 +48,9 @@ pub struct Addressing {
     our_mac: Option<EthernetMac>,
     phase: AddressSource,
     cancel: CancellationToken,
+    /// Publishes the settled address (and later changes via `SetAddr`) so the
+    /// data link layer can react, e.g. reprogram TashTalk node ID bits.
+    addr_tx: watch::Sender<Option<AppleTalkAddress>>,
 }
 
 impl Addressing {
@@ -80,6 +90,7 @@ impl Addressing {
         let (packet_send, packet_recv) = mpsc::channel(100);
         let (lt_ack_send, lt_ack_recv) = mpsc::channel(16);
         let (lt_enq_send, lt_enq_recv) = mpsc::channel(16);
+        let (addr_tx, addr_rx) = watch::channel(None);
         let cache = Arc::new(DashMap::new());
         let token = CancellationToken::new();
         let handle_token = token.clone();
@@ -95,18 +106,22 @@ impl Addressing {
             our_mac,
             phase,
             outbound,
+            addr_tx,
         };
 
         tokio::spawn(async move { us.run(fixed_addr).await });
 
         AddressingHandle {
-            _cancel: Arc::new(handle_token.drop_guard()),
-            request_send,
-            packet_send,
-            lt_ack_send,
-            lt_enq_send,
-            cache,
             phase,
+            inner: AddressingInner::Local {
+                _cancel: Arc::new(handle_token.drop_guard()),
+                request_send,
+                packet_send,
+                lt_ack_send,
+                lt_enq_send,
+                addr_watch: addr_rx,
+                cache,
+            },
         }
     }
 
@@ -148,7 +163,7 @@ impl Addressing {
     }
 
     async fn run(mut self, fixed_addr: Option<AppleTalkAddress>) {
-        let our_addr = if self.our_mac.is_none() {
+        let mut our_addr = if self.our_mac.is_none() {
             // LocalTalk: probe via LLAP ENQ. Send ENQ with dst=tentative, src=tentative;
             // if any node ACKs within 10 ms the address is taken — pick a new one and retry.
             let mut node_num = fixed_addr
@@ -234,6 +249,7 @@ impl Addressing {
         };
 
         // Main event loop — address is now settled.
+        let _ = self.addr_tx.send(Some(our_addr));
         loop {
             tokio::select! {
                 pkt = self.packet_recv.recv() => {
@@ -288,6 +304,16 @@ impl Addressing {
                             AarpCommand::OurAddr(req) => {
                                 req.chan.send(our_addr).expect("failed to send our_addr");
                             },
+                            AarpCommand::SetAddr(req) => {
+                                tracing::info!(
+                                    "addressing: address changed to {}.{}",
+                                    req.addr.network_number,
+                                    req.addr.node_number
+                                );
+                                our_addr = req.addr;
+                                let _ = self.addr_tx.send(Some(our_addr));
+                                let _ = req.chan.send(());
+                            },
                         }
                     }
                 }
@@ -334,28 +360,67 @@ impl Addressing {
     }
 }
 
+/// Handle to interface addressing.
 #[derive(Clone)]
 pub struct AddressingHandle {
-    request_send: mpsc::Sender<AarpCommand>,
-    packet_send: mpsc::Sender<(AarpPacket, AddressSource)>,
-    lt_ack_send: mpsc::Sender<u8>,
-    lt_enq_send: mpsc::Sender<u8>,
-    cache: Arc<DashMap<AppleTalkAddress, Node>>,
     pub phase: AddressSource,
-    _cancel: Arc<DropGuard>,
+    inner: AddressingInner,
+}
+
+#[derive(Clone)]
+enum AddressingInner {
+    Local {
+        request_send: mpsc::Sender<AarpCommand>,
+        packet_send: mpsc::Sender<(AarpPacket, AddressSource)>,
+        lt_ack_send: mpsc::Sender<u8>,
+        lt_enq_send: mpsc::Sender<u8>,
+        addr_watch: watch::Receiver<Option<AppleTalkAddress>>,
+        cache: Arc<DashMap<AppleTalkAddress, Node>>,
+        _cancel: Arc<DropGuard>,
+    },
+    Remote {
+        client: RemoteClient,
+        /// Daemon-side interface name this handle queries.
+        interface: String,
+    },
 }
 
 impl AddressingHandle {
+    /// Create a handle backed by a remote daemon's interface.
+    pub(crate) fn remote(client: RemoteClient, interface: String, phase: AddressSource) -> Self {
+        Self {
+            phase,
+            inner: AddressingInner::Remote { client, interface },
+        }
+    }
+
+    /// Watch the settled interface address; `None` until acquisition completes.
+    ///
+    /// Only available for locally-owned interfaces (used by the data link
+    /// layer to reprogram hardware when the address changes).
+    pub fn addr_watch(&self) -> Option<watch::Receiver<Option<AppleTalkAddress>>> {
+        match &self.inner {
+            AddressingInner::Local { addr_watch, .. } => Some(addr_watch.clone()),
+            AddressingInner::Remote { .. } => None,
+        }
+    }
+
     pub fn received_llap_ack(&self, src_node: u8) {
-        let _ = self.lt_ack_send.try_send(src_node);
+        if let AddressingInner::Local { lt_ack_send, .. } = &self.inner {
+            let _ = lt_ack_send.try_send(src_node);
+        }
     }
 
     pub fn received_llap_enq(&self, dst_node: u8) {
-        let _ = self.lt_enq_send.try_send(dst_node);
+        if let AddressingInner::Local { lt_enq_send, .. } = &self.inner {
+            let _ = lt_enq_send.try_send(dst_node);
+        }
     }
 
     pub fn learn(&self, addr: AppleTalkAddress, node: Node) {
-        self.cache.insert(addr, node);
+        if let AddressingInner::Local { cache, .. } = &self.inner {
+            cache.insert(addr, node);
+        }
     }
 
     pub fn try_lookup(&self, addr: &AppleTalkAddress) -> Option<Node> {
@@ -376,7 +441,11 @@ impl AddressingHandle {
             return Some(Node::LocalTalk(addr.node_number));
         }
 
-        self.cache.get(addr).map(|v| *v)
+        match &self.inner {
+            AddressingInner::Local { cache, .. } => cache.get(addr).map(|v| *v),
+            // Link-layer resolution happens inside the daemon.
+            AddressingInner::Remote { .. } => None,
+        }
     }
 
     pub async fn lookup(&self, addr: AppleTalkAddress) -> Result<Node, Error> {
@@ -384,11 +453,21 @@ impl AddressingHandle {
             return Ok(mac);
         }
 
+        let request_send = match &self.inner {
+            AddressingInner::Local { request_send, .. } => request_send,
+            AddressingInner::Remote { .. } => {
+                return Err(Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "link-layer lookup is performed by the daemon",
+                ));
+            }
+        };
+
         let (tx, rx) = oneshot::channel();
 
         let request = AarpCommand::Lookup(AarpRequest { addr, chan: tx });
 
-        if let Err(e) = self.request_send.send(request).await {
+        if let Err(e) = request_send.send(request).await {
             return Err(Error::other(e));
         }
 
@@ -399,20 +478,53 @@ impl AddressingHandle {
     }
 
     pub async fn addr(&self) -> Result<AppleTalkAddress, Error> {
-        let (tx, rx) = oneshot::channel();
-        let request = AarpCommand::OurAddr(SelfAddress { chan: tx });
+        match &self.inner {
+            AddressingInner::Local { request_send, .. } => {
+                let (tx, rx) = oneshot::channel();
+                let request = AarpCommand::OurAddr(SelfAddress { chan: tx });
 
-        if let Err(e) = self.request_send.send(request).await {
-            return Err(Error::other(e));
+                if let Err(e) = request_send.send(request).await {
+                    return Err(Error::other(e));
+                }
+
+                match rx.await {
+                    Ok(res) => Ok(res),
+                    Err(e) => Err(Error::other(e)),
+                }
+            }
+            AddressingInner::Remote { client, interface } => {
+                client.interface_addr(interface).await
+            }
         }
+    }
 
-        match rx.await {
-            Ok(res) => Ok(res),
-            Err(e) => Err(Error::other(e)),
+    /// Force this interface to the given address, without probing.
+    ///
+    /// On LocalTalk the data link layer reprograms the TashTalk node ID bits
+    /// to match.
+    pub async fn set_addr(&self, addr: AppleTalkAddress) -> Result<(), Error> {
+        match &self.inner {
+            AddressingInner::Local { request_send, .. } => {
+                let (tx, rx) = oneshot::channel();
+                let request = AarpCommand::SetAddr(SetAddress { addr, chan: tx });
+
+                if let Err(e) = request_send.send(request).await {
+                    return Err(Error::other(e));
+                }
+
+                rx.await.map_err(Error::other)
+            }
+            AddressingInner::Remote { client, interface } => {
+                client.set_interface_addr(interface, addr).await
+            }
         }
     }
 
     pub fn received_pkt(&self, pkt: &[u8], source: AddressSource) -> Result<(), Error> {
+        let AddressingInner::Local { cache, packet_send, .. } = &self.inner else {
+            return Ok(());
+        };
+
         let headers = AarpPacket::parse(pkt).unwrap();
 
         let node = match source {
@@ -421,9 +533,9 @@ impl AddressingHandle {
             // AARP is not used on LocalTalk; address assignment uses LLAP ENQ/ACK instead.
             AddressSource::LocalTalk => return Ok(()),
         };
-        self.cache.insert(headers.sender_protocol, node);
+        cache.insert(headers.sender_protocol, node);
 
-        self.packet_send
+        packet_send
             .try_send((headers, source))
             .map_err(Error::other)?;
 
