@@ -37,6 +37,16 @@ pub struct AtpAddress {
     pub socket_number: u8,
 }
 
+impl From<tailtalk_packets::nbp::ServiceAddress> for AtpAddress {
+    fn from(a: tailtalk_packets::nbp::ServiceAddress) -> Self {
+        AtpAddress {
+            network_number: a.network_number,
+            node_number: a.node_number,
+            socket_number: a.socket_number,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AtpSendRequest {
     pub address: AtpAddress,

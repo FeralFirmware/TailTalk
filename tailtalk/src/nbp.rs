@@ -371,4 +371,39 @@ impl NbpHandle {
 
         rx.await.map_err(io::Error::other)?
     }
+
+    /// Look up several entity names at once. Returns one result vector per
+    /// request, in request order.
+    ///
+    /// All lookups run as concurrent NBP transactions (each with its own
+    /// transaction ID), so N names share a single reply-collection window
+    /// instead of waiting out one window per name.
+    ///
+    /// This is deliberately *not* a single multi-tuple LkUp packet: the NBP
+    /// header's 4-bit tuple count would allow one, and our own responder
+    /// even answers such packets, but Inside AppleTalk specifies that a
+    /// LkUp request carries exactly one tuple — real devices only match
+    /// against the first and would silently drop the rest of the query.
+    pub async fn lookup_many(
+        &self,
+        requests: impl IntoIterator<Item = EntityName>,
+    ) -> Result<Vec<Vec<NbpTuple>>, io::Error> {
+        // Fire every request before awaiting any reply so their collection
+        // windows overlap.
+        let mut pending = Vec::new();
+        for request in requests {
+            let (tx, rx) = oneshot::channel();
+            self.request_send
+                .send(NbpCommand::Lookup(NbpLookupRequest { request, chan: tx }))
+                .await
+                .map_err(io::Error::other)?;
+            pending.push(rx);
+        }
+
+        let mut results = Vec::with_capacity(pending.len());
+        for rx in pending {
+            results.push(rx.await.map_err(io::Error::other)??);
+        }
+        Ok(results)
+    }
 }

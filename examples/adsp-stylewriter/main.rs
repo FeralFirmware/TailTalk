@@ -3,7 +3,11 @@ use std::io::Write;
 use tailtalk::{
     TalkStack,
     adsp::AdspAddress,
-    stylewriter::{StyleWriterEncoder, StyleWriterSession, MAX_BATCH_BYTES, SW2200_PRINT_ROWBYTES, SW2200_PRINT_WIDTH},
+    stylewriter::{
+        MAX_BATCH_BYTES, PrintQuality, SW2200_PRINT_ROWBYTES, SW2200_PRINT_WIDTH,
+        StyleWriterEncoder, StyleWriterSession, chunky_to_mono_plane, chunky_to_planes,
+        encode_page_batches,
+    },
 };
 use tailtalk_packets::nbp::EntityName;
 
@@ -42,79 +46,10 @@ struct Args {
     #[arg(long)]
     mono: bool,
 
-}
-
-/// Unpack one chunky scanline into raw (pre-RLE) CMYK planar bytes.
-fn chunky_to_planes(chunky: &[u8], planar_input_len: usize) -> [Vec<u8>; 4] {
-    let mut planes = [
-        Vec::with_capacity(planar_input_len),
-        Vec::with_capacity(planar_input_len),
-        Vec::with_capacity(planar_input_len),
-        Vec::with_capacity(planar_input_len),
-    ];
-
-    for chunk_block in chunky.chunks(4) {
-        let mut c = 0u8;
-        let mut m = 0u8;
-        let mut y = 0u8;
-        let mut k = 0u8;
-        for i in 0..4 {
-            let b = chunk_block.get(i).copied().unwrap_or(0);
-            c = (c << 2) | ((b >> 6) & 2) | ((b >> 3) & 1);
-            m = (m << 2) | ((b >> 5) & 2) | ((b >> 2) & 1);
-            y = (y << 2) | ((b >> 4) & 2) | ((b >> 1) & 1);
-            k = (k << 2) | ((b >> 3) & 2) | (b & 1);
-        }
-        planes[0].push(c);
-        planes[1].push(m);
-        planes[2].push(y);
-        planes[3].push(k);
-    }
-    planes
-}
-
-/// Unpack one chunky scanline's K-nibble bit only into a raw (pre-RLE) plane.
-fn chunky_to_mono_plane(chunky: &[u8], planar_input_len: usize) -> Vec<u8> {
-    let mut plane = Vec::with_capacity(planar_input_len);
-    for chunk_block in chunky.chunks(4) {
-        let mut k = 0u8;
-        for i in 0..4 {
-            let b = chunk_block.get(i).copied().unwrap_or(0);
-            k = (k << 2) | ((b >> 3) & 2) | (b & 1);
-        }
-        plane.push(k);
-    }
-    plane
-}
-
-/// Encode one row's plane(s) into concatenated RLE bytes. `use_delta` XORs
-/// each plane against the previous row's raw plane first (lpstyl's
-/// `appendEncode()` differencing).
-///
-/// Delta is NOT optional for color: 'c'/"m2sAH" mode reconstructs each row
-/// by XORing against the previous one, so absolute rows print as
-/// cumulative-XOR garbage. Monochrome 'R'/"m2nZAB" bands are absolute.
-///
-/// `use_delta` must be false for the first row of every rect+G block, since
-/// the printer's differencing state resets per block. Does not mutate
-/// `last` — the caller updates it once per source row, so a row re-encoded
-/// after a batch flush still deltas correctly.
-fn encode_row(planes: &[Vec<u8>], last: &[Vec<u8>], use_delta: bool, mono: bool) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (i, plane) in planes.iter().enumerate() {
-        let delta;
-        let src = if use_delta {
-            delta = plane.iter().zip(last[i].iter()).map(|(c, l)| c ^ l).collect::<Vec<u8>>();
-            &delta
-        } else {
-            plane
-        };
-        // K plane (mono, or index 3 of CMYK) never uses the blank-shortcut
-        // (see encode_scanline docs); C/M/Y planes do.
-        let allow_shortcut = !mono && i != 3;
-        out.extend_from_slice(&StyleWriterEncoder::encode_scanline(src, SW2200_PRINT_ROWBYTES, allow_shortcut));
-    }
-    out
+    /// Print quality: "normal" or "best" (see PrintQuality docs for which
+    /// combinations are verified on real hardware)
+    #[arg(short, long, default_value = "normal")]
+    quality: String,
 }
 
 #[tokio::main]
@@ -123,10 +58,13 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    let quality = match args.quality.as_str() {
+        "normal" => PrintQuality::Normal,
+        "best" => PrintQuality::Best,
+        other => anyhow::bail!("Unknown quality '{other}' (expected 'normal' or 'best')"),
+    };
+
     let raw_data = std::fs::read(&args.file)?;
-    // Color rows must be XOR-delta encoded; mono rows must be absolute
-    // (see encode_row) — this is the printer's wire format, not a choice.
-    let use_delta = !args.mono;
     let width_pixels = args.width;
     let chunky_scanline_len = width_pixels / 2;
     let planar_scanline_len = width_pixels / 8;
@@ -136,49 +74,36 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("SW2200_PRINT_ROWBYTES = {}, padding {} px per plane with white",
         SW2200_PRINT_ROWBYTES, SW2200_PRINT_WIDTH - width_pixels);
 
+    // Unpack every chunky scanline into raw planar rows, then encode the
+    // whole page into rect+G bands (delta chains and band splitting live in
+    // encode_page_batches).
+    let rows: Vec<Vec<Vec<u8>>> = raw_data
+        .chunks(chunky_scanline_len)
+        .take(total_rows)
+        .map(|chunky| {
+            if args.mono {
+                vec![chunky_to_mono_plane(chunky, planar_scanline_len)]
+            } else {
+                chunky_to_planes(chunky, planar_scanline_len).into()
+            }
+        })
+        .collect();
+    let batches = encode_page_batches(&rows, args.mono);
+
     // ── Dump mode: write raster blocks to stdout for comparison with C reference ─
     if args.dump {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
-        let mut batch_start = 0usize;
-        let mut batch_data = Vec::new();
-        let mut last_planes = vec![vec![0u8; planar_scanline_len]; if args.mono { 1 } else { 4 }];
-        for (row_idx, chunky) in raw_data.chunks(chunky_scanline_len).enumerate() {
-            let planes: Vec<Vec<u8>> = if args.mono {
-                vec![chunky_to_mono_plane(chunky, planar_scanline_len)]
-            } else {
-                chunky_to_planes(chunky, planar_scanline_len).into()
-            };
-            let mut row_enc = encode_row(&planes, &last_planes, use_delta && !batch_data.is_empty(), args.mono);
-            // Flush before this row would cross the printer's buffer size:
-            // one G block must stay strictly below MAX_BATCH_BYTES.
-            if !batch_data.is_empty() && batch_data.len() + row_enc.len() >= MAX_BATCH_BYTES {
-                let rect = StyleWriterEncoder::encode_rect(
-                    batch_start as u16, 0, (row_idx - 1) as u16, SW2200_PRINT_WIDTH as u16, !args.mono,
-                );
-                let g_block = StyleWriterEncoder::wrap_raster_chunk(&batch_data);
-                out.write_all(&rect)?;
-                out.write_all(&g_block)?;
-                batch_start = row_idx;
-                batch_data.clear();
-                if use_delta {
-                    // This row now starts a new block: the delta chain resets.
-                    row_enc = encode_row(&planes, &last_planes, false, args.mono);
-                }
-            }
-            batch_data.extend_from_slice(&row_enc);
-            last_planes = planes;
-            if row_idx + 1 == total_rows {
-                // Rows are padded to the full printable width, so the rect
-                // right edge is SW2200_PRINT_WIDTH (not the source width) —
-                // keeps dump output byte-identical to what write_batch sends.
-                let rect = StyleWriterEncoder::encode_rect(
-                    batch_start as u16, 0, row_idx as u16, SW2200_PRINT_WIDTH as u16, !args.mono,
-                );
-                let g_block = StyleWriterEncoder::wrap_raster_chunk(&batch_data);
-                out.write_all(&rect)?;
-                out.write_all(&g_block)?;
-            }
+        for batch in &batches {
+            // Rows are padded to the full printable width, so the rect
+            // right edge is SW2200_PRINT_WIDTH (not the source width) —
+            // keeps dump output byte-identical to what write_batch sends.
+            let rect = StyleWriterEncoder::encode_rect(
+                batch.top, 0, batch.bottom, SW2200_PRINT_WIDTH as u16, !args.mono,
+            );
+            let g_block = StyleWriterEncoder::wrap_raster_chunk(&batch.data);
+            out.write_all(&rect)?;
+            out.write_all(&g_block)?;
         }
         return Ok(());
     }
@@ -217,44 +142,20 @@ async fn main() -> anyhow::Result<()> {
     };
 
     eprintln!("Connecting to printer...");
-    let mut session = StyleWriterSession::connect(&stack, printer_addr, &args.username).await?;
+    let mut session = StyleWriterSession::connect(&stack.ddp, printer_addr, &args.username).await?;
     eprintln!("Connected! Running setup...");
 
     // Run setup + raster transmission in a block so any failure can eject
     // the loaded page and reset the printer instead of leaving it stuck.
     let print_result: anyhow::Result<()> = async {
-        session.setup(!args.mono).await?;
+        session.setup(!args.mono, quality).await?;
 
-        eprintln!("Encoding and transmitting {} rasters ({}batched, {} bytes/batch max)...",
+        eprintln!("Transmitting {} rasters as {} delta-encoded band(s) ({} bytes/batch max)...",
             if args.mono { "monochrome" } else { "color" },
-            if use_delta { "delta-encoded, " } else { "" },
+            batches.len(),
             MAX_BATCH_BYTES);
-        let mut batch_start = 0usize;
-        let mut batch_data = Vec::new();
-        let mut last_planes = vec![vec![0u8; planar_scanline_len]; if args.mono { 1 } else { 4 }];
-        for (row_idx, chunky) in raw_data.chunks(chunky_scanline_len).enumerate() {
-            let planes: Vec<Vec<u8>> = if args.mono {
-                vec![chunky_to_mono_plane(chunky, planar_scanline_len)]
-            } else {
-                chunky_to_planes(chunky, planar_scanline_len).into()
-            };
-            let mut row_enc = encode_row(&planes, &last_planes, use_delta && !batch_data.is_empty(), args.mono);
-            // Flush before this row would cross the printer's buffer size:
-            // one G block must stay strictly below MAX_BATCH_BYTES.
-            if !batch_data.is_empty() && batch_data.len() + row_enc.len() >= MAX_BATCH_BYTES {
-                session.write_batch(batch_start as u16, (row_idx - 1) as u16, &batch_data, !args.mono).await?;
-                batch_start = row_idx;
-                batch_data.clear();
-                if use_delta {
-                    // This row now starts a new block: the delta chain resets.
-                    row_enc = encode_row(&planes, &last_planes, false, args.mono);
-                }
-            }
-            batch_data.extend_from_slice(&row_enc);
-            last_planes = planes;
-            if row_idx + 1 == total_rows {
-                session.write_batch(batch_start as u16, row_idx as u16, &batch_data, !args.mono).await?;
-            }
+        for batch in &batches {
+            session.write_batch(batch.top, batch.bottom, &batch.data, !args.mono).await?;
         }
         Ok(())
     }

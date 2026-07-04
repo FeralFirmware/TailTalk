@@ -20,8 +20,19 @@ use std::{
 use axum::{Router, body::Bytes, extract::{Path, State}, routing::post};
 use ipp::{parser::IppParser, prelude::*, reader::IppReader};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
-use tailtalk::{atp::{Atp, AtpAddress}, ddp::DdpHandle, nbp::NbpHandle, pap::PapClient, CancellationToken};
-use tailtalk_packets::nbp::EntityName;
+use tailtalk::{
+    CancellationToken,
+    adsp::AdspAddress,
+    atp::{Atp, AtpAddress},
+    ddp::DdpHandle,
+    nbp::NbpHandle,
+    pap::PapClient,
+    stylewriter::{
+        PrintQuality, PrinterBusy, SW2200_PRINT_ROWBYTES, SW2200_PRINT_WIDTH,
+        StyleWriterSession, encode_page_batches,
+    },
+};
+use tailtalk_packets::nbp::{EntityName, ServiceAddress};
 use tokio::sync::{Mutex, RwLock};
 
 // Standard media sizes supported by all LaserWriters.
@@ -35,6 +46,12 @@ const STANDARD_MEDIA: &[&str] = &[
     "na_monarch_3.875x7.5in",
     "iso_c5_162x229mm",
     "iso_dl_110x220mm",
+];
+
+// Extra sizes the StyleWriter's sheet feeder handles beyond STANDARD_MEDIA.
+// "invoice" is the PWG self-describing name for half letter / statement.
+const STYLEWRITER_EXTRA_MEDIA: &[&str] = &[
+    "na_invoice_5.5x8.5in",
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -64,6 +81,24 @@ struct JobRecord {
     created_at: u32,
 }
 
+/// Which AppleTalk print path a discovered printer uses.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PrinterKind {
+    /// PostScript printer driven over PAP (NBP type "LaserWriter").
+    LaserWriter,
+    /// Color StyleWriter behind an EtherTalk adapter, driven over ADSP
+    /// (NBP type "ColorStyleWriter2400AT").
+    StyleWriter,
+}
+
+/// StyleWriters print at a fixed 360 dpi.
+const SW_DPI: u32 = 360;
+/// Printable-area margins at 360 dpi (lpstyl `printerSetup()` for the CS
+/// family): 72 px (9 bytes) left, 90 px top and bottom.
+const SW_LEFT_MARGIN_PX: usize = 72;
+const SW_TOP_MARGIN_ROWS: usize = 90;
+const SW_BOTTOM_MARGIN_ROWS: usize = 90;
+
 #[derive(Clone)]
 struct PrinterCaps {
     dpi: u32,
@@ -90,10 +125,18 @@ impl Default for PrinterCaps {
 #[derive(Clone)]
 struct Printer {
     name: String,
-    addr: AtpAddress,
+    kind: PrinterKind,
+    addr: ServiceAddress,
     key: String,
     mdns_fullname: String,
     caps: PrinterCaps,
+}
+
+impl Printer {
+    /// The DDP endpoint viewed as an ADSP address (StyleWriter path).
+    fn adsp_addr(&self) -> AdspAddress {
+        self.addr.into()
+    }
 }
 
 struct BridgeState {
@@ -102,10 +145,11 @@ struct BridgeState {
     jobs: RwLock<HashMap<u32, Arc<Mutex<JobRecord>>>>,
     next_job_id: AtomicU32,
     start_time: Instant,
-    /// Per-printer locks (keyed by printer key) serialising PAP sessions:
-    /// LaserWriters accept one PAP connection at a time and connect() gives
-    /// up after 60s of busy-retries, so concurrent jobs must queue here.
-    pap_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Per-printer locks (keyed by printer key) serialising print sessions:
+    /// LaserWriters accept one PAP connection at a time (and connect() gives
+    /// up after 60s of busy-retries); StyleWriters likewise hold a single
+    /// ADSP print connection. Concurrent jobs must queue here.
+    job_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 pub async fn run(nbp: NbpHandle, ddp: DdpHandle, token: CancellationToken) {
@@ -133,7 +177,7 @@ pub async fn run(nbp: NbpHandle, ddp: DdpHandle, token: CancellationToken) {
         jobs: RwLock::new(HashMap::new()),
         next_job_id: AtomicU32::new(1),
         start_time: Instant::now(),
-        pap_locks: std::sync::Mutex::new(HashMap::new()),
+        job_locks: std::sync::Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -214,27 +258,60 @@ fn urf_string(caps: &PrinterCaps) -> String {
     format!("W8,SRGB24,CP1,RS{}", caps.dpi)
 }
 
+/// IPP endpoint key for a discovered printer: name slug + AppleTalk address,
+/// plus a "-sw" tag for StyleWriters. The address keeps two identically-named
+/// devices on different nodes from colliding on one /ipp/{key} route; the tag
+/// keeps a LaserWriter and StyleWriter that share a name apart.
+fn printer_key(kind: PrinterKind, name: &str, addr: ServiceAddress) -> String {
+    let key = make_key(name);
+    let a = format!("{}-{}-{}", addr.network_number, addr.node_number, addr.socket_number);
+    match kind {
+        PrinterKind::LaserWriter => format!("{key}-{a}"),
+        PrinterKind::StyleWriter => format!("{key}-{a}-sw"),
+    }
+}
+
 async fn discover(
     nbp: &NbpHandle,
     ddp: &DdpHandle,
     printers: &Arc<RwLock<Vec<Printer>>>,
     mdns: &ServiceDaemon,
 ) {
-    let entity: EntityName = match "=:LaserWriter@*".try_into() {
-        Ok(e) => e,
-        Err(e) => { tracing::error!("IPP bridge: bad entity name: {e}"); return; }
-    };
+    // (kind, NBP type pattern) for each supported printer family.
+    let lookups: [(PrinterKind, &str); 2] = [
+        (PrinterKind::LaserWriter, "=:LaserWriter@*"),
+        (PrinterKind::StyleWriter, "=:ColorStyleWriter2400AT@*"),
+    ];
 
-    let tuples = match nbp.lookup(entity).await {
-        Ok(t) => t,
-        Err(e) => { tracing::warn!("IPP bridge: NBP lookup failed: {e}"); return; }
-    };
+    let entities: Vec<(PrinterKind, EntityName)> = lookups
+        .iter()
+        .filter_map(|(kind, pattern)| match (*pattern).try_into() {
+            Ok(e) => Some((*kind, e)),
+            Err(e) => { tracing::error!("IPP bridge: bad entity name '{pattern}': {e}"); None }
+        })
+        .collect();
 
-    tracing::info!("IPP bridge: found {} LaserWriter(s)", tuples.len());
+    let mut tuples: Vec<(PrinterKind, tailtalk_packets::nbp::NbpTuple)> = Vec::new();
+    // If the lookup errors, keep the existing registrations rather than
+    // pruning them on a transient failure.
+    let mut lookup_ok: Vec<PrinterKind> = Vec::new();
+    // Both name patterns go out as one concurrent batch, sharing a single
+    // NBP reply-collection window.
+    let names: Vec<EntityName> = entities.iter().map(|(_, e)| e.clone()).collect();
+    match nbp.lookup_many(names).await {
+        Ok(results) => {
+            for ((kind, _), found) in entities.iter().zip(results) {
+                tracing::info!("IPP bridge: found {} {kind:?}(s)", found.len());
+                lookup_ok.push(*kind);
+                tuples.extend(found.into_iter().map(|t| (*kind, t)));
+            }
+        }
+        Err(e) => tracing::warn!("IPP bridge: NBP lookup failed: {e}"),
+    }
 
     let new_keys: HashSet<String> = tuples.iter()
-        .map(|t| make_key(&t.entity_name.object))
-        .filter(|k| !k.is_empty())
+        .filter(|(_, t)| !make_key(&t.entity_name.object).is_empty())
+        .map(|(kind, t)| printer_key(*kind, &t.entity_name.object, t.service_address()))
         .collect();
 
     // Prune vanished printers under a short-lived write lock, then release it:
@@ -243,7 +320,7 @@ async fn discover(
     let mut current_keys: HashSet<String> = {
         let mut current = printers.write().await;
         current.retain(|p| {
-            if new_keys.contains(&p.key) {
+            if new_keys.contains(&p.key) || !lookup_ok.contains(&p.kind) {
                 true
             } else {
                 if let Ok(rx) = mdns.unregister(&p.mdns_fullname) { drop(rx); }
@@ -253,20 +330,48 @@ async fn discover(
         current.iter().map(|p| p.key.clone()).collect()
     };
 
-    for tuple in &tuples {
+    // Names that appear on more than one device this cycle. The mDNS instance
+    // name must be unique, so those get disambiguated by address below.
+    let mut name_counts: HashMap<&str, usize> = HashMap::new();
+    for (_, t) in &tuples {
+        *name_counts.entry(t.entity_name.object.as_str()).or_default() += 1;
+    }
+
+    for (kind, tuple) in &tuples {
+        let kind = *kind;
         let name = tuple.entity_name.object.clone();
-        let key = make_key(&name);
-        if key.is_empty() || current_keys.contains(&key) {
+        let addr = tuple.service_address();
+        let key = printer_key(kind, &name, addr);
+        if make_key(&name).is_empty() || current_keys.contains(&key) {
             continue;
         }
 
-        let addr = AtpAddress {
-            network_number: tuple.network_number,
-            node_number: tuple.node_id,
-            socket_number: tuple.socket_number,
+        let caps = match kind {
+            PrinterKind::LaserWriter => query_printer_caps(ddp, addr.into()).await,
+            PrinterKind::StyleWriter => {
+                match query_stylewriter_caps(ddp, addr.into()).await {
+                    Ok(caps) => caps,
+                    Err(e) if e.downcast_ref::<PrinterBusy>().is_some() => {
+                        // Someone is printing; retry on the next discovery
+                        // cycle rather than registering with guessed caps.
+                        tracing::info!("IPP bridge: StyleWriter '{name}' is busy, deferring registration");
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!("IPP bridge: StyleWriter caps query for '{name}' failed ({e}), using defaults");
+                        default_stylewriter_caps()
+                    }
+                }
+            }
         };
 
-        let caps = query_printer_caps(ddp, addr).await;
+        // When two devices share a name, the mDNS instance name (which must be
+        // unique) gets an address tag so both show up; unique names stay clean.
+        let instance_name = if name_counts.get(name.as_str()).copied().unwrap_or(0) > 1 {
+            format!("{name} ({}-{})", addr.network_number, addr.node_number)
+        } else {
+            name.clone()
+        };
 
         let hostname = format!("tailtalk-{key}.local.");
         let rp = format!("ipp/{key}");
@@ -292,7 +397,7 @@ async fn discover(
         props.push(("pdl", "application/pdf,application/postscript"));
 
         let addrs = local_ipv4_addrs();
-        let service_info = match ServiceInfo::new("_universal._sub._ipp._tcp.local.", &name, &hostname, addrs.as_slice(), 8631u16, &props[..]) {
+        let service_info = match ServiceInfo::new("_universal._sub._ipp._tcp.local.", &instance_name, &hostname, addrs.as_slice(), 8631u16, &props[..]) {
             Ok(si) => si,
             Err(e) => { tracing::warn!("IPP bridge: ServiceInfo error for '{name}': {e}"); continue; }
         };
@@ -309,9 +414,47 @@ async fn discover(
             caps.dpi, caps.color, caps.media_default,
         );
         current_keys.insert(key.clone());
-        printers.write().await.push(Printer { name, addr, key, mdns_fullname, caps });
+        printers.write().await.push(Printer { name, kind, addr, key, mdns_fullname, caps });
     }
 
+}
+
+/// Fallback caps when a StyleWriter is discovered but its info query fails.
+/// Assume color: a color job on a black cartridge is refused cleanly at
+/// setup time ('H' check), whereas advertising mono-only would permanently
+/// hide a working color printer.
+fn default_stylewriter_caps() -> PrinterCaps {
+    PrinterCaps {
+        dpi: SW_DPI,
+        color: true,
+        model: "Apple Color StyleWriter".to_string(),
+        media_default: "na_letter_8.5x11in".to_string(),
+        tray_sources: vec!["main".into()],
+    }
+}
+
+/// Query a StyleWriter's model and installed cartridge over a short-lived
+/// ADSP session (no page is fed). Propagates [`PrinterBusy`] so the caller
+/// can defer registration instead of guessing.
+async fn query_stylewriter_caps(ddp: &DdpHandle, addr: AdspAddress) -> anyhow::Result<PrinterCaps> {
+    let mut session = StyleWriterSession::connect(ddp, addr, "TailTalk").await?;
+    let info = session.query_info().await;
+    let _ = session.abort().await;
+    let info = info?;
+
+    tracing::info!(
+        "IPP bridge: StyleWriter identity '{}' submodel {:?} cartridge={}",
+        info.identity,
+        info.submodel,
+        if info.color_cartridge { "color" } else { "black" },
+    );
+
+    Ok(PrinterCaps {
+        dpi: SW_DPI,
+        color: info.color_capable(),
+        model: info.model_name().to_string(),
+        ..default_stylewriter_caps()
+    })
 }
 
 /// Query printer capabilities via the PostScript Query Protocol.
@@ -613,49 +756,72 @@ async fn handle_ipp(
             tracing::info!("IPP: PrintJob id={job_id} fmt={fmt:?} doc_bytes={} tray={tray:?}", doc.len());
 
             let ddp = state.ddp.clone();
-            let addr = printer.addr;
-            let dpi = printer.caps.dpi;
-            let pap_lock = {
-                let mut locks = state.pap_locks.lock().unwrap();
+            let job_lock = {
+                let mut locks = state.job_locks.lock().unwrap();
                 locks.entry(printer.key.clone()).or_default().clone()
             };
-            tokio::spawn(async move {
-                job.lock().await.state_message = "Rasterizing".to_string();
-                let (ps, page_count) = match rasterize_to_ps(doc, &fmt, &tray, dpi, job_id).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::error!("IPP: rasterize failed: {e}");
-                        let mut j = job.lock().await;
-                        j.state = JobState::Aborted;
-                        j.state_message = format!("Rasterize failed: {e}");
-                        return;
-                    }
-                };
-                tracing::info!("IPP: rasterized {page_count} page(s) to {} bytes PS", ps.len());
-                job.lock().await.state_message = "Waiting for printer".to_string();
-                let _pap_guard = pap_lock.lock().await;
-                job.lock().await.state_message = "Printing".to_string();
-                match print_to_pap(ddp, addr, ps).await {
-                    Ok(printer_output) => {
-                        let mut j = job.lock().await;
-                        j.impressions_completed = page_count as i32;
-                        if let Some(err) = parse_printer_error(&printer_output) {
-                            tracing::warn!("IPP: job {job_id} printer error: {err}");
-                            j.state = JobState::Aborted;
-                            j.state_message = err;
-                        } else {
-                            j.state = JobState::Completed;
-                            j.state_message = "Completed".to_string();
+            match printer.kind {
+                PrinterKind::LaserWriter => {
+                    let addr: AtpAddress = printer.addr.into();
+                    let dpi = printer.caps.dpi;
+                    tokio::spawn(async move {
+                        job.lock().await.state_message = "Rasterizing".to_string();
+                        let (ps, page_count) = match rasterize_to_ps(doc, &fmt, &tray, dpi, job_id).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::error!("IPP: rasterize failed: {e}");
+                                let mut j = job.lock().await;
+                                j.state = JobState::Aborted;
+                                j.state_message = format!("Rasterize failed: {e}");
+                                return;
+                            }
+                        };
+                        tracing::info!("IPP: rasterized {page_count} page(s) to {} bytes PS", ps.len());
+                        job.lock().await.state_message = "Waiting for printer".to_string();
+                        let _pap_guard = job_lock.lock().await;
+                        job.lock().await.state_message = "Printing".to_string();
+                        match print_to_pap(ddp, addr, ps).await {
+                            Ok(printer_output) => {
+                                let mut j = job.lock().await;
+                                j.impressions_completed = page_count as i32;
+                                if let Some(err) = parse_printer_error(&printer_output) {
+                                    tracing::warn!("IPP: job {job_id} printer error: {err}");
+                                    j.state = JobState::Aborted;
+                                    j.state_message = err;
+                                } else {
+                                    j.state = JobState::Completed;
+                                    j.state_message = "Completed".to_string();
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("IPP: job {job_id} PAP error: {e}");
+                                let mut j = job.lock().await;
+                                j.state = JobState::Aborted;
+                                j.state_message = format!("PAP error: {e}");
+                            }
                         }
-                    }
-                    Err(e) => {
-                        tracing::error!("IPP: job {job_id} PAP error: {e}");
-                        let mut j = job.lock().await;
-                        j.state = JobState::Aborted;
-                        j.state_message = format!("PAP error: {e}");
-                    }
+                    });
                 }
-            });
+                PrinterKind::StyleWriter => {
+                    // Mono jobs take the K-only path even on a color cartridge:
+                    // true black beats CMY-composite gray and saves the color inks.
+                    let color = printer.caps.color
+                        && job_color_mode(&parsed).as_deref() != Some("monochrome");
+                    let quality = match job_print_quality(&parsed) {
+                        Some(5) => PrintQuality::Best,
+                        _ => PrintQuality::Normal,
+                    };
+                    let username = job_user_name(&parsed)
+                        .unwrap_or_else(|| "TailTalk".to_string());
+                    let addr = printer.adsp_addr();
+                    tracing::info!(
+                        "IPP: StyleWriter job {job_id}: color={color} quality={quality:?} user={username}"
+                    );
+                    tokio::spawn(run_stylewriter_job(
+                        job, ddp, addr, doc, fmt, color, quality, username, job_lock, job_id,
+                    ));
+                }
+            }
             job_created_response(job_id, &job_uri, req_id)
         }
         op if op == Operation::ValidateJob as u16 => ipp_ok(req_id),
@@ -734,6 +900,24 @@ fn printer_attributes(printer: &Printer, req_id: u32) -> axum::response::Respons
     let uri = format!("ipp://localhost:8631/ipp/{}", printer.key);
     let caps = &printer.caps;
 
+    // A StyleWriter with a black cartridge really is monochrome-only; the
+    // LaserWriter path always accepts color input (ghostscript converts).
+    let color_modes: &[&str] = match printer.kind {
+        PrinterKind::StyleWriter if !caps.color => &["monochrome"],
+        _ => &["auto", "color", "monochrome"],
+    };
+    let color_mode_default = if printer.kind == PrinterKind::StyleWriter && caps.color {
+        "auto"
+    } else {
+        "monochrome"
+    };
+    // StyleWriter quality maps to the printer's own mode string (normal/best);
+    // draft has no known string, so it isn't offered there.
+    let qualities: &[i32] = match printer.kind {
+        PrinterKind::LaserWriter => &[3, 4, 5],
+        PrinterKind::StyleWriter => &[4, 5],
+    };
+
     let mut add = |name: &str, val: IppValue| {
         if let Ok(a) = IppAttribute::with_name(name, val) {
             resp.attributes_mut().add(DelimiterTag::PrinterAttributes, a);
@@ -771,13 +955,15 @@ fn printer_attributes(printer: &Printer, req_id: u32) -> axum::response::Respons
     if let Ok(t) = "".try_into() { add("printer-location", IppValue::TextWithoutLanguage(t)); }
     // output-mode-supported: older Apple attribute; synonym for print-color-mode-supported.
     {
-        let modes: Vec<IppValue> = ["auto", "color", "monochrome"].iter().copied()
+        let modes: Vec<IppValue> = color_modes.iter().copied()
             .filter_map(|k| k.try_into().ok())
             .map(IppValue::Keyword)
             .collect();
         add("output-mode-supported", IppValue::Array(modes));
     }
-    add("pages-per-minute", IppValue::Integer(8));
+    add("pages-per-minute", IppValue::Integer(
+        match printer.kind { PrinterKind::LaserWriter => 8, PrinterKind::StyleWriter => 1 },
+    ));
     add("pdf-k-octets-supported", IppValue::RangeOfInteger { min: 1, max: 65535 });
     add("jpeg-k-octets-supported", IppValue::RangeOfInteger { min: 1, max: 65535 });
     add("printer-state", IppValue::Enum(3)); // idle
@@ -832,7 +1018,11 @@ fn printer_attributes(printer: &Printer, req_id: u32) -> axum::response::Respons
     });
 
     {
-        let vals: Vec<IppValue> = STANDARD_MEDIA.iter().copied()
+        let mut media: Vec<&str> = STANDARD_MEDIA.to_vec();
+        if printer.kind == PrinterKind::StyleWriter {
+            media.extend_from_slice(STYLEWRITER_EXTRA_MEDIA);
+        }
+        let vals: Vec<IppValue> = media.into_iter()
             .filter_map(|m| m.try_into().ok())
             .map(IppValue::Keyword)
             .collect();
@@ -867,19 +1057,18 @@ fn printer_attributes(printer: &Printer, req_id: u32) -> axum::response::Respons
     add("sides-supported", IppValue::Keyword("one-sided".try_into().unwrap()));
     add("print-quality-default", IppValue::Enum(4)); // 4 = normal
     {
-        let vals = vec![IppValue::Enum(3), IppValue::Enum(4), IppValue::Enum(5)]; // draft/normal/high
+        let vals: Vec<IppValue> = qualities.iter().map(|&q| IppValue::Enum(q)).collect();
         add("print-quality-supported", IppValue::Array(vals));
     }
     // macOS Photos checks print-color-mode-supported before queuing photo jobs.
-    // Advertise all modes; ghostscript converts colour → mono for this printer.
     {
-        let modes: Vec<IppValue> = ["auto", "color", "monochrome"].iter().copied()
+        let modes: Vec<IppValue> = color_modes.iter().copied()
             .filter_map(|k| k.try_into().ok())
             .map(IppValue::Keyword)
             .collect();
         add("print-color-mode-supported", IppValue::Array(modes));
     }
-    if let Ok(k) = "monochrome".try_into() {
+    if let Ok(k) = color_mode_default.try_into() {
         add("print-color-mode-default", IppValue::Keyword(k));
     }
 
@@ -923,6 +1112,47 @@ fn job_media_source(parsed: &IppRequestResponse) -> String {
             }
         })
         .unwrap_or_else(|| "main".to_string())
+}
+
+/// Extract the requested color mode: `print-color-mode`, falling back to the
+/// older Apple `output-mode` synonym.
+fn job_color_mode(parsed: &IppRequestResponse) -> Option<String> {
+    let group = parsed.attributes()
+        .groups_of(DelimiterTag::JobAttributes)
+        .next()?;
+    for name in ["print-color-mode", "output-mode"] {
+        if let Some(a) = group.attributes().get(name)
+            && let IppValue::Keyword(k) = a.value() {
+                return Some(k.as_str().to_string());
+            }
+    }
+    None
+}
+
+/// Extract the `print-quality` job attribute (3=draft, 4=normal, 5=high).
+fn job_print_quality(parsed: &IppRequestResponse) -> Option<i32> {
+    parsed.attributes()
+        .groups_of(DelimiterTag::JobAttributes)
+        .next()
+        .and_then(|g| g.attributes().get("print-quality"))
+        .and_then(|a| match a.value() {
+            IppValue::Enum(v) | IppValue::Integer(v) => Some(*v),
+            _ => None,
+        })
+}
+
+/// Extract `requesting-user-name` (sent to the StyleWriter in its
+/// print-request handshake, where the real Mac driver sends the chooser name).
+fn job_user_name(parsed: &IppRequestResponse) -> Option<String> {
+    parsed.attributes()
+        .groups_of(DelimiterTag::OperationAttributes)
+        .next()
+        .and_then(|g| g.attributes().get("requesting-user-name"))
+        .and_then(|a| match a.value() {
+            IppValue::NameWithoutLanguage(n) => Some(n.as_str().to_string()),
+            IppValue::TextWithoutLanguage(t) => Some(t.to_string()),
+            _ => None,
+        })
 }
 
 /// Convert `image/urf` to a format gs can rasterize.
@@ -1033,22 +1263,20 @@ pub fn gs_probe() -> bool {
     }
 }
 
-// gs pbmraw → per-page PS Level-2 image; most reliable path for classic LaserWriter firmware.
-async fn rasterize_to_ps(mut data: Vec<u8>, fmt: &str, tray_source: &str, dpi: u32, job_token: u32) -> anyhow::Result<(Vec<u8>, usize)> {
-    if fmt == "application/postscript" || fmt == "application/vnd.cups-postscript" {
-        let page_count = data.windows(7).filter(|w| *w == b"%%Page:").count().max(1);
-        return Ok((data, page_count));
-    }
+/// Rasterize a PDF/PS/URF document with Ghostscript to a raw raster device
+/// (`pbmraw`, `ppmraw`, …) at `dpi`, returning the concatenated raw pages.
+async fn gs_raster(mut data: Vec<u8>, fmt: &str, device: &str, dpi: u32, job_token: u32) -> anyhow::Result<Vec<u8>> {
     // Track whether urf_to_rasterizable ran — on Linux it returns PostScript, not PDF.
     let is_urf = fmt == "image/urf" || data.starts_with(b"UNIRAST");
     if is_urf {
         data = urf_to_rasterizable(data, job_token).await?;
     }
 
-    // pbmraw cannot write to stdout, so use a temp file.
+    // Raw raster devices cannot write to stdout, so use a temp file.
     let tmp = std::env::temp_dir();
-    let pbm_path = tmp.join(format!("tailtalk-rip-{job_token}.pbm"));
+    let out_path = tmp.join(format!("tailtalk-rip-{job_token}.{device}"));
     let res_arg = format!("-r{dpi}");
+    let dev_arg = format!("-sDEVICE={device}");
 
     // Use .ps extension when we know the content is PostScript (Linux ippeveps output),
     // .pdf otherwise. gs content-sniffs regardless, but the correct extension avoids
@@ -1063,8 +1291,8 @@ async fn rasterize_to_ps(mut data: Vec<u8>, fmt: &str, tray_source: &str, dpi: u
     let output = tokio::process::Command::new(gs_command())
         // Pass -sOutputFile as a separate -o arg so the OS handles path quoting,
         // avoiding issues with spaces in the temp directory path on Windows.
-        .args(["-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=pbmraw", &res_arg, "-o"])
-        .arg(&pbm_path)
+        .args(["-dNOPAUSE", "-dBATCH", "-dSAFER", &dev_arg, &res_arg, "-o"])
+        .arg(&out_path)
         .arg(&input_path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1074,10 +1302,10 @@ async fn rasterize_to_ps(mut data: Vec<u8>, fmt: &str, tray_source: &str, dpi: u
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Keep the input file around for post-mortem; clean up the (possibly partial) pbm.
-        let _ = tokio::fs::remove_file(&pbm_path).await;
+        // Keep the input file around for post-mortem; clean up the (possibly partial) raster.
+        let _ = tokio::fs::remove_file(&out_path).await;
         anyhow::bail!(
-            "gs pbmraw exited with {} (input kept at {})\nstderr: {}\nstdout: {}",
+            "gs {device} exited with {} (input kept at {})\nstderr: {}\nstdout: {}",
             output.status,
             input_path.display(),
             stderr.trim(),
@@ -1086,15 +1314,214 @@ async fn rasterize_to_ps(mut data: Vec<u8>, fmt: &str, tray_source: &str, dpi: u
     }
     let _ = tokio::fs::remove_file(&input_path).await;
 
-    let pbm = tokio::fs::read(&pbm_path).await;
-    let _ = tokio::fs::remove_file(&pbm_path).await;
-    let pbm = pbm?;
+    let raster = tokio::fs::read(&out_path).await;
+    let _ = tokio::fs::remove_file(&out_path).await;
+    Ok(raster?)
+}
 
+// gs pbmraw → per-page PS Level-2 image; most reliable path for classic LaserWriter firmware.
+async fn rasterize_to_ps(data: Vec<u8>, fmt: &str, tray_source: &str, dpi: u32, job_token: u32) -> anyhow::Result<(Vec<u8>, usize)> {
+    if fmt == "application/postscript" || fmt == "application/vnd.cups-postscript" {
+        let page_count = data.windows(7).filter(|w| *w == b"%%Page:").count().max(1);
+        return Ok((data, page_count));
+    }
+
+    let pbm = gs_raster(data, fmt, "pbmraw", dpi, job_token).await?;
     let pages = parse_pbm_pages(&pbm)?;
     anyhow::ensure!(!pages.is_empty(), "gs produced no pages");
 
     let page_count = pages.len();
     Ok((build_ps_raster(&pages, dpi, tray_source), page_count))
+}
+
+/// One page of raw planar StyleWriter scanlines: rows → planes (1 for mono,
+/// C/M/Y/K for color) → plane bytes (1 bit per pixel, MSB first, 1 = ink).
+type PlanarPage = Vec<Vec<Vec<u8>>>;
+
+/// Rasterize a document for the StyleWriter at 360 dpi and crop each page
+/// to the printable window (lpstyl's margins for the CS family).
+async fn rasterize_for_stylewriter(data: Vec<u8>, fmt: &str, color: bool, job_token: u32) -> anyhow::Result<Vec<PlanarPage>> {
+    let device = if color { "ppmraw" } else { "pbmraw" };
+    let raster = gs_raster(data, fmt, device, SW_DPI, job_token).await?;
+    let pages: Vec<PlanarPage> = if color {
+        parse_ppm_pages(&raster)?
+            .into_iter()
+            .map(|(w, h, rgb)| ppm_page_to_planar(w, h, &rgb))
+            .collect()
+    } else {
+        parse_pbm_pages(&raster)?
+            .into_iter()
+            .map(|(w, h, bits)| pbm_page_to_planar(w, h, &bits))
+            .collect()
+    };
+    anyhow::ensure!(!pages.is_empty(), "gs produced no pages");
+    Ok(pages)
+}
+
+/// Number of printable rows for a page of `h` rows: skip the top margin and
+/// stop above the bottom margin (lpstyl: PRINT_HEIGHT = height - (TOP +
+/// BOTTOM + 1)). Returns the top offset and one-past-the-end row.
+fn sw_printable_rows(h: usize) -> (usize, usize) {
+    let top = SW_TOP_MARGIN_ROWS.min(h);
+    let bottom = h.saturating_sub(SW_BOTTOM_MARGIN_ROWS + 1).max(top);
+    (top, bottom)
+}
+
+/// Crop a full-page 360 dpi PBM raster to the printable window, returning
+/// per-row single-plane scanlines. PBM bit 1 = black = deposit ink, which is
+/// exactly the K-plane sense — no inversion needed.
+fn pbm_page_to_planar(w: u32, h: u32, bits: &[u8]) -> PlanarPage {
+    let row_bytes = (w as usize).div_ceil(8);
+    let left_bytes = SW_LEFT_MARGIN_PX / 8; // 72 px: exactly byte-aligned
+    let take = SW2200_PRINT_ROWBYTES.min(row_bytes.saturating_sub(left_bytes));
+    let (top, bottom) = sw_printable_rows(h as usize);
+    let mut rows = Vec::with_capacity(bottom - top);
+    for y in top..bottom {
+        let start = y * row_bytes + left_bytes;
+        rows.push(vec![bits[start..start + take].to_vec()]);
+    }
+    rows
+}
+
+/// Crop a full-page 360 dpi RGB raster to the printable window and
+/// Floyd–Steinberg dither it into C/M/Y 1-bit planes.
+///
+/// The K plane stays empty: with a color cartridge the printer deposits no
+/// ink for the K plane at all, so black must be composited from C+M+Y
+/// (undercolor removal 0 — see to_bitcmyk.py, verified on a real SW2200
+/// where UCR-moved black simply vanished from the page).
+fn ppm_page_to_planar(w: u32, h: u32, rgb: &[u8]) -> PlanarPage {
+    let (w, h) = (w as usize, h as usize);
+    let left = SW_LEFT_MARGIN_PX.min(w);
+    let print_w = (w - left).min(SW2200_PRINT_WIDTH);
+    let (top, bottom) = sw_printable_rows(h);
+    let plane_bytes = print_w.div_ceil(8).max(1);
+
+    // Floyd–Steinberg error buffers for the C/M/Y channels, padded one
+    // pixel each side so diffusion needs no bounds checks.
+    let mut err_cur = vec![[0.0f32; 3]; print_w + 2];
+    let mut err_next = vec![[0.0f32; 3]; print_w + 2];
+
+    let mut rows = Vec::with_capacity(bottom - top);
+    for y in top..bottom {
+        let mut planes = vec![vec![0u8; plane_bytes]; 4];
+        for x in 0..print_w {
+            let px = (y * w + left + x) * 3;
+            for ch in 0..3 {
+                // RGB → CMY: ink = 255 - value (R→C, G→M, B→Y).
+                let want = (255 - rgb[px + ch]) as f32 + err_cur[x + 1][ch];
+                let on = want >= 127.5;
+                if on {
+                    planes[ch][x / 8] |= 0x80 >> (x % 8);
+                }
+                let e = want - if on { 255.0 } else { 0.0 };
+                err_cur[x + 2][ch] += e * (7.0 / 16.0);
+                err_next[x][ch] += e * (3.0 / 16.0);
+                err_next[x + 1][ch] += e * (5.0 / 16.0);
+                err_next[x + 2][ch] += e * (1.0 / 16.0);
+            }
+        }
+        rows.push(planes);
+        std::mem::swap(&mut err_cur, &mut err_next);
+        for e in err_next.iter_mut() {
+            *e = [0.0; 3];
+        }
+    }
+    rows
+}
+
+/// Connect to a StyleWriter, retrying while it reports busy — another host
+/// may hold the print connection, or it may still be ejecting the previous
+/// page of this very job.
+async fn connect_stylewriter(ddp: &DdpHandle, addr: AdspAddress, username: &str) -> anyhow::Result<StyleWriterSession> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        match StyleWriterSession::connect(ddp, addr, username).await {
+            Err(e) if e.downcast_ref::<PrinterBusy>().is_some()
+                && tokio::time::Instant::now() < deadline =>
+            {
+                tracing::debug!("IPP: StyleWriter busy, retrying in 5s");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Print one page over a fresh ADSP session (connect → setup → bands →
+/// finish); on failure the abort path ejects any loaded page and resets the
+/// printer so the paper path isn't left wedged.
+async fn print_stylewriter_page(
+    ddp: &DdpHandle,
+    addr: AdspAddress,
+    rows: &PlanarPage,
+    color: bool,
+    quality: PrintQuality,
+    username: &str,
+) -> anyhow::Result<()> {
+    let batches = encode_page_batches(rows, !color);
+    let mut session = connect_stylewriter(ddp, addr, username).await?;
+    let result: anyhow::Result<()> = async {
+        session.setup(color, quality).await?;
+        for batch in &batches {
+            session.write_batch(batch.top, batch.bottom, &batch.data, color).await?;
+        }
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => session.finish().await,
+        Err(e) => {
+            let _ = session.abort().await;
+            Err(e)
+        }
+    }
+}
+
+/// Full StyleWriter job pipeline: rasterize + dither, queue behind any job
+/// already printing (per-printer lock), then print page by page.
+#[allow(clippy::too_many_arguments)]
+async fn run_stylewriter_job(
+    job: Arc<Mutex<JobRecord>>,
+    ddp: DdpHandle,
+    addr: AdspAddress,
+    doc: Vec<u8>,
+    fmt: String,
+    color: bool,
+    quality: PrintQuality,
+    username: String,
+    job_lock: Arc<Mutex<()>>,
+    job_id: u32,
+) {
+    job.lock().await.state_message = "Rasterizing".to_string();
+    let pages = match rasterize_for_stylewriter(doc, &fmt, color, job_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("IPP: StyleWriter job {job_id} rasterize failed: {e}");
+            let mut j = job.lock().await;
+            j.state = JobState::Aborted;
+            j.state_message = format!("Rasterize failed: {e}");
+            return;
+        }
+    };
+    tracing::info!("IPP: StyleWriter job {job_id}: {} page(s) rasterized", pages.len());
+
+    job.lock().await.state_message = "Waiting for printer".to_string();
+    let _guard = job_lock.lock().await;
+    for (i, rows) in pages.iter().enumerate() {
+        job.lock().await.state_message = format!("Printing page {} of {}", i + 1, pages.len());
+        if let Err(e) = print_stylewriter_page(&ddp, addr, rows, color, quality, &username).await {
+            tracing::error!("IPP: StyleWriter job {job_id} failed on page {}: {e:#}", i + 1);
+            let mut j = job.lock().await;
+            j.state = JobState::Aborted;
+            j.state_message = format!("Print failed on page {}: {e:#}", i + 1);
+            return;
+        }
+        job.lock().await.impressions_completed = (i + 1) as i32;
+    }
+    let mut j = job.lock().await;
+    j.state = JobState::Completed;
+    j.state_message = "Completed".to_string();
 }
 
 /// Parse one or more concatenated P4 (binary PBM) images from `data`.
@@ -1114,9 +1541,36 @@ fn parse_pbm_pages(data: &[u8]) -> anyhow::Result<Vec<(u32, u32, Vec<u8>)>> {
     Ok(pages)
 }
 
+/// Parse one or more concatenated P6 (binary PPM, maxval 255) images from `data`.
+fn parse_ppm_pages(data: &[u8]) -> anyhow::Result<Vec<(u32, u32, Vec<u8>)>> {
+    let mut pages = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let Some((w, h, header_len)) = parse_ppm_header(&data[pos..]) else { break };
+        let page_bytes = w as usize * h as usize * 3;
+        let data_start = pos + header_len;
+        let data_end = data_start + page_bytes;
+        if data_end > data.len() { break; }
+        pages.push((w, h, data[data_start..data_end].to_vec()));
+        pos = data_end;
+    }
+    Ok(pages)
+}
+
 /// Parse a P4 (binary PBM) header starting at `data[0]`.
 fn parse_pbm_header(data: &[u8]) -> Option<(u32, u32, usize)> {
-    if data.get(0..2) != Some(b"P4") { return None; }
+    parse_pnm_header(data, b'4', false)
+}
+
+/// Parse a P6 (binary PPM) header starting at `data[0]`; only maxval 255 is accepted.
+fn parse_ppm_header(data: &[u8]) -> Option<(u32, u32, usize)> {
+    parse_pnm_header(data, b'6', true)
+}
+
+/// Parse a binary PNM header (`P<magic>`, width, height, optional maxval)
+/// starting at `data[0]`, returning (width, height, header length).
+fn parse_pnm_header(data: &[u8], magic: u8, has_maxval: bool) -> Option<(u32, u32, usize)> {
+    if data.first() != Some(&b'P') || data.get(1) != Some(&magic) { return None; }
     let mut pos = 2;
 
     let skip = |data: &[u8], pos: &mut usize| {
@@ -1142,8 +1596,9 @@ fn parse_pbm_header(data: &[u8]) -> Option<(u32, u32, usize)> {
 
     let w = read_u32(data, &mut pos)?;
     let h = read_u32(data, &mut pos)?;
+    if has_maxval && read_u32(data, &mut pos)? != 255 { return None; }
     if pos >= data.len() { return None; }
-    pos += 1; // mandatory single whitespace after height
+    pos += 1; // mandatory single whitespace after the last header field
     Some((w, h, pos))
 }
 
@@ -1264,4 +1719,88 @@ fn parse_printer_error(output: &str) -> Option<String> {
         .map(|l| l.trim())
         .find(|l| l.starts_with("%%[ Error:"))
         .map(|l| l.trim_start_matches("%%[").trim_end_matches("]%%").trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_ppm_pages_concatenated() {
+        // Header shape matches real gs ppmraw output, including the comment
+        // line between the magic and the dimensions.
+        let mut data = Vec::new();
+        for fill in [0u8, 255u8] {
+            data.extend_from_slice(b"P6\n# Image generated by GPL Ghostscript (device=ppmraw)\n4 2\n255\n");
+            data.extend_from_slice(&[fill; 4 * 2 * 3]);
+        }
+        let pages = parse_ppm_pages(&data).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!((pages[0].0, pages[0].1), (4, 2));
+        assert!(pages[0].2.iter().all(|&b| b == 0));
+        assert!(pages[1].2.iter().all(|&b| b == 255));
+    }
+
+    #[test]
+    fn test_sw_printable_rows() {
+        // Letter at 360 dpi: 3960 rows → lpstyl's PRINT_HEIGHT = 3960 - 181.
+        let (top, bottom) = sw_printable_rows(3960);
+        assert_eq!(top, SW_TOP_MARGIN_ROWS);
+        assert_eq!(bottom - top, 3960 - 181);
+        // Degenerate tiny page must not underflow.
+        let (top, bottom) = sw_printable_rows(50);
+        assert!(bottom >= top);
+    }
+
+    #[test]
+    fn test_pbm_page_to_planar_crop() {
+        // 2 printable rows on a page just tall enough to have them; row bytes
+        // beyond the left margin land at byte offset 9.
+        let w = 3060u32; // letter width at 360 dpi
+        let h = (SW_TOP_MARGIN_ROWS + SW_BOTTOM_MARGIN_ROWS + 3) as u32;
+        let row_bytes = (w as usize).div_ceil(8);
+        let mut bits = vec![0u8; row_bytes * h as usize];
+        let printable_row = SW_TOP_MARGIN_ROWS;
+        bits[printable_row * row_bytes + SW_LEFT_MARGIN_PX / 8] = 0xAB;
+        let rows = pbm_page_to_planar(w, h, &bits);
+        assert_eq!(rows.len(), 2); // h - (top + bottom + 1)
+        assert_eq!(rows[0].len(), 1); // single K plane
+        assert_eq!(rows[0][0].len(), SW2200_PRINT_ROWBYTES.min(row_bytes - 9));
+        assert_eq!(rows[0][0][0], 0xAB);
+        assert!(rows[1][0].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_ppm_page_to_planar_dither_extremes() {
+        let w = 200u32;
+        let h = (SW_TOP_MARGIN_ROWS + SW_BOTTOM_MARGIN_ROWS + 5) as u32;
+        // Pure black page: every C/M/Y bit inside the printable window must
+        // be set (composite black), and the K plane must stay empty.
+        let black = vec![0u8; (w * h * 3) as usize];
+        let rows = pbm_like_bits(&ppm_page_to_planar(w, h, &black), w as usize);
+        for (c, m, y, k) in rows {
+            assert!(c && m && y, "black page must dither to solid CMY");
+            assert!(!k, "K plane must stay empty in color mode");
+        }
+        // Pure white page: no ink anywhere.
+        let white = vec![255u8; (w * h * 3) as usize];
+        for planes in ppm_page_to_planar(w, h, &white) {
+            for plane in planes {
+                assert!(plane.iter().all(|&b| b == 0));
+            }
+        }
+    }
+
+    /// Collapse a dithered page to per-plane "any ink missing / any ink present"
+    /// flags over the printable pixel span (ignores byte padding bits).
+    fn pbm_like_bits(page: &PlanarPage, w: usize) -> Vec<(bool, bool, bool, bool)> {
+        let print_w = (w - SW_LEFT_MARGIN_PX).min(SW2200_PRINT_WIDTH);
+        page.iter()
+            .map(|planes| {
+                let all_set = |p: &Vec<u8>| (0..print_w).all(|x| p[x / 8] & (0x80 >> (x % 8)) != 0);
+                let any_set = |p: &Vec<u8>| (0..print_w).any(|x| p[x / 8] & (0x80 >> (x % 8)) != 0);
+                (all_set(&planes[0]), all_set(&planes[1]), all_set(&planes[2]), any_set(&planes[3]))
+            })
+            .collect()
+    }
 }

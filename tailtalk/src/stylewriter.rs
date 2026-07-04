@@ -1,6 +1,6 @@
 use crate::{
-    TalkStack,
-    adsp::{AdspAddress, AdspStream},
+    adsp::{Adsp, AdspAddress, AdspStream},
+    ddp::DdpHandle,
 };
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,16 +10,25 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub const SW2200_PRINT_WIDTH: usize = 2919;
 pub const SW2200_PRINT_ROWBYTES: usize = SW2200_PRINT_WIDTH.div_ceil(8); // 365
 
-/// The printer's internal raster buffer size (lpstyl `MAX_BUFFER` for the
-/// CS family). It holds one whole rect+G block before printing the band, so
-/// a block must stay *strictly smaller* than this or the printer stalls with
-/// 'B' = 0x00 (buffer full) and ejects blank — confirmed with a 32863-byte
-/// block. Callers must flush before a row would cross this limit, carrying
-/// it over to the next block (lpstyl does the same).
+/// Max compressed bytes in one rect+G band.
 ///
-/// A rect+G block must also span many rows, not one block per row — the
-/// latter never printed anything despite being byte-correct.
-pub const MAX_BATCH_BYTES: usize = 0x8000;
+/// The printer's raster buffer holds 0x8000 bytes (lpstyl's `MAX_BUFFER` for
+/// the CS family). Hand it a block that size or larger and it stalls with
+/// 'B' = 0x00 and ejects a blank page — we saw this with a 32863-byte block —
+/// so a band has to stay under 0x8000. We cap well under it, at 8 KB, to match
+/// the native Mac driver, whose bands never run much larger. Dense pages just
+/// split into more bands; sparse ones hit the row cap first (see
+/// [`MAX_BAND_ROWS`]).
+///
+/// A band also has to cover many rows. One block per row is byte-correct but
+/// never actually prints.
+pub const MAX_BATCH_BYTES: usize = 0x2000;
+
+/// Max scanlines in one rect+G band.
+///
+/// [`MAX_BATCH_BYTES`] only limits the compressed size. The native Mac driver
+/// also caps mono bands at 400 rows, so we do the same.
+pub const MAX_BAND_ROWS: usize = 400;
 
 // SW2200 is idle when 'B' has both 0x80 and 0x20 set: 0xA2 (no paper) and
 // 0xA3 (paper loaded) are the observed idle values; mid-page 'B' is a
@@ -35,6 +44,78 @@ const SW2200_IDLE_MASK: u8 = 0xA0;
 /// by observing the eject command fire while paper was visibly still being
 /// pulled in. A short fixed settle delay avoids racing ahead of the hardware.
 const MECHANISM_SETTLE_DELAY: Duration = Duration::from_secs(3);
+
+/// The printer answered the 0x000b print request with a "busy" result:
+/// another host holds the print connection. Retry later. Carried inside the
+/// `anyhow::Error` returned by [`StyleWriterSession::connect`] so callers can
+/// distinguish "queue behind someone else" from a hard failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrinterBusy(pub u16);
+
+impl std::fmt::Display for PrinterBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Printer busy (result 0x{:04X}); retry later", self.0)
+    }
+}
+
+impl std::error::Error for PrinterBusy {}
+
+/// Print quality selector, mapped onto the mode string sent during `setup()`.
+///
+/// Verified against real SW2200 captures: mono-normal is `"m2nZAH"` and colour
+/// is `"m2sAH"`. A native Mac driver capture shows Best-quality sends
+/// byte-identical raster to Normal — the printer just runs more/slower passes —
+/// so Best only flips the quality character in the mode string, not the raster.
+///
+/// Mode-string grammar: `m2 <n|s> [Z] A <B|H>`. `n`=normal / `s`=superior
+/// (best), `Z` marks the mono/K path, and the final letter is head direction:
+/// `H`=unidirectional (ink only on the left→right pass), `B`=bidirectional
+/// (ink both ways, with the right→left rows reversed pixel-wise). We always
+/// use `H`, so no row reversal is needed. Mono-best `"m2sZAH"` is derived from
+/// this grammar and not yet hardware-confirmed; mono-normal and colour are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrintQuality {
+    #[default]
+    Normal,
+    Best,
+}
+
+/// Identity of the attached printer, gathered by [`StyleWriterSession::query_info`].
+#[derive(Debug, Clone)]
+pub struct StyleWriterInfo {
+    /// Raw reply to the `?` identify command ("IJ10", "SW", "SW3", "CS", …).
+    pub identity: String,
+    /// CS-family submodel from status query 'p' (0x01=2400, 0x02=2200,
+    /// 0x04=1500, 0x05=2500); `None` for non-CS printers or no reply.
+    pub submodel: Option<u8>,
+    /// Status 'H' bit 0x80: a color ink cartridge is installed.
+    pub color_cartridge: bool,
+}
+
+impl StyleWriterInfo {
+    /// Human-readable model name (lpstyl's identify tables).
+    pub fn model_name(&self) -> &'static str {
+        match self.identity.as_str() {
+            "IJ10" => "Apple StyleWriter",
+            "SW" => "Apple StyleWriter II",
+            "SW3" => "Apple StyleWriter 1200",
+            "CS" => match self.submodel {
+                Some(0x01) => "Apple Color StyleWriter 2400",
+                Some(0x02) => "Apple Color StyleWriter 2200",
+                Some(0x04) => "Apple Color StyleWriter 1500",
+                Some(0x05) => "Apple Color StyleWriter 2500",
+                _ => "Apple Color StyleWriter",
+            },
+            _ => "Apple StyleWriter",
+        }
+    }
+
+    /// CS-family printers are the only ones that can print color at all
+    /// (and only with a color cartridge installed).
+    pub fn color_capable(&self) -> bool {
+        self.identity == "CS" && self.color_cartridge
+    }
+}
 
 /// Build the attention payload for the 0x000b print-request message
 /// (lpstyl §at_printer_open): `struct printRequest { u_int32_t port; char string[66]; }`.
@@ -70,11 +151,10 @@ async fn write_flush(data: &mut AdspStream, bytes: &[u8]) -> anyhow::Result<()> 
 /// - Raster data must be batched (`write_batch`) as one rect+G block spanning
 ///   many rows, not one block per row — the latter looked byte-correct but
 ///   the printer silently never printed anything.
-/// - Color ('c'/"m2sAH") scanlines must be XOR-delta encoded against the
-///   previous row, restarting absolute at each rect+G block; the printer
-///   XOR-reconstructs rows, so absolute color rows print as cumulative-XOR
-///   noise. Monochrome ('R'/"m2nZAB") scanlines are absolute. See
-///   `encode_row` in the adsp-stylewriter example.
+/// - Both colour ('c'/"m2sAH") and mono ('R'/"m2nZAH") scanlines are XOR-delta
+///   encoded against the previous row, restarting from absolute at each rect+G
+///   block. The printer XOR-reconstructs each row, so a non-delta'd row prints
+///   as cumulative-XOR noise. See `encode_page_batches`.
 /// - `finish()`'s teardown replicates lpstyl's `at_printer_kill(), whose own
 ///   comment warns: "If you don't get it just right, after the disconnect
 ///   the printer tries to open a new connection to the original control
@@ -89,13 +169,13 @@ impl StyleWriterSession {
     /// ATTN 0x000b print request, close the control connection on success,
     /// then accept the printer's reverse connection on our data socket.
     pub async fn connect(
-        stack: &TalkStack,
+        ddp: &DdpHandle,
         printer_addr: AdspAddress,
         username: &str,
     ) -> anyhow::Result<Self> {
-        let (data_socket_num, mut data_listener) = stack.listen_adsp(None).await?;
+        let (data_socket_num, mut data_listener) = Adsp::bind(ddp, None).await?;
 
-        let mut ctrl = stack.connect_adsp(printer_addr).await?;
+        let mut ctrl = Adsp::connect(ddp, printer_addr).await?;
         let req_payload = build_print_request(data_socket_num, username);
         ctrl.send_attention(0x000b, &req_payload).await?;
 
@@ -105,7 +185,7 @@ impl StyleWriterSession {
         match result {
             0 => ctrl.close().await?,
             0xFFFF => anyhow::bail!("Printer rejected the print request (0xFFFF)"),
-            _ => anyhow::bail!("Printer busy (result 0x{:04X}); retry later", result),
+            _ => return Err(anyhow::Error::new(PrinterBusy(result))),
         }
 
         let data = data_listener.accept().await?;
@@ -147,6 +227,57 @@ impl StyleWriterSession {
                 Err(_) => {} // no reply yet, retry
             }
         }
+    }
+
+    /// Identify the attached printer and its cartridge without starting a
+    /// page (no 'L' is sent, so no paper feeds). Mirrors lpstyl's
+    /// `printerSetup()` identify path: write `?`, read the CR-terminated
+    /// identity string, then for CS-family printers query submodel ('p') and
+    /// cartridge ('D' + 'H').
+    ///
+    /// Intended for a dedicated capability-probe session: connect, call
+    /// this, then `abort()` (whose 'I' reset is a no-op with no page loaded).
+    pub async fn query_info(&mut self) -> anyhow::Result<StyleWriterInfo> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+
+        self.drain_stale_input().await;
+        write_flush(&mut self.data, b"?").await?;
+        let mut identity = Vec::new();
+        loop {
+            let mut b = [0u8; 1];
+            match tokio::time::timeout(Duration::from_secs(5), self.data.read_exact(&mut b)).await {
+                Ok(Ok(_)) if b[0] == 0x0D => break,
+                Ok(Ok(_)) if identity.len() < 32 => identity.push(b[0]),
+                Ok(Ok(_)) => break,
+                Ok(Err(e)) => return Err(e.into()),
+                // lpstyl's identify reply is CR-terminated, but tolerate a
+                // printer that stops without the CR.
+                Err(_) if !identity.is_empty() => break,
+                Err(_) => anyhow::bail!("No reply to printer identify query '?'"),
+            }
+        }
+        let identity = String::from_utf8_lossy(&identity).trim().to_string();
+
+        let submodel = if identity == "CS" {
+            self.poll_status(b'p', deadline).await
+        } else {
+            None
+        };
+
+        // 'D' then 'H' is lpstyl's cartridge probe; non-CS printers have no
+        // color cartridge to report, so skip the query (and its 'D') there.
+        let color_cartridge = if identity == "CS" {
+            write_flush(&mut self.data, b"D").await?;
+            let h = self
+                .poll_status(b'H', deadline)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("No reply to cartridge query 'H'"))?;
+            h & 0x80 != 0
+        } else {
+            false
+        };
+
+        Ok(StyleWriterInfo { identity, submodel, color_cartridge })
     }
 
     /// Poll until status 'B' reports idle (lpstyl `waitStatus()`/`waitNonBusy()`),
@@ -193,12 +324,11 @@ impl StyleWriterSession {
 
         // lpstyl's AppleTalk waitNonBusy() follows the idle wait with two
         // ADSP attention 0x0006 "buffer ready" queries, each answered by two
-        // in-band bytes (0xFFFF in a real Mac driver capture); real Mac
-        // drivers send the same pairs before each band. A missing reply is
-        // non-fatal — and if a reply arrives late, drain_stale_input
-        // discards it before the next status poll, so this can no longer
-        // desync the query/reply pairing (the likely reason earlier attempts
-        // to send this query seemed to get no answer).
+        // in-band bytes (0xFFFF per a native Mac driver capture); the native
+        // driver sends the same pairs before each band. A missing reply is
+        // non-fatal, and a late reply is harmless too: drain_stale_input
+        // discards it before the next status poll, so it can't desync the
+        // query/reply pairing.
         for _ in 0..2 {
             self.data.send_attention(0x0006, &[0x00]).await?;
             let mut reply = [0u8; 2];
@@ -217,11 +347,11 @@ impl StyleWriterSession {
     /// 'H', quality string, 'L' (page start), then wait for paper feed to
     /// settle and the printer to report idle.
     ///
-    /// `color` selects the quality string: monochrome uses `"m2nZAB"`, color
-    /// uses `"m2sAH"` (from real driver captures) — the string must match
-    /// the raster tag ('R'/'c') or the printer's configured mode disagrees
-    /// with the data it's told to expect.
-    pub async fn setup(&mut self, color: bool) -> anyhow::Result<()> {
+    /// `color` and `quality` select the mode string: mono-normal `"m2nZAH"`,
+    /// mono-best `"m2sZAH"`, colour `"m2sAH"` (colour ignores quality). Its tag
+    /// must match the raster tag ('R' for mono, 'c' for colour) or the printer
+    /// misreconstructs every row. See [`PrintQuality`] for the grammar.
+    pub async fn setup(&mut self, color: bool, quality: PrintQuality) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
         write_flush(&mut self.data, b"D").await?;
@@ -241,8 +371,15 @@ impl StyleWriterSession {
             );
         }
 
-        let quality = if color { b"m2sAH".as_slice() } else { b"m2nZAB".as_slice() };
-        write_flush(&mut self.data, quality).await?;
+        // Only the mode string changes between normal and best; the raster is
+        // byte-identical (per a native Mac driver capture), the printer just
+        // runs more passes. See [`PrintQuality`] for the grammar.
+        let mode_string: &[u8] = match (color, quality) {
+            (true, _) => b"m2sAH",                       // colour (verified)
+            (false, PrintQuality::Best) => b"m2sZAH",    // mono best (derived, HW-unverified)
+            (false, PrintQuality::Normal) => b"m2nZAH",  // mono normal (verified)
+        };
+        write_flush(&mut self.data, mode_string).await?;
         write_flush(&mut self.data, b"L").await?;
 
         tokio::time::sleep(MECHANISM_SETTLE_DELAY).await;
@@ -258,8 +395,13 @@ impl StyleWriterSession {
     /// rows' worth of already-RLE-encoded plane(s) — claiming more rows than
     /// supplied leaves the printer waiting for the missing scanlines.
     ///
-    /// Waits for a fully-idle 'B' status before sending, since the previous
-    /// band must be completely drained first (see `SW2200_IDLE_MASK`).
+    /// Does a light paper/error check between bands (like the native driver)
+    /// but does NOT wait for full idle. Flow control is the ADSP receive
+    /// window: `flush()` blocks until the whole band has been accepted into the
+    /// printer's buffer, and the printer advertises a shrinking window (down to
+    /// 0) as its buffer fills, so we can never overflow it. The native driver
+    /// streams bands back-to-back the same way; with bands capped well under
+    /// the buffer ([`MAX_BATCH_BYTES`]) it always has several buffered ahead.
     pub async fn write_batch(
         &mut self,
         top: u16,
@@ -273,15 +415,41 @@ impl StyleWriterSession {
             encoded_planes.len(),
             MAX_BATCH_BYTES
         );
-        self.wait_ready()
+        self.check_paper()
             .await
-            .map_err(|e| e.context("waiting for printer to drain before raster block"))?;
+            .map_err(|e| e.context("checking printer status before raster block"))?;
         let rect = StyleWriterEncoder::encode_rect(top, 0, bottom, SW2200_PRINT_WIDTH as u16, color);
         let g_block = StyleWriterEncoder::wrap_raster_chunk(encoded_planes);
         self.data.write_all(&rect).await?;
         self.data.write_all(&g_block).await?;
         self.data.flush().await?;
         Ok(())
+    }
+
+    /// Light between-band status check matching the real driver, which polls
+    /// '1' and '2' once each and moves straight on — no wait for idle. '2' ==
+    /// 0x04 means out of paper: send the `S` retry and wait, as
+    /// [`Self::wait_ready`] does. Everything else proceeds immediately; the
+    /// ADSP window (not a status poll) paces delivery to the printer's drain
+    /// rate.
+    async fn check_paper(&mut self) -> anyhow::Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        loop {
+            let _c1 = self.poll_status(b'1', deadline).await;
+            match self.poll_status(b'2', deadline).await {
+                Some(0x04) => {
+                    tracing::warn!("Printer is out of paper; sending retry ('S') and waiting...");
+                    write_flush(&mut self.data, &[0xFF, 0xFF, 0xFF, b'S']).await?;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                Some(c2) if c2 != 0x00 && c2 != 0x80 => {
+                    tracing::warn!("Unexpected printer error status 2=0x{c2:02X}");
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            }
+        }
     }
 
     /// Finish the page: wait for the last raster batch to fully drain, form
@@ -340,6 +508,144 @@ impl StyleWriterSession {
     }
 }
 
+/// One rect+G raster band covering scanlines `top..=bottom`, ready for
+/// [`StyleWriterSession::write_batch`].
+#[derive(Debug, Clone)]
+pub struct RasterBatch {
+    pub top: u16,
+    pub bottom: u16,
+    /// Concatenated RLE-encoded plane data for every row in the band.
+    pub data: Vec<u8>,
+}
+
+/// Unpack one chunky (4bpp, nibble bits 8=C 4=M 2=Y 1=K) scanline into raw
+/// (pre-RLE) CMYK planar bytes.
+pub fn chunky_to_planes(chunky: &[u8], planar_input_len: usize) -> [Vec<u8>; 4] {
+    let mut planes = [
+        Vec::with_capacity(planar_input_len),
+        Vec::with_capacity(planar_input_len),
+        Vec::with_capacity(planar_input_len),
+        Vec::with_capacity(planar_input_len),
+    ];
+
+    for chunk_block in chunky.chunks(4) {
+        let mut c = 0u8;
+        let mut m = 0u8;
+        let mut y = 0u8;
+        let mut k = 0u8;
+        for i in 0..4 {
+            let b = chunk_block.get(i).copied().unwrap_or(0);
+            c = (c << 2) | ((b >> 6) & 2) | ((b >> 3) & 1);
+            m = (m << 2) | ((b >> 5) & 2) | ((b >> 2) & 1);
+            y = (y << 2) | ((b >> 4) & 2) | ((b >> 1) & 1);
+            k = (k << 2) | ((b >> 3) & 2) | (b & 1);
+        }
+        planes[0].push(c);
+        planes[1].push(m);
+        planes[2].push(y);
+        planes[3].push(k);
+    }
+    planes
+}
+
+/// Unpack one chunky scanline's K-nibble bit only into a raw (pre-RLE) plane.
+pub fn chunky_to_mono_plane(chunky: &[u8], planar_input_len: usize) -> Vec<u8> {
+    let mut plane = Vec::with_capacity(planar_input_len);
+    for chunk_block in chunky.chunks(4) {
+        let mut k = 0u8;
+        for i in 0..4 {
+            let b = chunk_block.get(i).copied().unwrap_or(0);
+            k = (k << 2) | ((b >> 3) & 2) | (b & 1);
+        }
+        plane.push(k);
+    }
+    plane
+}
+
+/// Encode one row's plane(s) into concatenated RLE bytes. `use_delta` XORs
+/// each plane against the previous row's raw plane first (lpstyl's
+/// `appendEncode()` differencing).
+///
+/// Delta is not optional: both colour ('c'/"m2sAH") and mono ('R'/"m2nZAH")
+/// mode reconstruct each row by XORing against the previous one, so a
+/// non-delta'd row prints as cumulative-XOR garbage.
+///
+/// `use_delta` must be false for the first row of every rect+G block, since
+/// the printer's differencing state resets per block. Does not mutate
+/// `last` — the caller updates it once per source row, so a row re-encoded
+/// after a batch flush still deltas correctly.
+fn encode_row(planes: &[Vec<u8>], last: &[Vec<u8>], use_delta: bool, mono: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, plane) in planes.iter().enumerate() {
+        let delta;
+        let src = if use_delta {
+            delta = plane.iter().zip(last[i].iter()).map(|(c, l)| c ^ l).collect::<Vec<u8>>();
+            &delta
+        } else {
+            plane
+        };
+        // Whether a blank row can collapse to a single 0x80 ("rest of the row
+        // is white") depends on the path, matching the native Mac driver:
+        //  - mono 'R': yes. The driver encodes almost all of its white rows
+        //    that way, so we do too.
+        //  - colour 'c': yes for C/M/Y, but not the K plane (index 3), which
+        //    the driver always spells out even when it's blank.
+        let allow_shortcut = mono || i != 3;
+        out.extend_from_slice(&StyleWriterEncoder::encode_scanline(src, SW2200_PRINT_ROWBYTES, allow_shortcut));
+    }
+    out
+}
+
+/// Encode a whole page of raw planar scanlines into rect+G bands.
+///
+/// `rows` holds one entry per scanline: 4 CMYK planes for color, 1 K plane
+/// for mono (all planes the same length, at most [`SW2200_PRINT_ROWBYTES`];
+/// shorter planes are padded to the printable width with white). Handles the
+/// XOR-delta chain (restarting it at each band boundary, where the printer's
+/// differencing state resets) and splits bands so each stays strictly below
+/// [`MAX_BATCH_BYTES`].
+pub fn encode_page_batches(rows: &[Vec<Vec<u8>>], mono: bool) -> Vec<RasterBatch> {
+    let mut batches = Vec::new();
+    let plane_len = rows.first().map(|planes| planes[0].len()).unwrap_or(0);
+    let num_planes = if mono { 1 } else { 4 };
+    let mut batch_start = 0usize;
+    let mut batch_data = Vec::new();
+    let mut last_planes = vec![vec![0u8; plane_len]; num_planes];
+    for (row_idx, planes) in rows.iter().enumerate() {
+        // The first row of every band is absolute; the rest delta against the
+        // previous row (the printer resets its differencing state per band).
+        let mut row_enc = encode_row(planes, &last_planes, !batch_data.is_empty(), mono);
+        // Flush before this row would cross *either* printer limit: the
+        // compressed G block must stay strictly below MAX_BATCH_BYTES, and
+        // the band must stay within MAX_BAND_ROWS scanlines (compressible
+        // mono pages hit the row cap long before the byte cap).
+        let rows_in_band = row_idx - batch_start;
+        let over_compressed = batch_data.len() + row_enc.len() >= MAX_BATCH_BYTES;
+        let over_rows = rows_in_band + 1 > MAX_BAND_ROWS;
+        if !batch_data.is_empty() && (over_compressed || over_rows) {
+            batches.push(RasterBatch {
+                top: batch_start as u16,
+                bottom: (row_idx - 1) as u16,
+                data: std::mem::take(&mut batch_data),
+            });
+            batch_start = row_idx;
+            // This row now starts a new band, so re-encode it absolute.
+            row_enc = encode_row(planes, &last_planes, false, mono);
+        }
+        batch_data.extend_from_slice(&row_enc);
+        last_planes = planes.clone();
+        if row_idx + 1 == rows.len() {
+            batches.push(RasterBatch {
+                top: batch_start as u16,
+                bottom: row_idx as u16,
+                data: batch_data,
+            });
+            break;
+        }
+    }
+    batches
+}
+
 pub struct StyleWriterEncoder;
 
 // StyleWriter Encoding Protocol Constants
@@ -352,7 +658,11 @@ pub const MASK_RUNWHT: u8 = 0x80;
 pub const MASK_RUNBLK: u8 = 0xC0;
 
 impl StyleWriterEncoder {
-    /// Create the bounding box header (`R` for monochrome, `c` for color)
+    /// Create the bounding-box header (`R` for monochrome, `c` for color)
+    /// that precedes each `G` raster block: tag byte, then little-endian
+    /// left, top, right, bottom. Both `'R'` and `'c'` rects are 9 bytes, with
+    /// the `G` block immediately after (verified against real Mac driver
+    /// captures).
     pub fn encode_rect(top: u16, left: u16, bottom: u16, right: u16, is_color: bool) -> Vec<u8> {
         let mut buf = Vec::with_capacity(9);
         if is_color {
@@ -495,7 +805,9 @@ mod tests {
 
     #[test]
     fn test_encode_rect() {
-        // R (0x52) or c (0x63), then little-endian left, top, right, bottom
+        // R (0x52) or c (0x63), then little-endian left, top, right, bottom.
+        // Both tags produce a 9-byte rect (verified against real Mac driver
+        // captures).
         let bw = StyleWriterEncoder::encode_rect(10, 20, 30, 40, false);
         assert_eq!(bw, vec![b'R', 20, 0, 10, 0, 40, 0, 30, 0]);
 
@@ -536,6 +848,64 @@ mod tests {
         assert_eq!(encoded[0], 3); // 3 bytes of raw data
         assert_eq!(&encoded[1..4], &[0x11, 0x22, 0x33]);
         assert_eq!(encoded[4], MASK_RUNWHT + 2); // 2 bytes of white
+    }
+
+    #[test]
+    fn test_encode_page_batches_bands() {
+        // Rows of incompressible data force multiple bands; every band must
+        // stay strictly below MAX_BATCH_BYTES and the bands must tile the
+        // page contiguously.
+        let plane_len = SW2200_PRINT_ROWBYTES;
+        let rows: Vec<Vec<Vec<u8>>> = (0..400)
+            .map(|r| {
+                (0..4)
+                    .map(|p| (0..plane_len).map(|i| ((r * 31 + p * 7 + i * 13) % 251) as u8 + 1).collect())
+                    .collect()
+            })
+            .collect();
+        let batches = encode_page_batches(&rows, false);
+        assert!(batches.len() > 1, "expected multiple bands, got {}", batches.len());
+        assert_eq!(batches[0].top, 0);
+        assert_eq!(batches.last().unwrap().bottom as usize, rows.len() - 1);
+        for pair in batches.windows(2) {
+            assert_eq!(pair[1].top, pair[0].bottom + 1, "bands must be contiguous");
+        }
+        for b in &batches {
+            assert!(b.data.len() < MAX_BATCH_BYTES);
+            assert!(b.top <= b.bottom);
+        }
+    }
+
+    #[test]
+    fn test_encode_page_batches_row_cap() {
+        // A tall, highly-compressible mono page (all white) compresses to a
+        // few bytes per row, so the 32 KB *compressed* cap alone would let one
+        // band span hundreds of rows — taller than the printer's paper feed
+        // tracks, which shears the page (the vertical-streak bug). Every band
+        // must stay within MAX_BAND_ROWS scanlines.
+        let rows: Vec<Vec<Vec<u8>>> =
+            (0..MAX_BAND_ROWS * 3 + 17).map(|_| vec![vec![0u8; SW2200_PRINT_ROWBYTES]]).collect();
+        let batches = encode_page_batches(&rows, true);
+        assert!(batches.len() >= 4, "row cap must split the page into several bands");
+        for b in &batches {
+            let band_rows = (b.bottom - b.top + 1) as usize;
+            assert!(band_rows <= MAX_BAND_ROWS, "band of {band_rows} rows exceeds MAX_BAND_ROWS");
+        }
+        // Bands must still tile the page contiguously with no gaps.
+        assert_eq!(batches[0].top, 0);
+        assert_eq!(batches.last().unwrap().bottom as usize, rows.len() - 1);
+        for pair in batches.windows(2) {
+            assert_eq!(pair[1].top, pair[0].bottom + 1, "bands must be contiguous");
+        }
+    }
+
+    #[test]
+    fn test_encode_page_batches_mono_single_band() {
+        // A small all-white mono page fits in a single band.
+        let rows: Vec<Vec<Vec<u8>>> = (0..10).map(|_| vec![vec![0u8; 100]]).collect();
+        let batches = encode_page_batches(&rows, true);
+        assert_eq!(batches.len(), 1);
+        assert_eq!((batches[0].top, batches[0].bottom), (0, 9));
     }
 
     #[test]

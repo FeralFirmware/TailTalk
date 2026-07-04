@@ -24,6 +24,16 @@ pub struct AdspAddress {
     pub socket_number: u8,
 }
 
+impl From<tailtalk_packets::nbp::ServiceAddress> for AdspAddress {
+    fn from(a: tailtalk_packets::nbp::ServiceAddress) -> Self {
+        AdspAddress {
+            network_number: a.network_number,
+            node_number: a.node_number,
+            socket_number: a.socket_number,
+        }
+    }
+}
+
 fn ddp_dest(addr: AdspAddress) -> DdpAddress {
     DdpAddress::new(
         tailtalk_packets::aarp::AppleTalkAddress {

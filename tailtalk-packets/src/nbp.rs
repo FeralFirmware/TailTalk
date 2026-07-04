@@ -55,6 +55,27 @@ pub struct NbpTuple {
     pub entity_name: EntityName, // The entity name (object, type, zone)
 }
 
+/// The AppleTalk address (network, node, socket) an NBP-registered service
+/// lives at. The transport layered on top can be ATP, ADSP, PAP, etc., so
+/// this is deliberately transport-agnostic rather than an `AtpAddress`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ServiceAddress {
+    pub network_number: u16,
+    pub node_number: u8,
+    pub socket_number: u8,
+}
+
+impl NbpTuple {
+    /// The address this tuple points at.
+    pub fn service_address(&self) -> ServiceAddress {
+        ServiceAddress {
+            network_number: self.network_number,
+            node_number: self.node_id,
+            socket_number: self.socket_number,
+        }
+    }
+}
+
 /// Represents an entity name in NBP.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct EntityName {
