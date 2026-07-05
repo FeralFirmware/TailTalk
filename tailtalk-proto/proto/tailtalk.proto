@@ -85,6 +85,16 @@ message SetAddressRequest {
   AppleTalkAddress address = 2;
 }
 
+// Enable reception of an Ethernet multicast address on an interface, e.g.
+// the hardware multicast group a zone's NBP lookups are sent to. Only
+// meaningful on EtherTalk; LocalTalk has no hardware multicast, so calling
+// this on a LocalTalk interface fails with INVALID_ARGUMENT. Clients should
+// not issue it for LocalTalk interfaces.
+message AddMulticastRequest {
+  string interface = 1;
+  bytes address = 2; // 6-byte Ethernet multicast MAC (group bit set)
+}
+
 // ── DDP sockets ───────────────────────────────────────────────────────────────
 
 message OpenSocketRequest {
@@ -112,6 +122,10 @@ message SendDatagram {
   AppleTalkAddress dest = 2;
   uint32 dest_socket = 3; // destination DDP socket number
   bytes payload = 4;      // max 586 bytes
+  // DDP protocol type stamped on this datagram. 0 means use the ddp_type
+  // the socket was opened with. Clients whose socket API carries the DDP
+  // type per datagram (e.g. Netatalk's netddp) set this on every send.
+  uint32 ddp_type = 5;
 }
 
 // Daemon → client datagram, delivered for any open socket.
@@ -195,6 +209,7 @@ message Request {
     RemoveZoneRequest remove_zone = 11;
     SetLocalRangeRequest set_local_range = 12;
     PingRequest ping = 13;
+    AddMulticastRequest add_multicast = 14;
   }
 }
 

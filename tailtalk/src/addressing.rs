@@ -436,8 +436,12 @@ impl AddressingHandle {
             });
         }
 
-        // Network 0 unicast: LocalTalk — node number is the link-layer address directly.
-        if addr.network_number == 0 {
+        // Network 0 unicast: on a LocalTalk handle, the node number is the
+        // link-layer address directly. Nonextended EtherTalk (Phase 1) nodes
+        // also address themselves on network 0, so an EtherTalk handle can't
+        // take this shortcut — it must fall through to the learned-address
+        // cache below like any other lookup.
+        if addr.network_number == 0 && self.phase == AddressSource::LocalTalk {
             return Some(Node::LocalTalk(addr.node_number));
         }
 

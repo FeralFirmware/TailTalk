@@ -46,6 +46,10 @@ pub struct InterfaceEntry {
     pub name: String,
     pub kind: proto::InterfaceType,
     pub addressing: AddressingHandle,
+    /// Ethernet multicast groups enabled on this interface (EtherTalk only).
+    /// The EtherTalk transport captures promiscuously, so reception already
+    /// works; this records the membership requested by clients.
+    pub multicast: std::sync::Mutex<std::collections::HashSet<[u8; 6]>>,
 }
 
 pub struct DaemonState {
@@ -103,6 +107,7 @@ impl Daemon {
                 name,
                 kind: proto::InterfaceType::Ethertalk,
                 addressing,
+                multicast: std::sync::Mutex::new(std::collections::HashSet::new()),
             });
         }
         if let (Some(name), Some(addressing)) =
@@ -112,6 +117,7 @@ impl Daemon {
                 name,
                 kind: proto::InterfaceType::Localtalk,
                 addressing,
+                multicast: std::sync::Mutex::new(std::collections::HashSet::new()),
             });
         }
 
@@ -259,6 +265,7 @@ impl Session {
         match kind {
             Kind::ListInterfaces(_) => self.list_interfaces(id).await,
             Kind::SetAddress(r) => self.set_address(id, r).await,
+            Kind::AddMulticast(r) => self.add_multicast(id, r),
             Kind::OpenSocket(r) => self.open_socket(id, r).await,
             Kind::CloseSocket(r) => {
                 match u8::try_from(r.socket_id).ok().and_then(|s| self.sockets.remove(&s)) {
@@ -360,6 +367,39 @@ impl Session {
             Ok(()) => proto::Reply::ok(id),
             Err(e) => proto::Reply::error(id, proto::ErrorCode::Internal, e.to_string()),
         }
+    }
+
+    fn add_multicast(&self, id: u64, r: proto::AddMulticastRequest) -> proto::Reply {
+        let Some(iface) = self.state.interfaces.iter().find(|i| i.name == r.interface) else {
+            return proto::Reply::error(
+                id,
+                proto::ErrorCode::NotFound,
+                format!("no interface named '{}'", r.interface),
+            );
+        };
+        // Multicast is an EtherTalk-only concept; LocalTalk has no hardware
+        // multicast, so reject it rather than silently accept.
+        if iface.kind != proto::InterfaceType::Ethertalk {
+            return invalid(id, "multicast is only supported on EtherTalk interfaces");
+        }
+        let Ok(mac) = <[u8; 6]>::try_from(r.address.as_slice()) else {
+            return invalid(id, "multicast address must be 6 bytes");
+        };
+        if mac[0] & 0x01 == 0 {
+            return invalid(id, "not a multicast address (group bit clear)");
+        }
+        // The EtherTalk capture is promiscuous, so frames for this group are
+        // already delivered; record the membership for correctness.
+        let mut groups = iface.multicast.lock().unwrap();
+        if groups.insert(mac) {
+            tracing::info!(
+                "interface {}: enabled multicast {:02x?} ({} group(s))",
+                iface.name,
+                mac,
+                groups.len()
+            );
+        }
+        proto::Reply::ok(id)
     }
 
     async fn open_socket(&mut self, id: u64, r: proto::OpenSocketRequest) -> proto::Reply {
@@ -588,7 +628,18 @@ async fn socket_pump_outbound(
             },
             send.dest_socket as u8,
         );
-        if let Err(e) = sender.send_to(&send.payload, addr).await {
+        let protocol = match u8::try_from(send.ddp_type) {
+            Ok(0) => None,
+            Ok(t) => Some(DdpProtocolType::from(t)),
+            Err(_) => {
+                tracing::warn!(
+                    "socket {socket_id}: dropping datagram with bad ddp_type {}",
+                    send.ddp_type
+                );
+                continue;
+            }
+        };
+        if let Err(e) = sender.send_to_typed(&send.payload, addr, protocol).await {
             tracing::warn!("socket {socket_id}: send failed: {e}");
         }
     }

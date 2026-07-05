@@ -191,6 +191,7 @@ impl RemoteClient {
                 )),
                 dest_socket: dest_socket as u32,
                 payload: payload.to_vec(),
+                ddp_type: 0, // use the type the socket was opened with
             })),
         };
         self.req_tx

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::io;
 use std::time::Duration;
 use tailtalk_packets::{
+    aarp::AppleTalkAddress,
     ddp::{DdpPacket, DdpProtocolType},
     nbp::{EntityName, NbpOperation, NbpPacket, NbpTuple},
 };
@@ -235,7 +236,7 @@ impl Nbp {
 
         match packet.operation {
             NbpOperation::Lookup => {
-                let response = self.generate_response(&packet, ddp.src_network_num).await;
+                let response = self.generate_response(&packet, ddp.src_network_num, ddp.src_node_id).await;
 
                 // Only send a reply if we have at least one matching tuple
                 if !response.tuples.is_empty() {
@@ -284,13 +285,26 @@ impl Nbp {
         }
     }
 
-    async fn generate_response(&self, nbp: &NbpPacket, source_network: u16) -> NbpPacket {
+    async fn generate_response(&self, nbp: &NbpPacket, source_network: u16, source_node: u8) -> NbpPacket {
         // Respond with the address on the same interface the lookup arrived from.
         let our_addr = if source_network == 0 {
-            if let Some(lt) = &self.lt_addressing {
-                lt.addr().await.expect("failed to get LT addr")
-            } else {
-                self.et_addressing.as_ref().expect("no addressing").addr().await.expect("failed to get ET addr")
+            // Network 0 is ambiguous between LocalTalk and nonextended
+            // EtherTalk (Phase 1). With only one interface configured, it
+            // must be that one. With both, check whether the requester has
+            // been learned as an EtherTalk Phase 1 peer before assuming
+            // LocalTalk.
+            match (&self.lt_addressing, &self.et_addressing) {
+                (Some(lt), None) => lt.addr().await.expect("failed to get LT addr"),
+                (None, Some(et)) => et.addr().await.expect("failed to get ET addr"),
+                (Some(lt), Some(et)) => {
+                    let peer = AppleTalkAddress { network_number: 0, node_number: source_node };
+                    if et.try_lookup(&peer).is_some() {
+                        et.addr().await.expect("failed to get ET addr")
+                    } else {
+                        lt.addr().await.expect("failed to get LT addr")
+                    }
+                }
+                (None, None) => panic!("no addressing configured"),
             }
         } else if let Some(et) = &self.et_addressing {
             et.addr().await.expect("failed to get ET addr")

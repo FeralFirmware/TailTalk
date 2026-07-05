@@ -94,6 +94,21 @@ async fn control_plane_over_unix_socket() {
         panic!("expected error reply");
     };
     assert_eq!(err.code, proto::ErrorCode::NotFound as i32);
+
+    // Enabling multicast on a nonexistent interface reports NotFound.
+    let kind = request(
+        &mut stream,
+        4,
+        proto::request::Kind::AddMulticast(proto::AddMulticastRequest {
+            interface: "en99".into(),
+            address: vec![0x09, 0x00, 0x07, 0xff, 0xff, 0xff],
+        }),
+    )
+    .await;
+    let proto::reply::Kind::Error(err) = kind else {
+        panic!("expected error reply");
+    };
+    assert_eq!(err.code, proto::ErrorCode::NotFound as i32);
 }
 
 #[tokio::test]
@@ -151,6 +166,7 @@ async fn ddp_socket_lifecycle() {
                 dest: Some(proto::AppleTalkAddress::new(0, 255)),
                 dest_socket: 2,
                 payload: vec![1, 2, 3],
+                ddp_type: 0,
             }),
         )
         .await,

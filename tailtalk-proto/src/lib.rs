@@ -177,6 +177,7 @@ mod tests {
                 dest: Some(AppleTalkAddress::new(1, 7)),
                 dest_socket: 2,
                 payload: vec![0xAA; 100],
+                ddp_type: 0,
             })),
         }
     }
