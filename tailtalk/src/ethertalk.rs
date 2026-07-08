@@ -1,9 +1,14 @@
 use futures::StreamExt;
-use mac_address::mac_address_by_name;
 use tailtalk_packets::aarp;
 use tailtalk_packets::ddp::DdpPacket;
 use tailtalk_packets::ethertalk::{EtherTalkPhase2Frame, EtherTalkPhase2Type};
 use tailtalk_packets::llap::{LlapPacket, LlapType};
+
+#[cfg(not(target_os = "windows"))]
+use mac_address::mac_address_by_name;
+
+#[cfg(target_os = "windows")]
+use get_adapters_addresses::{AdaptersAddresses, Family, Flags};
 
 use crate::{addressing, ddp, CancellationToken};
 
@@ -54,28 +59,88 @@ pub struct EtherTalkTx {
 
 impl EtherTalkTransport {
     pub fn open(intf: &str) -> anyhow::Result<Self> {
-        let mac = mac_address_by_name(intf)?
-            .ok_or_else(|| anyhow::anyhow!("no MAC address found for interface {}", intf))?;
-        let our_mac = mac.bytes();
+        let mac: String;
+        let device_description: Option<String>;
+        let our_mac: [u8; 6];
+
+        #[cfg(target_os = "windows")]
+        {
+            let intf_str = std::ffi::OsStr::new(intf);
+            let adapter_addresses = AdaptersAddresses::try_new(Family::Unspec, *Flags::default().include_all_interfaces())?;
+            let adt = adapter_addresses.iter().find( |a| a.friendly_name() == intf_str ).ok_or_else(|| anyhow::anyhow!("Failed to get interfaces '{}'", intf))?;
+
+            //let intf_friendly_name = adt.friendly_name().to_str();
+            device_description = match  adt.description().into_string() {
+                Ok(s) => Some(s),
+                Err(e) => panic!("Cannot get description of adapater {e:?}")
+            };
+            // Convert representation so that PCAP filter works
+            mac = adt.physical_address().unwrap().to_string().replace("-",":");
+            // Grab MAC Address for future use
+            let t = adt.physical_address().expect("MAC Address missing").as_u64().to_le_bytes();
+            our_mac = t[0..6].try_into().unwrap();
+
+
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Retrieve the interface MAC address linux/mac
+            let t = mac_address_by_name(intf)?
+                .ok_or_else(|| anyhow::anyhow!("no MAC address found for interface {}", intf))?;
+            our_mac = t.bytes();
+            mac = t.to_string();
+        }
+
 
         let filter = format!(
             "(ether proto 0x809B or ether proto 0x80F3 or (ether[12:2] <= 1500)) and not ether src {mac}"
         );
         tracing::info!("filter string: {filter}");
 
-        let mut rx = pcap::Capture::from_device(intf)?
-            .promisc(true)
-            .immediate_mode(true)
-            .open()?;
-        rx.filter(&filter, true)?;
+        #[cfg(target_os = "windows")]
+        {
 
-        let tx = pcap::Capture::from_device(intf)?
-            .promisc(true)
-            .open()?;
+                let devices = pcap::Device::list()?;
+                let device = devices.into_iter().find(|dev| dev.desc == device_description ) ;
 
-        tracing::info!("EtherTalk pcap captures opened on {}", intf);
+                tracing::info!("device {:?}", device );
 
-        Ok(Self { pcap_rx: Some(rx), pcap_tx: Some(tx), our_mac })
+                let d1 = device.clone().unwrap();
+                let d2 = device.unwrap();
+
+                // RX capture – promiscuous mode, filter applied.
+                let mut rx = pcap::Capture::from_device( d1 ) ?
+                    .promisc(true)
+                    .immediate_mode(true)
+                    .open()?;
+                rx.filter(&filter, true)?;
+
+                // TX capture – separate handle used solely for packet injection.
+                let tx = pcap::Capture::from_device( d2 )?
+                    .promisc(true)
+                    .open()?;
+                tracing::info!("EtherTalk pcap captures opened on {}", intf);
+                Ok(Self { pcap_rx: Some(rx), pcap_tx: Some(tx), our_mac })
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let mut rx = pcap::Capture::from_device(intf)?
+                    .promisc(true)
+                    .immediate_mode(true)
+                    .open()?;
+                rx.filter(&filter, true)?;
+
+                let tx = pcap::Capture::from_device(intf)?
+                    .promisc(true)
+                    .open()?;
+
+                tracing::info!("EtherTalk pcap captures opened on {}", intf);
+                Ok(Self { pcap_rx: Some(rx), pcap_tx: Some(tx), our_mac })
+            }
+
+        
+
+        
     }
 
     /// Returns `None` if pcap stream setup fails; the caller should abort the run loop.

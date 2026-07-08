@@ -19,6 +19,7 @@ bytes = { workspace = true } #unified
 dashmap = "6.1.0"
 encoding_rs = { workspace = true } #unified
 futures = { workspace = true } #unified
+get_adapters_addresses = "0.1.1"
 im = "15.1.0"
 mac_address = { version = "1.1", optional = true }
 magic-db = "0.5"
