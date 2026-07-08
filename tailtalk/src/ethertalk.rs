@@ -60,7 +60,7 @@ pub struct EtherTalkTx {
 impl EtherTalkTransport {
     pub fn open(intf: &str) -> anyhow::Result<Self> {
         let mac: String;
-        let device_description: Option<String>;
+        let _device_description: Option<String>;
         let our_mac: [u8; 6];
 
         #[cfg(target_os = "windows")]
@@ -70,7 +70,7 @@ impl EtherTalkTransport {
             let adt = adapter_addresses.iter().find( |a| a.friendly_name() == intf_str ).ok_or_else(|| anyhow::anyhow!("Failed to get interfaces '{}'", intf))?;
 
             //let intf_friendly_name = adt.friendly_name().to_str();
-            device_description = match  adt.description().into_string() {
+            _device_description = match  adt.description().into_string() {
                 Ok(s) => Some(s),
                 Err(e) => panic!("Cannot get description of adapater {e:?}")
             };
@@ -101,7 +101,7 @@ impl EtherTalkTransport {
         {
 
                 let devices = pcap::Device::list()?;
-                let device = devices.into_iter().find(|dev| dev.desc == device_description ) ;
+                let device = devices.into_iter().find(|dev| dev.desc == _device_description ) ;
 
                 tracing::info!("device {:?}", device );
 
