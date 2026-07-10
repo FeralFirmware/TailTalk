@@ -409,7 +409,7 @@ impl PacketProcessor {
                             }
                             res = tashtalk_instance.receive_frame() => {
                                 match res {
-                                    Ok(Some(data)) => {
+                                    Ok(Some(tashtalk::TashTalkEvent::Frame(data))) => {
                                         if let Some(ref tx) = pcap_rx_sender {
                                             let _ = tx.try_send((SystemTime::now(), data.clone()));
                                         }
@@ -461,6 +461,10 @@ impl PacketProcessor {
                                                 _ => {}
                                             }
                                         }
+                                    }
+                                    Ok(Some(tashtalk::TashTalkEvent::Error(e))) => {
+                                        // Bad frame already discarded; keep going.
+                                        tracing::debug!("TashTalk: discarded bad frame: {}", e);
                                     }
                                     Ok(None) => break,
                                     Err(e) => {
@@ -527,12 +531,8 @@ impl PacketProcessor {
                             output_buf[header_len..header_len + payload_len]
                                 .copy_from_slice(&pkt.payload);
 
-                            let frame_end = header_len + payload_len;
-                            let crc = tashtalk::lt_crc(&output_buf[..frame_end]);
-                            output_buf[frame_end] = crc[0];
-                            output_buf[frame_end + 1] = crc[1];
-
-                            frame_end + 2
+                            // CRC is appended in send_frame.
+                            header_len + payload_len
                         }
                         #[cfg(not(feature = "ethertalk"))]
                         _ => 0,
@@ -554,10 +554,8 @@ impl PacketProcessor {
                             let header_len = llap_pkt
                                 .to_bytes(&mut output_buf)
                                 .expect("failed to frame LLAP control");
-                            let crc = tashtalk::lt_crc(&output_buf[..header_len]);
-                            output_buf[header_len] = crc[0];
-                            output_buf[header_len + 1] = crc[1];
-                            header_len + 2
+                            // CRC is appended in send_frame.
+                            header_len
                         }
                         _ => 0,
                     }
@@ -594,10 +592,9 @@ impl PacketProcessor {
                             tracing::error!("Failed to send to Tashtalk tx: {}", e);
                         }
                     }
-                    // Capture outbound frame without the trailing 2 CRC bytes.
+                    // Outbound frame has no CRC bytes, so capture it as-is.
                     if let Some(ref tx) = pcap_tx_sender {
-                        let frame_len = final_size.saturating_sub(2);
-                        let _ = tx.try_send((SystemTime::now(), output_buf[..frame_len].to_vec()));
+                        let _ = tx.try_send((SystemTime::now(), output_buf[..final_size].to_vec()));
                     }
                 }
                 #[cfg(not(feature = "ethertalk"))]

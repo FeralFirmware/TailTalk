@@ -3,7 +3,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::Framed;
 
 pub mod codec;
-pub use codec::{TashTalkCodec, TashTalkCommand, TashTalkError};
+pub use codec::{FrameError, TashTalkCodec, TashTalkCommand, TashTalkError, TashTalkEvent};
 
 pub mod crc;
 pub use crc::{lt_crc, CrcCalculator};
@@ -75,12 +75,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> TashTalk<T> {
     }
 
     /// Transmit a frame.
-    /// `frame` must include the LLAP header and the 2 CRC bytes at the end.
-    /// Note: if SetFeatures bit 7 (CRC Calculation) is enabled on TashTalk,
-    /// it will overwrite the 2 CRC bytes with the correct values.
+    /// `frame` is the LLAP header and payload without CRC bytes; the CRC is
+    /// computed in software and appended here. (If SetFeatures bit 7 is also
+    /// enabled, TashTalk recomputes the same value — harmless.)
     pub async fn send_frame(&mut self, frame: &[u8]) -> Result<(), std::io::Error> {
         self.framed
-            .send(TashTalkCommand::TransmitFrame(frame.to_vec()))
+            .send(TashTalkCommand::TransmitFrame(codec::frame_with_crc(frame)))
             .await
     }
 
@@ -107,8 +107,9 @@ impl<T: AsyncRead + AsyncWrite + Unpin> TashTalk<T> {
             .await
     }
 
-    /// Wait for and receive the next frame from the LocalTalk bus.
-    pub async fn receive_frame(&mut self) -> Result<Option<Vec<u8>>, TashTalkError> {
+    /// Wait for and receive the next event from the LocalTalk bus.
+    /// `Ok(None)` means end of stream; `Err` is reserved for fatal I/O errors.
+    pub async fn receive_frame(&mut self) -> Result<Option<TashTalkEvent>, TashTalkError> {
         self.framed.next().await.transpose()
     }
 }
