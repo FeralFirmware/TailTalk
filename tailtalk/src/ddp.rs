@@ -263,12 +263,13 @@ impl DdpProcessor {
             n
         } else {
             let mut rng = rand::rng();
-            let mut candidate = rng.random_range(64u8..=255);
+            // 255 is the reserved broadcast socket, never dynamically assignable.
+            let mut candidate = rng.random_range(64u8..=254);
             for _ in 0..192u16 {
                 if !self.sockets.contains_key(&candidate) {
                     break;
                 }
-                candidate = rng.random_range(64..=255);
+                candidate = rng.random_range(64..=254);
             }
             if self.sockets.contains_key(&candidate) {
                 return Err(io::Error::from(io::ErrorKind::AddrInUse));

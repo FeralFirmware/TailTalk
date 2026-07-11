@@ -134,17 +134,6 @@ impl Nbp {
                                     z   => self.route_table.nbp_dispatch(NbpZone::Named(z)),
                                 };
 
-                                let dest_addr = match dispatch {
-                                    NbpDispatch::RouterBroadcast(_routers) => {
-                                        // TODO: send BrRq to each router once implemented.
-                                        // For now fall back to network-wide broadcast.
-                                        tailtalk_packets::aarp::AppleTalkAddress { network_number: 0, node_number: 255 }
-                                    }
-                                    NbpDispatch::LocalBroadcast | NbpDispatch::ZoneUnknown => {
-                                        tailtalk_packets::aarp::AppleTalkAddress { network_number: 0, node_number: 255 }
-                                    }
-                                };
-
                                 let tuple = NbpTuple {
                                     network_number: primary_addr.network_number,
                                     node_id: primary_addr.node_number,
@@ -153,19 +142,55 @@ impl Nbp {
                                     entity_name: lookup.request,
                                 };
 
-                                let packet = NbpPacket {
-                                    operation: NbpOperation::Lookup,
-                                    transaction_id: tid,
-                                    tuples: vec![tuple],
+                                let mut buf = [0u8; 1024];
+                                let send_result = match dispatch {
+                                    NbpDispatch::RouterBroadcast(routers) => {
+                                        // A router is known (via RTMP): send BrRq directly
+                                        // to it rather than broadcasting locally.
+                                        let packet = NbpPacket {
+                                            operation: NbpOperation::BroadcastRequest,
+                                            transaction_id: tid,
+                                            tuples: vec![tuple],
+                                        };
+                                        let size = packet.to_bytes(&mut buf).expect("failed to serialize");
+
+                                        let mut any_ok = false;
+                                        let mut last_err = None;
+                                        for router in routers {
+                                            let dest = crate::ddp::DdpAddress::new(router, 2);
+                                            match self.sock.send_to(&buf[..size], dest).await {
+                                                Ok(()) => any_ok = true,
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        "NBP BrRq: failed to send to {}.{}: {e}",
+                                                        router.network_number, router.node_number,
+                                                    );
+                                                    last_err = Some(e);
+                                                }
+                                            }
+                                        }
+                                        if any_ok {
+                                            Ok(())
+                                        } else {
+                                            Err(last_err.unwrap_or_else(|| io::Error::other("no routers to send BrRq to")))
+                                        }
+                                    }
+                                    NbpDispatch::LocalBroadcast | NbpDispatch::ZoneUnknown => {
+                                        let packet = NbpPacket {
+                                            operation: NbpOperation::Lookup,
+                                            transaction_id: tid,
+                                            tuples: vec![tuple],
+                                        };
+                                        let size = packet.to_bytes(&mut buf).expect("failed to serialize");
+
+                                        let dest_addr = tailtalk_packets::aarp::AppleTalkAddress { network_number: 0, node_number: 255 };
+                                        let dest = crate::ddp::DdpAddress::new(dest_addr, 2);
+                                        self.sock.send_to(&buf[..size], dest).await
+                                    }
                                 };
 
-                                let mut buf = [0u8; 1024];
-                                let size = packet.to_bytes(&mut buf).expect("failed to serialize");
-
-                                let dest = crate::ddp::DdpAddress::new(dest_addr, 2);
-
-                                if let Err(e) = self.sock.send_to(&buf[..size], dest).await {
-                                    tracing::error!("NBP LkUp: failed to send: {e}");
+                                if let Err(e) = send_result {
+                                    tracing::error!("NBP lookup: failed to send: {e}");
                                     let _ = lookup.chan.send(Err(io::Error::other(
                                         "failed to send NBP lookup",
                                     )));
@@ -267,6 +292,15 @@ impl Nbp {
 
                 // Only send a reply if we have at least one matching tuple
                 if !response.tuples.is_empty() {
+                    // Reply to the tuple's address, not the DDP source: a
+                    // router forwarding a BrRq as a broadcast Lookup sets the
+                    // DDP source to itself, but the tuple names the original
+                    // requester.
+                    let Some(req_tuple) = packet.tuples.first() else {
+                        tracing::warn!("NBP Lookup with no request tuple; dropping");
+                        return;
+                    };
+
                     let mut buf = [0u8; 1024];
                     let size = response
                         .to_bytes(&mut buf)
@@ -274,10 +308,10 @@ impl Nbp {
 
                     let dest = crate::ddp::DdpAddress::new(
                         tailtalk_packets::aarp::AppleTalkAddress {
-                            network_number: ddp.src_network_num,
-                            node_number: ddp.src_node_id,
+                            network_number: req_tuple.network_number,
+                            node_number: req_tuple.node_id,
                         },
-                        ddp.src_sock_num,
+                        req_tuple.socket_number,
                     );
 
                     if let Err(e) = self.sock.send_to(&buf[..size], dest).await {
@@ -286,8 +320,8 @@ impl Nbp {
                         tracing::debug!(
                             "Sent NBP LookupReply with {} tuples to {}.{}",
                             response.tuples.len(),
-                            ddp.src_network_num,
-                            ddp.src_node_id
+                            req_tuple.network_number,
+                            req_tuple.node_id
                         );
                     }
                 } else {

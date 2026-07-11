@@ -26,6 +26,7 @@ pub mod nbp;
 pub mod pap;
 pub mod remote;
 pub mod route_table;
+pub mod rtmp;
 pub mod stylewriter;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -984,8 +985,9 @@ impl TalkStackBuilder {
             None
         };
 
-        let route_table = route_table::RouteTable::new(route_table::LearningMode::Static);
+        let route_table = route_table::RouteTable::new(route_table::LearningMode::Dynamic);
         let ddp = ddp::DdpProcessor::spawn(et_addressing.clone(), lt_addressing.clone(), outbound, route_table.clone());
+        rtmp::Rtmp::spawn(&ddp, route_table.clone()).await;
 
         let transport_token = CancellationToken::new();
         tokio::spawn(processor.run(et_addressing.clone(), lt_addressing.clone(), ddp.clone(), transport_token.clone()));

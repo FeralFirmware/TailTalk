@@ -1,5 +1,8 @@
 use thiserror::Error;
 
+/// Well-known DDP socket for both RTMP Data and RTMP Request packets.
+pub const RTMP_SOCKET: u8 = 1;
+
 #[derive(Error, Debug)]
 pub enum RtmpError {
     #[error("packet too short: expected at least {expected} bytes but found {found}")]
@@ -206,6 +209,40 @@ mod tests {
             packet.tuples[2],
             RtmpTuple::NonExtended {
                 network: 1,
+                distance: 0
+            }
+        );
+    }
+
+    /// Verifies decoding of a real RTMP Data packet. Node 128 is broadcasting on
+    /// non-extended LocalTalk net 0, advertising a single route to its own net
+    /// (net 0, distance 0).
+    #[test]
+    fn test_parse_rtmp_data_netatalk_broadcast() {
+        // RTMP payload (LLAP + DDP short header stripped).
+        //
+        // Full on-wire bytes (frame 42, 18 bytes total):
+        //   LLAP:  ff 80 01
+        //   DDP:   00 0f 01 01 01
+        //   RTMP:  00 00 08 80  00 00 82  00 00 00
+        let rtmp_payload: &[u8] = &[
+            0x00, 0x00, // Router network: 0
+            0x08, // ID length: 8 bits
+            0x80, // Node ID: 128
+            0x00, 0x00, 0x82, // Non-extended version indicator ($000082)
+            0x00, 0x00, 0x00, // Tuple 1: NonExtended, net 0, dist 0
+        ];
+
+        let packet =
+            RtmpDataPacket::parse(rtmp_payload).expect("failed to parse RTMP Data packet");
+
+        assert_eq!(packet.router_network, 0);
+        assert_eq!(packet.node_id, 128);
+        assert_eq!(packet.tuples.len(), 1);
+        assert_eq!(
+            packet.tuples[0],
+            RtmpTuple::NonExtended {
+                network: 0,
                 distance: 0
             }
         );
