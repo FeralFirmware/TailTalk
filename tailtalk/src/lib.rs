@@ -45,6 +45,11 @@ pub struct DataLinkPacket {
     /// Our own LocalTalk node ID, used to populate the LLAP `src_node` field.
     /// Zero for Ethernet destinations (LLAP is not used on EtherTalk).
     pub src_node_id: u8,
+    /// For `DataLinkProtocol::Ddp` on a LocalTalk destination, whether
+    /// `payload` holds a long-form (13-byte) DDP header rather than the
+    /// short-form (5-byte) one — selects the LLAP DDP-long vs. DDP-short
+    /// frame type. Ignored for every other protocol/destination.
+    pub ddp_long: bool,
 }
 
 pub struct PacketProcessor {
@@ -522,7 +527,7 @@ impl PacketProcessor {
                             let llap_pkt = LlapPacket {
                                 dst_node: node_id,
                                 src_node: pkt.src_node_id,
-                                type_: LlapType::DdpShort,
+                                type_: if pkt.ddp_long { LlapType::DdpLong } else { LlapType::DdpShort },
                             };
                             let header_len = llap_pkt
                                 .to_bytes(&mut output_buf)

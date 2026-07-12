@@ -193,6 +193,10 @@ impl Inner {
         self.rtmp.lookup(net).map(|e| NextHop::Via(e.next_hop))
     }
 
+    fn has_router(&self) -> bool {
+        !self.rtmp.entries.is_empty()
+    }
+
     fn routers_for_zone(&self, zone: &str) -> Vec<AppleTalkAddress> {
         let mut seen = HashSet::new();
         self.zip
@@ -393,6 +397,17 @@ impl RouteTable {
         self.0.read().unwrap().route_for(net)
     }
 
+    /// Returns `true` once at least one router has advertised itself via RTMP
+    /// (or been configured programmatically).
+    ///
+    /// Used to decide when to stop using short-form (5-byte) DDP headers on
+    /// LocalTalk: those omit the network number entirely, which is fine on
+    /// an isolated LocalTalk segment but ambiguous as soon as a router makes
+    /// off-segment addressing possible.
+    pub fn has_router(&self) -> bool {
+        self.0.read().unwrap().has_router()
+    }
+
     /// Return the router addresses that can forward NBP requests for `zone`.
     ///
     /// Derived from ZIP (zone → ranges) then RTMP (range → next-hop).
@@ -461,6 +476,16 @@ mod tests {
         assert_eq!(t.route_for(155), Some(NextHop::Via(addr(1, 2))));
         // Parts of the old range outside [150, 160] are gone
         assert_eq!(t.route_for(100), None);
+    }
+
+    #[test]
+    fn has_router_tracks_rtmp_entries() {
+        let t = RouteTable::new(LearningMode::Static);
+        assert!(!t.has_router());
+        t.insert_route(200, 210, addr(100, 1));
+        assert!(t.has_router());
+        t.remove_route(200, 210);
+        assert!(!t.has_router());
     }
 
     #[test]

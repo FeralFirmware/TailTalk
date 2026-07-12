@@ -527,8 +527,13 @@ impl DdpProcessor {
         dest_node: Node,
         our_addr: AppleTalkAddress,
     ) {
-        // Short DDP (DDP-S, 5-byte header) is LocalTalk only.
-        let use_short = matches!(dest_node, Node::LocalTalk(_));
+        // Short DDP (DDP-S, 5-byte header) is LocalTalk only, and only while
+        // the segment is unrouted: it carries no network number, which is
+        // fine in isolation but ambiguous once a router (seen via RTMP) puts
+        // us in a multi-network topology. Once a router is known, switch to
+        // long-form DDP even on LocalTalk, same as NBP switches to router
+        // broadcast requests.
+        let use_short = matches!(dest_node, Node::LocalTalk(_)) && !self.route_table.has_router();
 
         let header_len = if use_short { 5 } else { DdpHeaders::LEN };
         let headers = DdpHeaders {
@@ -582,6 +587,7 @@ impl DdpProcessor {
                 protocol: DataLinkProtocol::Ddp,
                 payload,
                 src_node_id: our_addr.node_number,
+                ddp_long: !use_short,
             })
             .await
         {

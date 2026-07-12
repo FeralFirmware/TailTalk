@@ -165,6 +165,7 @@ impl Addressing {
             protocol: DataLinkProtocol::Aarp,
             payload: payload.into(),
             src_node_id: 0, // AARP is never sent to LocalTalk destinations
+            ddp_long: false,
         }
     }
 
@@ -184,6 +185,7 @@ impl Addressing {
                     protocol: DataLinkProtocol::LlapEnq,
                     payload: Box::new([]),
                     src_node_id: node_num,
+                    ddp_long: false,
                 };
                 self.outbound.send(enq).await.expect("failed to dispatch LLAP ENQ");
 
@@ -305,6 +307,7 @@ impl Addressing {
                             protocol: DataLinkProtocol::LlapAck,
                             payload: Box::new([]),
                             src_node_id: our_addr.node_number,
+                            ddp_long: false,
                         };
                         let _ = self.outbound.send(ack).await;
                     }
@@ -392,6 +395,7 @@ impl Addressing {
                 protocol: DataLinkProtocol::LlapEnq,
                 payload: Box::new([]),
                 src_node_id: candidate.node_number,
+                ddp_long: false,
             };
             if self.outbound.send(enq).await.is_err() {
                 return false;

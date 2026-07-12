@@ -152,15 +152,14 @@ impl PapClient {
                         PapFunction::SendData => {
                             let seq_num = pap_req.sequence_num;
 
-                            if seq_num != 0 {
-                                if let Some((seq, ub, chunk)) = &last_reply {
-                                    if *seq == seq_num {
-                                        let _ = req
-                                            .send_response_chunked(chunk.clone(), *ub, PAP_MAX_DATA_PER_PACKET)
-                                            .await;
-                                        continue;
-                                    }
-                                }
+                            if seq_num != 0
+                                && let Some((seq, ub, chunk)) = &last_reply
+                                && *seq == seq_num
+                            {
+                                let _ = req
+                                    .send_response_chunked(chunk.clone(), *ub, PAP_MAX_DATA_PER_PACKET)
+                                    .await;
+                                continue;
                             }
 
                             let max_packets = if req.bitmap == 0x00 { 8 } else { req.bitmap.count_ones() as usize }.clamp(1, 8);

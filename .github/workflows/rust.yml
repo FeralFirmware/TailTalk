@@ -40,6 +40,19 @@ jobs:
     - name: Run tests
       run: cargo test
 
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y pkg-config libfontconfig1-dev libudev-dev libpcap-dev
+    - name: Install clippy
+      run: rustup component add clippy
+    - name: Run clippy
+      run: cargo clippy --workspace --all-targets -- -D warnings
+
   release:
     runs-on: ${{ matrix.os }}
     strategy:
