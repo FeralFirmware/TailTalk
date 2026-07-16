@@ -38,6 +38,7 @@ struct AppConfig {
     laserwriter_name: Option<String>,
     laserwriter_output_path: Option<String>,
     laserwriter_convert_pdf: bool,
+    keep_awake_enabled: bool,
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -242,6 +243,11 @@ fn main() -> anyhow::Result<()> {
     // Shared handle used to shut the stack down when the window closes.
     let active_handle: Arc<tokio::sync::Mutex<Option<ShutdownHandle>>> =
         Arc::new(tokio::sync::Mutex::new(None));
+    // Power assertion preventing idle system sleep while the stack is running
+    // (the daemon's network sockets don't survive a full system sleep). Held
+    // only while running; dropping it releases the assertion.
+    let keep_awake: Arc<std::sync::Mutex<Option<keepawake::KeepAwake>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
     let (_log_guard, log_dir) = init_logging();
 
@@ -335,10 +341,16 @@ fn main() -> anyhow::Result<()> {
             ui.set_laserwriter_output_path(v.as_str().into());
         }
         ui.set_laserwriter_convert_pdf(config.laserwriter_convert_pdf);
+        ui.set_keep_awake_enabled(config.keep_awake_enabled);
     }
 
     let ui_handle = ui.as_weak();
-    rt_handle.spawn(server_loop(cmd_rx, ui_handle, active_handle.clone()));
+    rt_handle.spawn(server_loop(
+        cmd_rx,
+        ui_handle,
+        active_handle.clone(),
+        keep_awake.clone(),
+    ));
 
     let ui_weak = ui.as_weak();
     #[cfg(feature = "ethertalk")]
@@ -498,6 +510,7 @@ fn main() -> anyhow::Result<()> {
                     if s.is_empty() { None } else { Some(s) }
                 },
                 laserwriter_convert_pdf: ui.get_laserwriter_convert_pdf(),
+                keep_awake_enabled: ui.get_keep_awake_enabled(),
             });
 
             let pcap_path: Option<PathBuf> = if ui.get_pcap_enabled() {
@@ -866,6 +879,7 @@ fn main() -> anyhow::Result<()> {
             h.graceful_shutdown().await;
         }
     });
+    keep_awake.lock().unwrap().take();
 
     Ok(())
 }
@@ -876,6 +890,7 @@ async fn server_loop(
     mut cmd_rx: tokio::sync::mpsc::Receiver<ServerCommand>,
     ui_weak: slint::Weak<AppWindow>,
     active: Arc<tokio::sync::Mutex<Option<ShutdownHandle>>>,
+    keep_awake: Arc<std::sync::Mutex<Option<keepawake::KeepAwake>>>,
 ) {
     let mut shutdown_handle: Option<ShutdownHandle> = None;
 
@@ -897,6 +912,7 @@ async fn server_loop(
                 if let Some(h) = shutdown_handle.take() {
                     active.lock().await.take();
                     h.graceful_shutdown().await;
+                    keep_awake.lock().unwrap().take();
                 }
 
                 let ui_w = ui_weak.clone();
@@ -922,10 +938,23 @@ async fn server_loop(
                 if let Ok((handle, extra)) = ready_rx.await {
                     *active.lock().await = Some(extra);
                     shutdown_handle = Some(handle);
+                    let keep_awake = keep_awake.clone();
                     slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_w.upgrade() {
                             ui.set_starting(false);
                             ui.set_running(true);
+                            if ui.get_keep_awake_enabled() {
+                                match keepawake::Builder::default()
+                                    .idle(true)
+                                    .reason("TailTalk AFP server is running")
+                                    .app_name("TailTalk")
+                                    .app_reverse_domain("com.tailtalk.app")
+                                    .create()
+                                {
+                                    Ok(k) => *keep_awake.lock().unwrap() = Some(k),
+                                    Err(e) => tracing::warn!("Could not enable keep-awake: {e}"),
+                                }
+                            }
                         }
                     })
                     .ok();
@@ -939,6 +968,7 @@ async fn server_loop(
                     active.lock().await.take();
                     h.graceful_shutdown().await;
                 }
+                keep_awake.lock().unwrap().take();
                 let ui_w = ui_weak.clone();
                 slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_w.upgrade() {

@@ -30,6 +30,7 @@ export component AppWindow inherits Window {
     in-out property <string> laserwriter-name: "Color LaserWriter 12/600";
     in-out property <string> laserwriter-output-path;
     in-out property <bool> laserwriter-convert-pdf: false;
+    in-out property <bool> keep-awake-enabled: false;
     in-out property <string> info-message: "";
 
     in-out property <bool> import-progress-visible: false;
@@ -61,6 +62,11 @@ export component AppWindow inherits Window {
     MenuBar {
         Menu {
             title: "File";
+            MenuItem {
+                title: "Keep Awake";
+                checkable: true;
+                checked <=> root.keep-awake-enabled;
+            }
             MenuItem {
                 title: "Import Archive/Disk Image…";
                 activated => { root.import-files(); }

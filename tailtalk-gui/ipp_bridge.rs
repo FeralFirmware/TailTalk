@@ -1221,60 +1221,67 @@ async fn urf_to_rasterizable(data: Vec<u8>, job_token: u32) -> anyhow::Result<Ve
     }
 }
 
-/// Return the name of the Ghostscript executable on this platform.
-/// On Windows, Ghostscript may be installed as `gswin64c` or `gswin32c`
-/// rather than `gs`; try each in order and return the first one found.
-pub(crate) fn gs_command() -> &'static str {
+/// Absolute fallback locations to check for Ghostscript beyond `$PATH`.
+/// A GUI app launched from Finder/LaunchServices (rather than a terminal)
+/// gets a bare-minimum PATH that doesn't include Homebrew's or MacPorts'
+/// install prefixes, so a plain `Command::new("gs")` fails to spawn even
+/// though `gs` works fine from a shell.
+#[cfg(target_os = "macos")]
+const GS_FALLBACK_PATHS: &[&str] = &[
+    "/opt/homebrew/bin/gs",       // Homebrew, Apple Silicon
+    "/usr/local/bin/gs",          // Homebrew, Intel
+    "/usr/local/opt/ghostscript/bin/gs",
+    "/opt/local/bin/gs",          // MacPorts
+];
+
+fn gs_works(candidate: &str) -> bool {
+    std::process::Command::new(candidate)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Locate a usable Ghostscript executable, checking `$PATH` first and then
+/// (on macOS) common install locations that a Finder-launched app's PATH
+/// won't include. Returns the name or full path to invoke it with.
+fn find_gs() -> Option<String> {
     #[cfg(target_os = "windows")]
-    {
-        for candidate in &["gswin64c", "gswin32c", "gs"] {
-            if std::process::Command::new(candidate)
-                .arg("--version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-            {
-                return candidate;
-            }
-        }
-        "gswin64c" // fall through to a named binary so the error message is useful
-    }
+    let path_candidates: &[&str] = &["gswin64c", "gswin32c", "gs"];
     #[cfg(not(target_os = "windows"))]
-    "gs"
+    let path_candidates: &[&str] = &["gs"];
+
+    for candidate in path_candidates {
+        if gs_works(candidate) {
+            return Some((*candidate).to_string());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    for candidate in GS_FALLBACK_PATHS {
+        if gs_works(candidate) {
+            return Some((*candidate).to_string());
+        }
+    }
+
+    None
+}
+
+/// Return the name or full path of the Ghostscript executable to invoke.
+pub(crate) fn gs_command() -> String {
+    find_gs().unwrap_or_else(|| {
+        #[cfg(target_os = "windows")]
+        { "gswin64c".to_string() } // fall through to a named binary so the error message is useful
+        #[cfg(not(target_os = "windows"))]
+        { "gs".to_string() }
+    })
 }
 
 /// Returns true if a usable Ghostscript executable is found on this platform.
 pub fn gs_probe() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        // gs_command() already probes all candidates; if it falls through to the
-        // default name without finding anything, a --version call will fail.
-        for candidate in &["gswin64c", "gswin32c", "gs"] {
-            if std::process::Command::new(candidate)
-                .arg("--version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-            {
-                return true;
-            }
-        }
-        false
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::process::Command::new("gs")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
+    find_gs().is_some()
 }
 
 /// Rasterize a PDF/PS/URF document with Ghostscript to a raw raster device
