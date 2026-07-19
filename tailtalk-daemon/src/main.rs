@@ -48,6 +48,12 @@ struct Cli {
     #[arg(long)]
     pcap: Option<PathBuf>,
 
+    /// Disable the built-in RTMP listener and ZIP client (DDP sockets 1 and
+    /// 6). Use when a client (e.g. netatalk's atalkd) runs its own router
+    /// engines over this daemon.
+    #[arg(long)]
+    no_router_discovery: bool,
+
     /// Cable range of the local segment, as LO-HI (e.g. 100-105).
     #[arg(long, value_parser = parse_range)]
     local_range: Option<RangeArg>,
@@ -147,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         localtalk: cli.localtalk,
         localtalk_node: cli.localtalk_node,
         pcap: cli.pcap,
+        no_router_discovery: cli.no_router_discovery,
     })
     .await?;
 
@@ -154,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
     // modify these later through the API.
     let table = daemon.route_table();
     if let Some(RangeArg(lo, hi)) = cli.local_range {
-        table.set_local_range(lo, hi);
+        table.set_local_range_for(tailtalk::route_table::Interface::EtherTalk, lo, hi);
     }
     for RouteArg(lo, hi, net, node) in &cli.routes {
         table.insert_route(
@@ -164,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
                 network_number: *net,
                 node_number: *node,
             },
+            tailtalk::route_table::Interface::EtherTalk,
         );
     }
     for ZoneArg(name, ranges) in &cli.zones {

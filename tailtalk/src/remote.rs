@@ -289,7 +289,7 @@ impl RemoteClient {
                     range: Some(proto::CableRange { lo: *lo as u32, hi: *hi as u32 }),
                 })
             }
-            RouteChange::InsertRoute { lo, hi, next_hop } => {
+            RouteChange::InsertRoute { lo, hi, next_hop, interface } => {
                 proto::request::Kind::AddRoute(proto::AddRouteRequest {
                     route: Some(proto::Route {
                         range: Some(proto::CableRange { lo: *lo as u32, hi: *hi as u32 }),
@@ -297,6 +297,11 @@ impl RemoteClient {
                             next_hop.network_number,
                             next_hop.node_number,
                         )),
+                        interface: match interface {
+                            Some(crate::route_table::Interface::EtherTalk) => 2, // EtherTalkPhase2 by default for daemon
+                            Some(crate::route_table::Interface::LocalTalk) => 3,
+                            None => 0,
+                        },
                     }),
                 })
             }
@@ -352,6 +357,12 @@ fn dispatch(shared: &Shared, msg: proto::ServerMessage) {
             let packet = Packet {
                 headers,
                 payload: dg.payload.into_boxed_slice(),
+                source: match dg.arrival_link {
+                    1 => tailtalk_packets::aarp::AddressSource::EtherTalkPhase1,
+                    2 => tailtalk_packets::aarp::AddressSource::EtherTalkPhase2,
+                    3 => tailtalk_packets::aarp::AddressSource::LocalTalk,
+                    _ => tailtalk_packets::aarp::AddressSource::EtherTalkPhase2, // default fallback
+                },
             };
             let sockets = shared.sockets.lock().unwrap();
             if let Some(tx) = sockets.get(&socket_id)
@@ -385,6 +396,11 @@ pub(crate) fn snapshot_from_proto(
             .filter_map(|route| {
                 let range = route.range.as_ref()?;
                 let next_hop = route.next_hop.as_ref()?;
+                let interface = match route.interface {
+                    1 | 2 => Some(crate::route_table::Interface::EtherTalk),
+                    3 => Some(crate::route_table::Interface::LocalTalk),
+                    _ => None,
+                };
                 Some((
                     range.lo as u16,
                     range.hi as u16,
@@ -392,6 +408,7 @@ pub(crate) fn snapshot_from_proto(
                         network_number: next_hop.network as u16,
                         node_number: next_hop.node as u8,
                     },
+                    interface,
                 ))
             })
             .collect(),

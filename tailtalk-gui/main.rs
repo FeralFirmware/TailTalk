@@ -93,7 +93,7 @@ enum ServerCommand {
         pcap_path: Option<PathBuf>,
         ipp_bridge_enabled: bool,
         lw_bridge_enabled: bool,
-        laserwriter: Option<LaserWriterConfig>,
+        laserwriter: Box<Option<LaserWriterConfig>>,
     },
     Stop,
 }
@@ -534,7 +534,7 @@ fn main() -> anyhow::Result<()> {
                 pcap_path,
                 ipp_bridge_enabled: ui.get_ipp_bridge_enabled(),
                 lw_bridge_enabled: ui.get_lw_bridge_enabled(),
-                laserwriter,
+                laserwriter: Box::new(laserwriter),
             });
             if send_result.is_err() {
                 tracing::warn!("Server command queue full; ignoring Start");
@@ -928,7 +928,7 @@ async fn server_loop(
                     pcap_path,
                     ipp_bridge_enabled,
                     lw_bridge_enabled,
-                    laserwriter,
+                    *laserwriter,
                     ready_tx,
                     ui_w.clone(),
                 ));

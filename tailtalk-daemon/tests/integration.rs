@@ -241,6 +241,7 @@ async fn routing_rules_over_unix_socket() {
                 route: Some(proto::Route {
                     range: Some(proto::CableRange { lo: 200, hi: 210 }),
                     next_hop: Some(proto::AppleTalkAddress::new(100, 1)),
+                    interface: 2,
                 }),
             }),
         )
@@ -275,8 +276,8 @@ async fn routing_rules_over_unix_socket() {
 
     // ...and actually applied to the daemon's forwarding table.
     assert_eq!(
-        daemon.route_table().route_for(205),
-        Some(NextHop::Via(addr(100, 1)))
+        daemon.route_table().resolve(205),
+        Some(NextHop::Via { router: addr(100, 1), interface: tailtalk::route_table::Interface::EtherTalk })
     );
 
     // Remove and verify.
@@ -290,7 +291,7 @@ async fn routing_rules_over_unix_socket() {
         )
         .await,
     );
-    assert_eq!(daemon.route_table().route_for(205), None);
+    assert_eq!(daemon.route_table().resolve(205), None);
 }
 
 #[tokio::test]
@@ -311,6 +312,7 @@ async fn route_changes_are_pushed_to_all_clients() {
                 route: Some(proto::Route {
                     range: Some(proto::CableRange { lo: 200, hi: 210 }),
                     next_hop: Some(proto::AppleTalkAddress::new(100, 1)),
+                    interface: 2,
                 }),
             }),
         )
@@ -336,7 +338,7 @@ async fn route_changes_are_pushed_to_all_clients() {
     );
 
     // Changes made directly on the daemon (e.g. its CLI) are pushed too.
-    daemon.route_table().set_local_range(10, 15);
+    daemon.route_table().set_local_range_for(tailtalk::route_table::Interface::EtherTalk, 10, 15);
     let push = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let msg: proto::ServerMessage =
@@ -360,10 +362,10 @@ async fn talkstack_mirror_follows_daemon_changes() {
 
     // A rule added on the daemon after the client connected shows up in the
     // client's route table via the push channel — no RPC from the client.
-    daemon.route_table().insert_route(200, 210, addr(100, 1));
+    daemon.route_table().insert_route(200, 210, addr(100, 1), tailtalk::route_table::Interface::EtherTalk);
     let mut synced = false;
     for _ in 0..100 {
-        if stack.route_table.route_for(205) == Some(NextHop::Via(addr(100, 1))) {
+        if stack.route_table.resolve(205) == Some(NextHop::Via { router: addr(100, 1), interface: tailtalk::route_table::Interface::EtherTalk }) {
             synced = true;
             break;
         }
@@ -375,7 +377,7 @@ async fn talkstack_mirror_follows_daemon_changes() {
     daemon.route_table().remove_route(200, 210);
     let mut synced = false;
     for _ in 0..100 {
-        if stack.route_table.route_for(205).is_none() {
+        if stack.route_table.resolve(205).is_none() {
             synced = true;
             break;
         }
@@ -389,21 +391,21 @@ async fn talkstack_remote_mode_over_unix() {
     let (daemon, _dir, path) = start_daemon().await;
 
     // Rules configured on the daemon before the client connects…
-    daemon.route_table().insert_route(200, 210, addr(100, 1));
+    daemon.route_table().insert_route(200, 210, addr(100, 1), tailtalk::route_table::Interface::EtherTalk);
 
     let stack = TalkStack::builder().daemon_unix(&path).build().await.unwrap();
 
     // …are mirrored into the client's route table at build time.
     assert_eq!(
-        stack.route_table.route_for(205),
-        Some(NextHop::Via(addr(100, 1)))
+        stack.route_table.resolve(205),
+        Some(NextHop::Via { router: addr(100, 1), interface: tailtalk::route_table::Interface::EtherTalk })
     );
 
     // Client-side modifications propagate back to the daemon.
-    stack.route_table.insert_route(300, 310, addr(100, 2));
+    stack.route_table.insert_route(300, 310, addr(100, 2), tailtalk::route_table::Interface::EtherTalk);
     let mut synced = false;
     for _ in 0..100 {
-        if daemon.route_table().route_for(305) == Some(NextHop::Via(addr(100, 2))) {
+        if daemon.route_table().resolve(305) == Some(NextHop::Via { router: addr(100, 2), interface: tailtalk::route_table::Interface::EtherTalk }) {
             synced = true;
             break;
         }
@@ -467,7 +469,7 @@ async fn talkstack_remote_mode_over_udp() {
     let sock = stack.ddp.new_sock(DdpProtocolType::Adsp, None).await.unwrap();
     assert!((64..=254).contains(&sock.socket_num()));
 
-    stack.route_table.set_local_range(50, 55);
+    stack.route_table.set_local_range_for(tailtalk::route_table::Interface::EtherTalk, 50, 55);
     let mut synced = false;
     for _ in 0..100 {
         if daemon.route_table().is_local(52) {

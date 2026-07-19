@@ -28,6 +28,7 @@ pub mod remote;
 pub mod route_table;
 pub mod rtmp;
 pub mod stylewriter;
+pub mod zip;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DataLinkProtocol {
@@ -451,7 +452,6 @@ impl PacketProcessor {
                                                     addressing_handle.received_llap_ack(llap.src_node);
                                                 }
                                                 LlapType::DdpLong => {
-                                                    tracing::info!("TashTalk: LocalTalk DDP Long");
                                                     if let Ok(headers) = DdpPacket::parse(&data[3..]) {
                                                         let end = (3 + headers.len).min(data.len());
                                                         let payload =
@@ -688,6 +688,10 @@ pub struct TalkStack {
     pub ddp: ddp::DdpHandle,
     pub nbp: nbp::NbpHandle,
     pub echo: echo::EchoHandle,
+    /// Handle to the resident ZIP client, for forcing a zone re-discovery.
+    /// `None` with a remote daemon (which runs its own) or when router
+    /// discovery is disabled.
+    pub zip: Option<zip::ZipHandle>,
     /// Shared routing table. Call `insert_route` / `insert_zone` on this to
     /// program static routes before or after the stack is running.
     pub route_table: route_table::RouteTable,
@@ -823,6 +827,8 @@ pub struct Underlay {
     pub lt_addressing: Option<addressing::AddressingHandle>,
     pub ddp: ddp::DdpHandle,
     pub route_table: route_table::RouteTable,
+    /// Handle to the ZIP actor; `None` when router discovery is disabled.
+    pub zip: Option<zip::ZipHandle>,
     /// Cancel to stop the transport (PacketProcessor).
     pub transport_token: CancellationToken,
 }
@@ -844,6 +850,8 @@ pub struct TalkStackBuilder {
     lt_fixed_node: Option<u8>,
     pcap_path: Option<PathBuf>,
     daemon: Option<remote::DaemonEndpoint>,
+    router_discovery: bool,
+    zone_cache: Option<PathBuf>,
 }
 
 impl TalkStack {
@@ -858,6 +866,8 @@ impl TalkStack {
             lt_fixed_node: None,
             pcap_path: None,
             daemon: None,
+            router_discovery: true,
+            zone_cache: None,
         }
     }
 }
@@ -892,9 +902,28 @@ impl TalkStackBuilder {
 
     /// Use a fixed AppleTalk node on LocalTalk instead of probing via LLAP ENQ.
     ///
-    /// The network number is always 0 on LocalTalk and cannot be configured.
+    /// The network number starts as 0 on LocalTalk; a router's RTMP/ZIP
+    /// advertisements may later supply the cable's real network number.
     pub fn localtalk_fixed_address(mut self, node: u8) -> Self {
         self.lt_fixed_node = Some(node);
+        self
+    }
+
+    /// Disable the resident RTMP listener and ZIP client.
+    ///
+    /// These own DDP sockets 1 and 6 and adapt addressing/routing to router
+    /// advertisements. Disable them when an external router engine (e.g.
+    /// netatalk's `atalkd` driving a TailTalk daemon) needs those sockets and
+    /// manages routes itself.
+    pub fn disable_router_discovery(mut self) -> Self {
+        self.router_discovery = false;
+        self
+    }
+
+    /// Persist the learned zone name to this file (PRAM-style), so the next
+    /// startup can ask the router to re-confirm it.
+    pub fn zone_cache(mut self, path: impl Into<PathBuf>) -> Self {
+        self.zone_cache = Some(path.into());
         self
     }
 
@@ -992,7 +1021,6 @@ impl TalkStackBuilder {
 
         let route_table = route_table::RouteTable::new(route_table::LearningMode::Dynamic);
         let ddp = ddp::DdpProcessor::spawn(et_addressing.clone(), lt_addressing.clone(), outbound, route_table.clone());
-        rtmp::Rtmp::spawn(&ddp, route_table.clone()).await;
 
         let transport_token = CancellationToken::new();
         tokio::spawn(processor.run(et_addressing.clone(), lt_addressing.clone(), ddp.clone(), transport_token.clone()));
@@ -1005,7 +1033,25 @@ impl TalkStackBuilder {
             lt.addr().await?;
         }
 
-        Ok(Underlay { et_addressing, lt_addressing, ddp, route_table, transport_token })
+        // Router discovery starts only after addressing has settled: ZIP's
+        // initial GetNetInfo broadcast needs a source address, and the RTMP
+        // listener may adopt gleaned network numbers on top of it.
+        let zip = if self.router_discovery {
+            let zip = zip::Zip::spawn(
+                &ddp,
+                et_addressing.clone(),
+                lt_addressing.clone(),
+                route_table.clone(),
+                self.zone_cache.clone(),
+            )
+            .await;
+            rtmp::Rtmp::spawn(&ddp, route_table.clone(), lt_addressing.clone(), Some(zip.clone())).await;
+            Some(zip)
+        } else {
+            None
+        };
+
+        Ok(Underlay { et_addressing, lt_addressing, ddp, route_table, zip, transport_token })
     }
 
     /// Launch the full AppleTalk stack and return handles to each layer.
@@ -1019,7 +1065,7 @@ impl TalkStackBuilder {
             return self.build_remote(endpoint).await;
         }
 
-        let Underlay { et_addressing, lt_addressing, ddp, route_table, transport_token } =
+        let Underlay { et_addressing, lt_addressing, ddp, route_table, zip, transport_token } =
             self.build_underlay().await?;
 
         let echo = echo::Echo::spawn(&ddp).await;
@@ -1028,7 +1074,7 @@ impl TalkStackBuilder {
         let service_token = CancellationToken::new();
         let services_done = CancellationToken::new();
 
-        Ok(TalkStack { et_addressing, lt_addressing, ddp, nbp, echo, route_table, service_token, transport_token, services_done })
+        Ok(TalkStack { et_addressing, lt_addressing, ddp, nbp, echo, zip, route_table, service_token, transport_token, services_done })
     }
 
     /// Build the stack on top of a remote daemon's underlay.
@@ -1108,7 +1154,7 @@ impl TalkStackBuilder {
             });
         }
 
-        Ok(TalkStack { et_addressing, lt_addressing, ddp, nbp, echo, route_table, service_token, transport_token, services_done })
+        Ok(TalkStack { et_addressing, lt_addressing, ddp, nbp, echo, zip: None, route_table, service_token, transport_token, services_done })
     }
 }
 

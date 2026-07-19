@@ -1,13 +1,13 @@
 use crate::{
     addressing::AddressingHandle,
     ddp::{DdpHandle, DdpSocket},
-    route_table::{NbpDispatch, NbpZone, RouteTable},
+    route_table::{Interface, NbpDispatch, NbpZone, RouteTable},
 };
 use std::collections::HashMap;
 use std::io;
 use std::time::Duration;
 use tailtalk_packets::{
-    aarp::AppleTalkAddress,
+    aarp::{AddressSource, AppleTalkAddress},
     ddp::{DdpPacket, DdpProtocolType},
     nbp::{EntityName, NbpOperation, NbpPacket, NbpTuple},
 };
@@ -100,7 +100,7 @@ impl Nbp {
                 sock_recv = self.sock.recv() => {
                     match sock_recv {
                         Ok(mut pkt) => {
-                            self.handle_packet(pkt.headers, &mut pkt.payload).await;
+                            self.handle_packet(pkt.headers, &mut pkt.payload, pkt.source).await;
                         },
                         Err(_e) => {
 
@@ -120,23 +120,33 @@ impl Nbp {
                                 let tid = self.next_tid;
                                 self.next_tid = self.next_tid.wrapping_add(1);
 
-                                // Use the primary address (ET if available, else LT) in the lookup tuple.
-                                let primary_addr = if let Some(et) = &self.et_addressing {
-                                    et.addr().await.expect("failed to get ET addr")
-                                } else {
-                                    self.lt_addressing.as_ref().expect("no addressing").addr().await.expect("failed to get LT addr")
+                                // Derive dispatch strategy from the zone in the entity name.
+                                // "*" is the local zone, not just the local cable: with a
+                                // router present it needs a BrRq to the router (which forwards
+                                // the lookup onto other cables, like the far side of a bridge),
+                                // falling back to a local broadcast only when there is none.
+                                // That is exactly the "=" (all zones) dispatch; the two differ
+                                // only in the zone carried in the request, which stays intact.
+                                let dispatch = match lookup.request.zone.as_str() {
+                                    "*" | "=" => self.route_table.nbp_dispatch(NbpZone::All),
+                                    z => self.route_table.nbp_dispatch(NbpZone::Named(z)),
                                 };
 
-                                // Derive dispatch strategy from the zone in the entity name.
-                                let dispatch = match lookup.request.zone.as_str() {
-                                    "*" => self.route_table.nbp_dispatch(NbpZone::Local),
-                                    "=" => self.route_table.nbp_dispatch(NbpZone::All),
-                                    z   => self.route_table.nbp_dispatch(NbpZone::Named(z)),
+                                // The reply address we advertise in the tuple: when
+                                // asking a router, use our address on that router's
+                                // cable so replies forwarded from other networks can
+                                // route back; otherwise the primary address.
+                                let reply_iface = match &dispatch {
+                                    NbpDispatch::RouterBroadcast(routers) => routers
+                                        .first()
+                                        .and_then(|r| self.route_table.interface_for_net(r.network_number)),
+                                    _ => None,
                                 };
+                                let our_addr = self.addr_on(reply_iface).await;
 
                                 let tuple = NbpTuple {
-                                    network_number: primary_addr.network_number,
-                                    node_id: primary_addr.node_number,
+                                    network_number: our_addr.network_number,
+                                    node_id: our_addr.node_number,
                                     socket_number: 2,
                                     enumerator: 0,
                                     entity_name: lookup.request,
@@ -146,7 +156,10 @@ impl Nbp {
                                 let send_result = match dispatch {
                                     NbpDispatch::RouterBroadcast(routers) => {
                                         // A router is known (via RTMP): send BrRq directly
-                                        // to it rather than broadcasting locally.
+                                        // to it rather than broadcasting locally. Any single
+                                        // router ("A-ROUTER") handles the whole request, so
+                                        // stop at the first successful send — asking several
+                                        // would only duplicate every reply.
                                         let packet = NbpPacket {
                                             operation: NbpOperation::BroadcastRequest,
                                             transaction_id: tid,
@@ -154,26 +167,24 @@ impl Nbp {
                                         };
                                         let size = packet.to_bytes(&mut buf).expect("failed to serialize");
 
-                                        let mut any_ok = false;
-                                        let mut last_err = None;
+                                        let mut result = Err(io::Error::other("no routers to send BrRq to"));
                                         for router in routers {
                                             let dest = crate::ddp::DdpAddress::new(router, 2);
                                             match self.sock.send_to(&buf[..size], dest).await {
-                                                Ok(()) => any_ok = true,
+                                                Ok(()) => {
+                                                    result = Ok(());
+                                                    break;
+                                                }
                                                 Err(e) => {
                                                     tracing::warn!(
                                                         "NBP BrRq: failed to send to {}.{}: {e}",
                                                         router.network_number, router.node_number,
                                                     );
-                                                    last_err = Some(e);
+                                                    result = Err(e);
                                                 }
                                             }
                                         }
-                                        if any_ok {
-                                            Ok(())
-                                        } else {
-                                            Err(last_err.unwrap_or_else(|| io::Error::other("no routers to send BrRq to")))
-                                        }
+                                        result
                                     }
                                     NbpDispatch::LocalBroadcast | NbpDispatch::ZoneUnknown => {
                                         let packet = NbpPacket {
@@ -277,7 +288,31 @@ impl Nbp {
         }
     }
 
-    async fn handle_packet(&mut self, ddp: DdpPacket, payload: &mut [u8]) {
+    /// Our address on the given interface, falling back to the primary
+    /// address (ET if available, else LT) when unspecified or unconfigured.
+    async fn addr_on(&self, iface: Option<Interface>) -> AppleTalkAddress {
+        let handle = match iface {
+            Some(Interface::LocalTalk) if self.lt_addressing.is_some() => {
+                self.lt_addressing.as_ref()
+            }
+            Some(Interface::EtherTalk) if self.et_addressing.is_some() => {
+                self.et_addressing.as_ref()
+            }
+            _ => self.et_addressing.as_ref().or(self.lt_addressing.as_ref()),
+        };
+        handle
+            .expect("no addressing configured")
+            .addr()
+            .await
+            .expect("failed to get interface address")
+    }
+
+    async fn handle_packet(
+        &mut self,
+        ddp: DdpPacket,
+        payload: &mut [u8],
+        source: AddressSource,
+    ) {
         let packet = match NbpPacket::from_bytes(payload) {
             Ok(pkt) => pkt,
             Err(e) => {
@@ -288,7 +323,9 @@ impl Nbp {
 
         match packet.operation {
             NbpOperation::Lookup => {
-                let response = self.generate_response(&packet, ddp.src_network_num, ddp.src_node_id).await;
+                let response = self
+                    .generate_response(&packet, ddp.src_network_num, ddp.src_node_id, source)
+                    .await;
 
                 // Only send a reply if we have at least one matching tuple
                 if !response.tuples.is_empty() {
@@ -346,32 +383,14 @@ impl Nbp {
         }
     }
 
-    async fn generate_response(&self, nbp: &NbpPacket, source_network: u16, source_node: u8) -> NbpPacket {
-        // Respond with the address on the same interface the lookup arrived from.
-        let our_addr = if source_network == 0 {
-            // Network 0 is ambiguous between LocalTalk and nonextended
-            // EtherTalk (Phase 1). With only one interface configured, it
-            // must be that one. With both, check whether the requester has
-            // been learned as an EtherTalk Phase 1 peer before assuming
-            // LocalTalk.
-            match (&self.lt_addressing, &self.et_addressing) {
-                (Some(lt), None) => lt.addr().await.expect("failed to get LT addr"),
-                (None, Some(et)) => et.addr().await.expect("failed to get ET addr"),
-                (Some(lt), Some(et)) => {
-                    let peer = AppleTalkAddress { network_number: 0, node_number: source_node };
-                    if et.try_lookup(&peer).is_some() {
-                        et.addr().await.expect("failed to get ET addr")
-                    } else {
-                        lt.addr().await.expect("failed to get LT addr")
-                    }
-                }
-                (None, None) => panic!("no addressing configured"),
-            }
-        } else if let Some(et) = &self.et_addressing {
-            et.addr().await.expect("failed to get ET addr")
-        } else {
-            self.lt_addressing.as_ref().expect("no addressing").addr().await.expect("failed to get LT addr")
-        };
+    async fn generate_response(
+        &self,
+        nbp: &NbpPacket,
+        _source_network: u16,
+        _source_node: u8,
+        source: AddressSource,
+    ) -> NbpPacket {
+        let our_addr = self.addr_on(Some(Interface::from(source))).await;
 
         let mut tuples = Vec::new();
 

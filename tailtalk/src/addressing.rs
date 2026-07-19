@@ -49,7 +49,7 @@ pub struct Addressing {
     lt_ack_recv: mpsc::Receiver<u8>,
     lt_enq_recv: mpsc::Receiver<u8>,
     pending: HashMap<AppleTalkAddress, Vec<Arc<AarpRequest>>>,
-    cache: Arc<DashMap<AppleTalkAddress, Node>>,
+    cache: Arc<DashMap<AppleTalkAddress, CacheEntry>>,
     outbound: OutboundHandle,
     our_mac: Option<EthernetMac>,
     phase: AddressSource,
@@ -216,14 +216,31 @@ impl Addressing {
             addr
         } else {
             // EtherTalk: probe via AARP. Retry with a new random address on conflict.
+            //
+            // On Phase 2 (extended) networks the provisional address is drawn
+            // from the startup range $FF00–$FFFE, as Inside AppleTalk
+            // specifies: the cable's real network range is unknown until a
+            // router answers ZIP GetNetInfo, after which the ZIP actor
+            // re-acquires an address inside that range. On an isolated cable
+            // the startup address simply remains in use. Phase 1
+            // (nonextended) nodes address with network 0 until a router's
+            // RTMP broadcast supplies the real network number.
             'probe: loop {
-                let node_num = rand::rng().random_range(1..=254);
-                let addr = AppleTalkAddress {
-                    network_number: 1,
-                    node_number: node_num,
+                let addr = match self.phase {
+                    AddressSource::EtherTalkPhase2 => AppleTalkAddress {
+                        network_number: rand::rng().random_range(0xFF00..=0xFFFE),
+                        node_number: rand::rng().random_range(1..=253),
+                    },
+                    _ => AppleTalkAddress {
+                        network_number: 0,
+                        node_number: rand::rng().random_range(1..=254),
+                    },
                 };
 
-                tracing::info!("addressing: Selecting 1.{node_num} as our address");
+                tracing::info!(
+                    "addressing: Selecting {}.{} as our provisional address",
+                    addr.network_number, addr.node_number
+                );
 
                 let probe = self.create_packet(
                     addr,
@@ -241,13 +258,19 @@ impl Addressing {
                 loop {
                     tokio::select! {
                         _ = tokio::time::sleep_until(probe_deadline) => {
-                            tracing::info!("No response, address 1.{node_num} confirmed");
+                            tracing::info!(
+                                "No response, address {}.{} confirmed",
+                                addr.network_number, addr.node_number
+                            );
                             break 'probe addr;
                         }
                         pkt = self.packet_recv.recv() => {
                             if let Some((pkt, _source)) = pkt
                                 && pkt.opcode == AarpOpcode::Probe && pkt.target_protocol == addr {
-                                    tracing::warn!("Address conflict for 1.{node_num}, re-selecting");
+                                    tracing::warn!(
+                                        "Address conflict for {}.{}, re-selecting",
+                                        addr.network_number, addr.node_number
+                                    );
                                     continue 'probe;
                                 }
                         }
@@ -368,10 +391,12 @@ impl Addressing {
                             },
                         };
 
+                        // The requester may have timed out and dropped its
+                        // receiver; still cache the answer below.
                         if let Err(e) = inner_req.chan.send(Ok(node)) {
-                            tracing::error!("error responding to AarpRequest: {e:?}");
+                            tracing::debug!("AARP response arrived after requester gave up: {e:?}");
                         }
-                        self.cache.insert(pkt.sender_protocol, node);
+                        self.cache.insert(pkt.sender_protocol, CacheEntry::Valid(node));
                     }
                 }
             },
@@ -452,6 +477,12 @@ impl Addressing {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum CacheEntry {
+    Valid(Node),
+    Negative(tokio::time::Instant),
+}
+
 /// Handle to interface addressing.
 #[derive(Clone)]
 pub struct AddressingHandle {
@@ -467,7 +498,7 @@ enum AddressingInner {
         lt_ack_send: mpsc::Sender<u8>,
         lt_enq_send: mpsc::Sender<u8>,
         addr_watch: watch::Receiver<Option<AppleTalkAddress>>,
-        cache: Arc<DashMap<AppleTalkAddress, Node>>,
+        cache: Arc<DashMap<AppleTalkAddress, CacheEntry>>,
         _cancel: Arc<DropGuard>,
     },
     Remote {
@@ -511,7 +542,7 @@ impl AddressingHandle {
 
     pub fn learn(&self, addr: AppleTalkAddress, node: Node) {
         if let AddressingInner::Local { cache, .. } = &self.inner {
-            cache.insert(addr, node);
+            cache.insert(addr, CacheEntry::Valid(node));
         }
     }
 
@@ -538,9 +569,26 @@ impl AddressingHandle {
         }
 
         match &self.inner {
-            AddressingInner::Local { cache, .. } => cache.get(addr).map(|v| *v),
+            AddressingInner::Local { cache, .. } => {
+                if let Some(entry) = cache.get(addr) {
+                    match *entry {
+                        CacheEntry::Valid(node) => Some(node),
+                        CacheEntry::Negative(_) => None,
+                    }
+                } else {
+                    None
+                }
+            }
             // Link-layer resolution happens inside the daemon.
             AddressingInner::Remote { .. } => None,
+        }
+    }
+
+    fn get_cache_entry(&self, addr: &AppleTalkAddress) -> Option<CacheEntry> {
+        if let AddressingInner::Local { cache, .. } = &self.inner {
+            cache.get(addr).map(|v| *v)
+        } else {
+            None
         }
     }
 
@@ -548,6 +596,14 @@ impl AddressingHandle {
         if let Some(mac) = self.try_lookup(&addr) {
             return Ok(mac);
         }
+
+        if let Some(CacheEntry::Negative(expires_at)) = self.get_cache_entry(&addr)
+            && tokio::time::Instant::now() < expires_at {
+                return Err(Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "AARP negative cache hit",
+                ));
+            }
 
         let request_send = match &self.inner {
             AddressingInner::Local { request_send, .. } => request_send,
@@ -567,9 +623,25 @@ impl AddressingHandle {
             return Err(Error::other(e));
         }
 
-        match rx.await {
-            Ok(res) => res,
-            Err(e) => Err(Error::other(e)),
+        // A node that isn't on this cable never answers, and the pending
+        // request would otherwise wait forever — which would wedge callers
+        // like the DDP processor. Bound the wait; the stale pending entry is
+        // simply overwritten by any later lookup for the same address.
+        match tokio::time::timeout(Duration::from_secs(2), rx).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(e)) => Err(Error::other(e)),
+            Err(_) => {
+                if let AddressingInner::Local { cache, .. } = &self.inner {
+                    cache.insert(addr, CacheEntry::Negative(tokio::time::Instant::now() + Duration::from_secs(60)));
+                }
+                Err(Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "AARP lookup for {}.{} timed out",
+                        addr.network_number, addr.node_number
+                    ),
+                ))
+            }
         }
     }
 
@@ -652,12 +724,77 @@ impl AddressingHandle {
             // AARP is not used on LocalTalk; address assignment uses LLAP ENQ/ACK instead.
             AddressSource::LocalTalk => return Ok(()),
         };
-        cache.insert(headers.sender_protocol, node);
+        cache.insert(headers.sender_protocol, CacheEntry::Valid(node));
 
         packet_send
             .try_send((headers, source))
             .map_err(Error::other)?;
 
         Ok(())
+    }
+
+    /// Move an EtherTalk interface's address inside `[lo..=hi]` if it isn't
+    /// already, probing candidates via AARP so we don't collide with a node that
+    /// already owns the address.
+    pub async fn acquire_in_range(&self, lo: u16, hi: u16) {
+        const MAX_CANDIDATES: usize = 8;
+        let cur = match self.addr().await {
+            Ok(cur) => cur,
+            Err(e) => {
+                tracing::warn!("addressing: could not read current address: {e}");
+                return;
+            }
+        };
+        if lo <= cur.network_number && cur.network_number <= hi {
+            return;
+        }
+
+        for _ in 0..MAX_CANDIDATES {
+            let candidate = AppleTalkAddress {
+                network_number: rand::rng().random_range(lo..=hi),
+                node_number: rand::rng().random_range(1..=253),
+            };
+            match self.probe(candidate).await {
+                Ok(true) => {
+                    match self.set_addr(candidate).await {
+                        Ok(()) => tracing::info!(
+                            "addressing: adopted EtherTalk address {}.{} inside cable range {lo}-{hi}",
+                            candidate.network_number,
+                            candidate.node_number,
+                        ),
+                        Err(e) => tracing::warn!("addressing: failed to adopt probed address: {e}"),
+                    }
+                    return;
+                }
+                Ok(false) => continue, // in use, next candidate
+                Err(e) => {
+                    tracing::warn!("addressing: address probe failed: {e}");
+                    return;
+                }
+            }
+        }
+        tracing::warn!(
+            "addressing: no free address found in cable range {lo}-{hi} after {MAX_CANDIDATES} probes; keeping {}.{}",
+            cur.network_number,
+            cur.node_number
+        );
+    }
+
+    /// Update the network number of the current address while keeping the node number.
+    /// Used when learning the real network number from a router.
+    pub async fn adopt_network_number(&self, net: u16) {
+        match self.addr().await {
+            Ok(cur) if cur.network_number != net => {
+                let new = AppleTalkAddress {
+                    network_number: net,
+                    node_number: cur.node_number,
+                };
+                if let Err(e) = self.set_addr(new).await {
+                    tracing::warn!("addressing: failed to adopt network number {net}: {e}");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("addressing: could not read current address: {e}"),
+        }
     }
 }

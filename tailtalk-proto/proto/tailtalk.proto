@@ -144,6 +144,13 @@ message SendDatagram {
   uint32 ddp_type = 5;
 }
 
+enum AddressSource {
+  ADDRESS_SOURCE_UNKNOWN = 0;
+  ADDRESS_SOURCE_ETHERTALK_PHASE_1 = 1;
+  ADDRESS_SOURCE_ETHERTALK_PHASE_2 = 2;
+  ADDRESS_SOURCE_LOCALTALK = 3;
+}
+
 // Daemon → client datagram, delivered for any open socket.
 message ReceivedDatagram {
   uint32 socket_id = 1; // the local socket this arrived on
@@ -154,6 +161,7 @@ message ReceivedDatagram {
   uint32 dest_socket = 5;
   uint32 ddp_type = 6;
   bytes payload = 7;
+  AddressSource arrival_link = 8;
 }
 
 // ── Routing rules ─────────────────────────────────────────────────────────────
@@ -162,6 +170,7 @@ message Route {
   CableRange range = 1;
   // Router on the local segment that forwards traffic for `range`.
   AppleTalkAddress next_hop = 2;
+  AddressSource interface = 3;
 }
 
 message Zone {

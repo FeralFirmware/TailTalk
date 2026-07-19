@@ -16,12 +16,14 @@ use crate::{
     DataLinkPacket, DataLinkProtocol, OutboundHandle,
     addressing::{Addressing, AddressingHandle, Node},
     remote::RemoteClient,
-    route_table::{NextHop, RouteTable},
+    route_table::{Interface, NextHop, RouteTable},
 };
 
 pub struct Packet {
     pub headers: DdpHeaders,
     pub payload: Box<[u8]>,
+    /// Which link the packet arrived on. Now carried by the daemon proto as well.
+    pub source: AppleTalkAddressSource,
 }
 
 #[derive(Debug)]
@@ -205,6 +207,30 @@ pub struct DdpProcessor {
 }
 
 impl DdpProcessor {
+    async fn et_addr(&self) -> Result<AppleTalkAddress, Error> {
+        if let Some(et) = &self.et_addressing {
+            if let Some(watch) = et.addr_watch()
+                && let Some(addr) = *watch.borrow() {
+                    return Ok(addr);
+                }
+            et.addr().await
+        } else {
+            Err(Error::new(io::ErrorKind::NotFound, "no EtherTalk interface"))
+        }
+    }
+
+    async fn lt_addr(&self) -> Result<AppleTalkAddress, Error> {
+        if let Some(lt) = &self.lt_addressing {
+            if let Some(watch) = lt.addr_watch()
+                && let Some(addr) = *watch.borrow() {
+                    return Ok(addr);
+                }
+            lt.addr().await
+        } else {
+            Err(Error::new(io::ErrorKind::NotFound, "no LocalTalk interface"))
+        }
+    }
+
     pub fn spawn(
         et_addressing: Option<AddressingHandle>,
         lt_addressing: Option<AddressingHandle>,
@@ -323,13 +349,13 @@ impl DdpProcessor {
         };
         let is_for_us = packet.headers.dest_node_id == 255 || {
             let mut matched = false;
-            if let Some(et) = &self.et_addressing
-                && let Ok(our) = et.addr().await {
+            if self.et_addressing.is_some()
+                && let Ok(our) = self.et_addr().await {
                     matched |= our.matches(&dest, packet.source);
             }
             if !matched
-                && let Some(lt) = &self.lt_addressing
-                && let Ok(our) = lt.addr().await {
+                && self.lt_addressing.is_some()
+                && let Ok(our) = self.lt_addr().await {
                     matched |= our.matches(&dest, packet.source);
             }
             matched
@@ -345,6 +371,7 @@ impl DdpProcessor {
             match socket.try_send(Packet {
                 headers: packet.headers,
                 payload: packet.payload,
+                source: packet.source,
             }) {
                 Ok(_) => {}
                 Err(TrySendError::Closed(_)) => {
@@ -361,7 +388,13 @@ impl DdpProcessor {
 
     /// Hand an outbound packet addressed to ourselves straight to the target
     /// local socket, synthesizing the headers a wire reception would carry.
-    fn deliver_local(&mut self, packet: &OutboundPacket, our_addr: AppleTalkAddress) {
+    /// `source` is the link of the interface whose address matched.
+    fn deliver_local(
+        &mut self,
+        packet: &OutboundPacket,
+        our_addr: AppleTalkAddress,
+        source: AppleTalkAddressSource,
+    ) {
         let headers = DdpHeaders {
             hop_count: 0,
             len: packet.payload.len() + DdpHeaders::LEN,
@@ -379,6 +412,7 @@ impl DdpProcessor {
             match socket.try_send(Packet {
                 headers,
                 payload: packet.payload.clone(),
+                source,
             }) {
                 Ok(_) => {}
                 Err(TrySendError::Closed(_)) => {
@@ -398,14 +432,14 @@ impl DdpProcessor {
         // all nodes on each cable receive it, regardless of their network number.
         if packet.dest.addr.network_number == 0 && packet.dest.addr.node_number == 255 {
             let mut sent = false;
-            if let Some(et) = &self.et_addressing {
-                let et_addr = et.addr().await.unwrap();
+            if self.et_addressing.is_some() {
+                let et_addr = self.et_addr().await.unwrap();
                 let dest_node = Node::EtherTalkPhase2(Addressing::APPLETALK_BROADCAST_MULTICAST);
                 self.send_ddp_to_node(&packet, dest_node, et_addr).await;
                 sent = true;
             }
-            if let Some(lt) = &self.lt_addressing {
-                let lt_addr = lt.addr().await.unwrap();
+            if self.lt_addressing.is_some() {
+                let lt_addr = self.lt_addr().await.unwrap();
                 self.send_ddp_to_node(&packet, Node::LocalTalk(255), lt_addr).await;
                 sent = true;
             }
@@ -425,97 +459,140 @@ impl DdpProcessor {
         // rely on this, e.g. to reach an NBP responder on their own node.
         // Address {0,0} ("any net, any node") conventionally means the node
         // itself — the kernel AppleTalk stacks loop it back the same way.
+        // Network 0 acts as an "our net" wildcard only on links that natively
+        // address with network 0 (LocalTalk, Phase 1 EtherTalk); on Phase 2
+        // {0, N} names a node on such a cable, not us.
         let dest = packet.dest.addr;
         let to_self = dest.network_number == 0 && dest.node_number == 0;
         if let Some(et) = &self.et_addressing
-            && let Ok(our) = et.addr().await
+            && let Ok(our) = self.et_addr().await
             && (to_self
                 || (dest.node_number == our.node_number
-                    && (dest.network_number == our.network_number || dest.network_number == 0)))
+                    && (dest.network_number == our.network_number
+                        || (dest.network_number == 0
+                            && et.phase != AppleTalkAddressSource::EtherTalkPhase2))))
         {
-            self.deliver_local(&packet, our);
+            self.deliver_local(&packet, our, et.phase);
             return;
         }
-        if let Some(lt) = &self.lt_addressing
-            && let Ok(our) = lt.addr().await
+        if self.lt_addressing.is_some()
+            && let Ok(our) = self.lt_addr().await
             && (to_self
                 || (dest.node_number == our.node_number
                     && (dest.network_number == our.network_number || dest.network_number == 0)))
         {
-            self.deliver_local(&packet, our);
+            self.deliver_local(&packet, our, AppleTalkAddressSource::LocalTalk);
             return;
         }
 
         // Routing happens here, not in the caller: first resolve the
         // link-level next hop (the destination itself when it is on one of
         // our cables or unknown, otherwise the responsible router from the
-        // route table), then pick whichever interface reaches that hop.
-        let hop = if dest.network_number == 0 {
+        // route table), then pick the interface that reaches that hop. The
+        // route table remembers which cable dynamic routes and local ranges
+        // belong to; programmatic entries carry no tag, so the fallback
+        // guesses from the address shape and what is configured.
+        let (hop, route_iface) = if dest.network_number == 0 {
             // Network 0 is by definition on the local cable.
-            dest
+            (dest, None)
         } else {
-            match self.route_table.route_for(dest.network_number) {
-                Some(NextHop::Via(router)) => router,
+            match self.route_table.resolve(dest.network_number) {
+                Some(NextHop::Via { router, interface }) => (router, Some(interface)),
                 // On our cable range, or no route known: try it directly.
-                Some(NextHop::Local) | None => dest,
+                Some(NextHop::Local(interface)) => (dest, Some(interface)),
+                None => (dest, None),
             }
         };
 
-        let dest_node = if hop.network_number == 0 {
-            // Network 0 is ambiguous between LocalTalk and nonextended
-            // (Phase 1) EtherTalk. With only one of the two configured,
-            // there's nothing to disambiguate — it must be that one. With
-            // both configured, check whether this node has actually been
-            // learned as an EtherTalk Phase 1 peer (e.g. from a packet it
-            // sent us); only fall back to LocalTalk if it hasn't.
-            match (&self.lt_addressing, &self.et_addressing) {
-                (Some(_), None) => Node::LocalTalk(hop.node_number),
-                (None, Some(et)) => match et.try_lookup(&hop) {
-                    Some(node) => node,
-                    None => {
+        let dest_node = match route_iface {
+            Some(Interface::LocalTalk) if self.lt_addressing.is_some() => {
+                Node::LocalTalk(hop.node_number)
+            }
+            Some(Interface::EtherTalk) if self.et_addressing.is_some() => {
+                match self.et_addressing.as_ref().unwrap().lookup(hop).await {
+                    Ok(node) => node,
+                    Err(e) => {
                         tracing::error!(
-                            "DDP: dropping packet to {}.{} — next hop {}.{} is on network 0 but no EtherTalk Phase 1 binding is cached for it",
+                            "DDP: dropping packet to {}.{} — AARP lookup for next hop {}.{} failed: {e}",
                             dest.network_number, dest.node_number,
                             hop.network_number, hop.node_number,
                         );
                         return;
                     }
-                },
-                (Some(_), Some(et)) => et.try_lookup(&hop).unwrap_or(Node::LocalTalk(hop.node_number)),
-                (None, None) => {
-                    tracing::error!(
-                        "DDP: dropping packet to {}.{} — next hop {}.{} is on network 0, but no interfaces are configured",
-                        dest.network_number, dest.node_number,
-                        hop.network_number, hop.node_number,
-                    );
-                    return;
                 }
             }
-        } else {
-            let Some(et) = &self.et_addressing else {
-                tracing::error!(
-                    "DDP: dropping packet to {}.{} — next hop {}.{} needs EtherTalk, which is not configured",
-                    dest.network_number, dest.node_number,
-                    hop.network_number, hop.node_number,
-                );
-                return;
-            };
-            match et.lookup(hop).await {
-                Ok(node) => node,
-                Err(e) => {
-                    tracing::error!(
-                        "DDP: dropping packet to {}.{} — AARP lookup for next hop {}.{} failed: {e}",
-                        dest.network_number, dest.node_number,
-                        hop.network_number, hop.node_number,
-                    );
-                    return;
+            // No (usable) interface recorded for this hop — fall back on the
+            // address shape and the configured interfaces.
+            _ if hop.network_number == 0 => {
+                // Network 0 is ambiguous between LocalTalk and nonextended
+                // (Phase 1) EtherTalk. With only one of the two configured,
+                // there's nothing to disambiguate — it must be that one. With
+                // both configured, check whether this node has actually been
+                // learned as an EtherTalk Phase 1 peer (e.g. from a packet it
+                // sent us); only fall back to LocalTalk if it hasn't.
+                match (&self.lt_addressing, &self.et_addressing) {
+                    (Some(_), None) => Node::LocalTalk(hop.node_number),
+                    (None, Some(et)) => match et.try_lookup(&hop) {
+                        Some(node) => node,
+                        None => {
+                            tracing::error!(
+                                "DDP: dropping packet to {}.{} — next hop {}.{} is on network 0 but no EtherTalk Phase 1 binding is cached for it",
+                                dest.network_number, dest.node_number,
+                                hop.network_number, hop.node_number,
+                            );
+                            return;
+                        }
+                    },
+                    (Some(_), Some(et)) => et.try_lookup(&hop).unwrap_or(Node::LocalTalk(hop.node_number)),
+                    (None, None) => {
+                        tracing::error!(
+                            "DDP: dropping packet to {}.{} — next hop {}.{} is on network 0, but no interfaces are configured",
+                            dest.network_number, dest.node_number,
+                            hop.network_number, hop.node_number,
+                        );
+                        return;
+                    }
+                }
+            }
+            _ => {
+                // Nonzero network, unknown cable: on a single-interface stack
+                // the hop can only be on that interface. With both, try AARP
+                // on EtherTalk first and treat silence as "must be the
+                // LocalTalk cable".
+                match (&self.lt_addressing, &self.et_addressing) {
+                    (Some(_), None) => Node::LocalTalk(hop.node_number),
+                    (None, Some(et)) | (Some(_), Some(et)) => match et.lookup(hop).await {
+                        Ok(node) => node,
+                        Err(e) if self.lt_addressing.is_some() => {
+                            tracing::debug!(
+                                "DDP: AARP found nothing for next hop {}.{} ({e}); assuming it is on the LocalTalk cable",
+                                hop.network_number, hop.node_number,
+                            );
+                            Node::LocalTalk(hop.node_number)
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "DDP: dropping packet to {}.{} — AARP lookup for next hop {}.{} failed: {e}",
+                                dest.network_number, dest.node_number,
+                                hop.network_number, hop.node_number,
+                            );
+                            return;
+                        }
+                    },
+                    (None, None) => {
+                        tracing::error!(
+                            "DDP: dropping packet to {}.{} — no interfaces are configured",
+                            dest.network_number, dest.node_number,
+                        );
+                        return;
+                    }
                 }
             }
         };
 
         let our_addr = match &dest_node {
-            Node::LocalTalk(_) => self.lt_addressing.as_ref().unwrap().addr().await.unwrap(),
-            _ => self.et_addressing.as_ref().unwrap().addr().await.unwrap(),
+            Node::LocalTalk(_) => self.lt_addr().await.unwrap(),
+            _ => self.et_addr().await.unwrap(),
         };
 
         self.send_ddp_to_node(&packet, dest_node, our_addr).await;

@@ -38,6 +38,10 @@ pub struct DaemonConfig {
     pub localtalk_node: Option<u8>,
     /// LocalTalk pcap capture path.
     pub pcap: Option<PathBuf>,
+    /// Disable the daemon's own RTMP listener and ZIP client (DDP sockets 1
+    /// and 6). Needed when a client such as netatalk's `atalkd` runs its own
+    /// router engines over this daemon and must bind those sockets itself.
+    pub no_router_discovery: bool,
 }
 
 // ── Daemon state ──────────────────────────────────────────────────────────────
@@ -94,6 +98,10 @@ impl Daemon {
 
         if let Some(ref path) = config.pcap {
             builder = builder.pcap_capture(path);
+        }
+
+        if config.no_router_discovery {
+            builder = builder.disable_router_discovery();
         }
 
         let underlay = builder.build_underlay().await?;
@@ -309,7 +317,7 @@ impl Session {
             }
             Kind::SetLocalRange(r) => match r.range.and_then(range_from_proto) {
                 Some((lo, hi)) => {
-                    self.state.route_table.set_local_range(lo, hi);
+                    self.state.route_table.set_local_range_for(tailtalk::route_table::Interface::EtherTalk, lo, hi);
                     proto::Reply::ok(id)
                 }
                 None => invalid(id, "set_local_range requires a valid range"),
@@ -539,6 +547,12 @@ impl Session {
         let (Ok(network), Ok(node)) = (u16::try_from(nh.network), u8::try_from(nh.node)) else {
             return invalid(id, "next_hop out of range");
         };
+        let interface = match route.interface {
+            1 => Some(tailtalk::route_table::Interface::EtherTalk),
+            2 => Some(tailtalk::route_table::Interface::EtherTalk),
+            3 => Some(tailtalk::route_table::Interface::LocalTalk),
+            _ => None,
+        };
         self.state.route_table.insert_route(
             lo,
             hi,
@@ -546,6 +560,7 @@ impl Session {
                 network_number: network,
                 node_number: node,
             },
+            interface.unwrap_or(tailtalk::route_table::Interface::EtherTalk),
         );
         proto::Reply::ok(id)
     }
@@ -575,12 +590,17 @@ fn routes_to_proto(table: &RouteTable) -> proto::ListRoutesReply {
         routes: snapshot
             .routes
             .into_iter()
-            .map(|(lo, hi, next_hop)| proto::Route {
+            .map(|(lo, hi, next_hop, interface)| proto::Route {
                 range: Some(range_to_proto((lo, hi))),
                 next_hop: Some(proto::AppleTalkAddress::new(
                     next_hop.network_number,
                     next_hop.node_number,
                 )),
+                interface: match interface {
+                    Some(tailtalk::route_table::Interface::EtherTalk) => 2,
+                    Some(tailtalk::route_table::Interface::LocalTalk) => 3,
+                    None => 0,
+                },
             })
             .collect(),
         zones: snapshot
@@ -634,6 +654,11 @@ async fn socket_pump_inbound(
             dest_socket: h.dest_sock_num as u32,
             ddp_type: u8::from(h.protocol_typ) as u32,
             payload: pkt.payload.into_vec(),
+            arrival_link: match pkt.source {
+                tailtalk_packets::aarp::AddressSource::EtherTalkPhase1 => 1,
+                tailtalk_packets::aarp::AddressSource::EtherTalkPhase2 => 2,
+                tailtalk_packets::aarp::AddressSource::LocalTalk => 3,
+            },
         };
         if out_tx.send(proto::ServerMessage::datagram(datagram)).await.is_err() {
             break;
