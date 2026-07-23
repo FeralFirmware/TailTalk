@@ -10,7 +10,7 @@
 /// to the printer, which is much faster - it typically starts printing as soon as the job is fully sent.
 /// The rasterization is done via Ghostscript, which must be installed on the system for this to work.
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::{Cursor, Read as _, Write as _},
     net::IpAddr,
     sync::{Arc, atomic::{AtomicU32, Ordering}},
@@ -18,7 +18,7 @@ use std::{
 };
 
 use axum::{Router, body::Bytes, extract::{Path, State}, routing::post};
-use ipp::{parser::IppParser, prelude::*, reader::IppReader};
+use ipp::{parser::IppParser, prelude::*, reader::IppReader, value::IppName};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tailtalk::{
     CancellationToken,
@@ -48,11 +48,98 @@ const STANDARD_MEDIA: &[&str] = &[
     "iso_dl_110x220mm",
 ];
 
-// Extra sizes the StyleWriter's sheet feeder handles beyond STANDARD_MEDIA.
-// "invoice" is the PWG self-describing name for half letter / statement.
+// Extra sizes the StyleWriter's sheet feeder handles beyond STANDARD_MEDIA:
+// half-letter plus the common photo print sizes its color cartridge targets.
+// "invoice" is the PWG self-describing name for half letter / statement;
+// "index-*" names are PWG's self-describing terms for photo index prints.
 const STYLEWRITER_EXTRA_MEDIA: &[&str] = &[
     "na_invoice_5.5x8.5in",
+    "na_index-3x5_3x5in",
+    "na_index-4x6_4x6in",
+    "na_5x7_5x7in",
+    "na_8x10_8x10in",
 ];
+
+/// Physical dimensions, in hundredths of a millimeter (PWG 5100.3 units), for
+/// every PWG self-describing media name in STANDARD_MEDIA/STYLEWRITER_EXTRA_MEDIA.
+/// Backs media-size-supported/media-col-database: IPP Everywhere clients (macOS,
+/// iOS) need the actual dimensions to build a paper-size picker — media-supported
+/// keywords alone leave them showing only the default size.
+const MEDIA_DIMENSIONS_HMM: &[(&str, i32, i32)] = &[
+    ("na_letter_8.5x11in", 21590, 27940),
+    ("na_legal_8.5x14in", 21590, 35560),
+    ("iso_a4_210x297mm", 21000, 29700),
+    ("iso_b5_176x250mm", 17600, 25000),
+    ("na_executive_7.25x10.5in", 18415, 26670),
+    ("na_number-10_4.125x9.5in", 10477, 24130),
+    ("na_monarch_3.875x7.5in", 9843, 19050),
+    ("iso_c5_162x229mm", 16200, 22900),
+    ("iso_dl_110x220mm", 11000, 22000),
+    ("na_invoice_5.5x8.5in", 13970, 21590),
+    ("na_index-3x5_3x5in", 7620, 12700),
+    ("na_index-4x6_4x6in", 10160, 15240),
+    ("na_5x7_5x7in", 12700, 17780),
+    ("na_8x10_8x10in", 20320, 25400),
+];
+
+fn media_dimensions_hmm(name: &str) -> Option<(i32, i32)> {
+    MEDIA_DIMENSIONS_HMM.iter().find(|(n, _, _)| *n == name).map(|&(_, w, h)| (w, h))
+}
+
+/// The StyleWriter carriage/feed path's design width: 8.5in (215.9mm), the US
+/// Letter width `lpstyl`, this bridge's margins, and Apple's own PPD all
+/// assume. Nothing wider physically clears the print head regardless of what
+/// gets added to STANDARD_MEDIA/STYLEWRITER_EXTRA_MEDIA later.
+const SW_MAX_PAPER_WIDTH_HMM: i32 = 21590;
+
+fn fits_stylewriter_carriage(name: &str) -> bool {
+    match media_dimensions_hmm(name) {
+        Some((w, _)) => w <= SW_MAX_PAPER_WIDTH_HMM,
+        None => true, // unknown dimensions: nothing to check against, so don't drop it
+    }
+}
+
+/// Builds a `media-size` collection value ({x,y}-dimension in hundredths of mm).
+fn media_size_collection(w: i32, h: i32) -> Option<IppValue> {
+    let x: IppName = "x-dimension".try_into().ok()?;
+    let y: IppName = "y-dimension".try_into().ok()?;
+    Some(IppValue::Collection(BTreeMap::from([(x, IppValue::Integer(w)), (y, IppValue::Integer(h))])))
+}
+
+/// StyleWriter margins for a given paper width, in hundredths of a mm
+/// (left, right, top, bottom). Left/top/bottom mirror the fixed crop
+/// constants `sw_printable_rows`/`ppm_page_to_planar` already use; right
+/// varies with paper width because the print head only covers
+/// `SW2200_PRINT_WIDTH` dots; letter-width paper leaves an unprinted strip
+/// on the right, narrower paper (e.g. the photo/index sizes) does not.
+fn stylewriter_margins_hmm(width_hmm: i32) -> (i32, i32, i32, i32) {
+    let px_to_hmm = |px: i32| (px as f64 / SW_DPI as f64 * 2540.0).round() as i32;
+    let hmm_to_px = |hmm: i32| (hmm as f64 / 2540.0 * SW_DPI as f64).round() as i32;
+    let left_px = SW_LEFT_MARGIN_PX as i32;
+    let print_w_px = (hmm_to_px(width_hmm) - left_px).clamp(0, SW2200_PRINT_WIDTH as i32);
+    let right_px = (hmm_to_px(width_hmm) - left_px - print_w_px).max(0);
+    (
+        px_to_hmm(left_px),
+        px_to_hmm(right_px),
+        px_to_hmm(SW_TOP_MARGIN_ROWS as i32),
+        // sw_printable_rows excludes SW_BOTTOM_MARGIN_ROWS + 1 rows, not just SW_BOTTOM_MARGIN_ROWS.
+        px_to_hmm(SW_BOTTOM_MARGIN_ROWS as i32 + 1),
+    )
+}
+
+/// Builds one `media-col-database` entry: the media-size collection plus,
+/// when known, the printer's unprintable margins (left, right, top, bottom).
+fn media_col_entry(w: i32, h: i32, margins: Option<(i32, i32, i32, i32)>) -> Option<IppValue> {
+    let mut members = BTreeMap::new();
+    members.insert("media-size".try_into().ok()?, media_size_collection(w, h)?);
+    if let Some((l, r, t, b)) = margins {
+        members.insert("media-left-margin".try_into().ok()?, IppValue::Integer(l));
+        members.insert("media-right-margin".try_into().ok()?, IppValue::Integer(r));
+        members.insert("media-top-margin".try_into().ok()?, IppValue::Integer(t));
+        members.insert("media-bottom-margin".try_into().ok()?, IppValue::Integer(b));
+    }
+    Some(IppValue::Collection(members))
+}
 
 #[derive(Clone, Debug, PartialEq)]
 enum JobState {
@@ -579,20 +666,12 @@ fn parse_pts_to_media(pts: &str) -> &'static str {
     let (Some(w), Some(h)) = (nums.next(), nums.next()) else {
         return "na_letter_8.5x11in";
     };
-    // Tolerance of 5 points covers rounding in printer firmware.
-    let known: &[(f32, f32, &str)] = &[
-        (612.0, 792.0,  "na_letter_8.5x11in"),
-        (612.0, 1008.0, "na_legal_8.5x14in"),
-        (595.0, 842.0,  "iso_a4_210x297mm"),
-        (516.0, 729.0,  "iso_b5_176x250mm"),
-        (522.0, 756.0,  "na_executive_7.25x10.5in"),
-        (297.0, 684.0,  "na_number-10_4.125x9.5in"),
-        (279.0, 540.0,  "na_monarch_3.875x7.5in"),
-        (459.0, 649.0,  "iso_c5_162x229mm"),
-        (312.0, 624.0,  "iso_dl_110x220mm"),
-    ];
-    for &(pw, ph, name) in known {
-        if (w - pw).abs() < 5.0 && (h - ph).abs() < 5.0 {
+    // Matches against MEDIA_DIMENSIONS_HMM (converted to points) rather than a
+    // second hand-maintained table; tolerance of 5 points covers rounding in
+    // printer firmware.
+    let hmm_to_pt = |hmm: i32| hmm as f32 * 72.0 / 2540.0;
+    for &(name, w_hmm, h_hmm) in MEDIA_DIMENSIONS_HMM {
+        if (w - hmm_to_pt(w_hmm)).abs() < 5.0 && (h - hmm_to_pt(h_hmm)).abs() < 5.0 {
             return name;
         }
     }
@@ -1035,12 +1114,28 @@ fn printer_attributes(printer: &Printer, req_id: u32) -> axum::response::Respons
         let mut media: Vec<&str> = STANDARD_MEDIA.to_vec();
         if printer.kind == PrinterKind::StyleWriter {
             media.extend_from_slice(STYLEWRITER_EXTRA_MEDIA);
+            media.retain(|m| fits_stylewriter_carriage(m));
         }
-        let vals: Vec<IppValue> = media.into_iter()
+        let vals: Vec<IppValue> = media.iter().copied()
             .filter_map(|m| m.try_into().ok())
             .map(IppValue::Keyword)
             .collect();
         add("media-supported", IppValue::Array(vals));
+
+        // LaserWriters aren't cropped by this bridge, so their margins aren't
+        // known here and are left unset.
+        let dims: Vec<(i32, i32)> = media.iter().copied().filter_map(media_dimensions_hmm).collect();
+        let size_vals: Vec<IppValue> = dims.iter().filter_map(|&(w, h)| media_size_collection(w, h)).collect();
+        if !size_vals.is_empty() {
+            add("media-size-supported", IppValue::Array(size_vals));
+        }
+        let col_vals: Vec<IppValue> = dims.iter().filter_map(|&(w, h)| {
+            let margins = (printer.kind == PrinterKind::StyleWriter).then(|| stylewriter_margins_hmm(w));
+            media_col_entry(w, h, margins)
+        }).collect();
+        if !col_vals.is_empty() {
+            add("media-col-database", IppValue::Array(col_vals));
+        }
     }
     if let Ok(k) = caps.media_default.as_str().try_into() {
         add("media-default", IppValue::Keyword(k));
@@ -1114,18 +1209,29 @@ fn doc_format(parsed: &IppRequestResponse) -> String {
 
 /// Extract the `media-source` job attribute, defaulting to `"main"`.
 fn job_media_source(parsed: &IppRequestResponse) -> String {
-    parsed.attributes()
+    let group = parsed.attributes()
         .groups_of(DelimiterTag::JobAttributes)
-        .next()
+        .next();
+
+    let media_source = group
         .and_then(|g| g.attributes().get("media-source"))
-        .and_then(|a| {
-            if let IppValue::Keyword(k) = a.value() {
-                Some(k.as_str().to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| "main".to_string())
+        .and_then(|a| match a.value() {
+            IppValue::Keyword(k) => Some(k.as_str().to_string()),
+            _ => None,
+        });
+
+    // PPD-backed CUPS queues (e.g. macOS's built-in "Generic PostScript
+    // Printer") never send the PWG media-source keyword at all — tray
+    // choice comes across as the PPD's own InputSlot keyword instead.
+    let input_slot = group
+        .and_then(|g| g.attributes().get("InputSlot"))
+        .and_then(|a| match a.value() {
+            IppValue::NameWithoutLanguage(n) => Some(n.as_str().to_lowercase()),
+            IppValue::Keyword(k) => Some(k.as_str().to_lowercase()),
+            _ => None,
+        });
+
+    media_source.or(input_slot).unwrap_or_else(|| "main".to_string())
 }
 
 /// Extract the requested color mode: `print-color-mode`, falling back to the
@@ -1344,6 +1450,14 @@ async fn gs_raster(mut data: Vec<u8>, fmt: &str, device: &str, dpi: u32, job_tok
 async fn rasterize_to_ps(data: Vec<u8>, fmt: &str, tray_source: &str, dpi: u32, job_token: u32) -> anyhow::Result<(Vec<u8>, usize)> {
     if fmt == "application/postscript" || fmt == "application/vnd.cups-postscript" {
         let page_count = data.windows(7).filter(|w| *w == b"%%Page:").count().max(1);
+        // The client's own PostScript never encodes IPP-level tray choice
+        // (that's carried out-of-band as the media-source job attribute), so
+        // it has to be injected here even on the passthrough path or manual
+        // feed silently has no effect.
+        let data = match tray_setpagedevice(tray_source) {
+            Some(cmd) => inject_ps_setup(data, cmd),
+            None => data,
+        };
         return Ok((data, page_count));
     }
 
@@ -1671,6 +1785,56 @@ fn encode_asciihex(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The `setpagedevice` call, if any, that selects the given IPP
+/// `media-source` keyword on a LaserWriter.
+fn tray_setpagedevice(tray_source: &str) -> Option<&'static str> {
+    match tray_source {
+        "manual" => Some("<< /ManualFeed true >> setpagedevice"),
+        "alternate" => Some("<< /MediaPosition 1 >> setpagedevice"),
+        _ => None,
+    }
+}
+
+/// Insert a tray-selecting `setpagedevice` call ahead of the first page of a
+/// pass-through PostScript job, so IPP media-source selection still applies
+/// when the document is a native PS job forwarded to the printer's own
+/// interpreter rather than rasterized by us.
+fn inject_ps_setup(data: Vec<u8>, cmd: &str) -> Vec<u8> {
+    let needle = b"%%Page:";
+    if let Some(pos) = data.windows(needle.len()).position(|w| w == needle) {
+        let line_start = data[..pos]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let mut out = Vec::with_capacity(data.len() + cmd.len() + 32);
+        out.extend_from_slice(&data[..line_start]);
+        out.extend_from_slice(b"%%BeginSetup\n");
+        out.extend_from_slice(cmd.as_bytes());
+        out.extend_from_slice(b"\n%%EndSetup\n");
+        out.extend_from_slice(&data[line_start..]);
+        out
+    } else {
+        // No DSC page markers found; run the command right after the header
+        // line so it still executes before any page content.
+        let mut out = Vec::with_capacity(data.len() + cmd.len() + 16);
+        match data.iter().position(|&b| b == b'\n') {
+            Some(nl) => {
+                out.extend_from_slice(&data[..=nl]);
+                out.extend_from_slice(cmd.as_bytes());
+                out.push(b'\n');
+                out.extend_from_slice(&data[nl + 1..]);
+            }
+            None => {
+                out.extend_from_slice(cmd.as_bytes());
+                out.push(b'\n');
+                out.extend_from_slice(&data);
+            }
+        }
+        out
+    }
+}
+
 /// Assemble a multi-page PS document from rasterized PBM pages.
 fn build_ps_raster(pages: &[(u32, u32, Vec<u8>)], dpi: u32, tray_source: &str) -> Vec<u8> {
     let mut out = Vec::new();
@@ -1678,18 +1842,10 @@ fn build_ps_raster(pages: &[(u32, u32, Vec<u8>)], dpi: u32, tray_source: &str) -
     let _ = writeln!(out, "%%LanguageLevel: 2");
     let _ = writeln!(out, "%%Pages: {}", pages.len());
     let _ = writeln!(out, "%%EndComments");
-    match tray_source {
-        "manual" => {
-            let _ = writeln!(out, "%%BeginSetup");
-            let _ = writeln!(out, "<< /ManualFeed true >> setpagedevice");
-            let _ = writeln!(out, "%%EndSetup");
-        }
-        "alternate" => {
-            let _ = writeln!(out, "%%BeginSetup");
-            let _ = writeln!(out, "<< /MediaPosition 1 >> setpagedevice");
-            let _ = writeln!(out, "%%EndSetup");
-        }
-        _ => {}
+    if let Some(cmd) = tray_setpagedevice(tray_source) {
+        let _ = writeln!(out, "%%BeginSetup");
+        let _ = writeln!(out, "{cmd}");
+        let _ = writeln!(out, "%%EndSetup");
     }
     for (i, (width, height, bitmap)) in pages.iter().enumerate() {
         let (width, height) = (*width, *height);
@@ -1745,6 +1901,16 @@ fn parse_printer_error(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_advertised_media_have_dimensions() {
+        // fits_stylewriter_carriage() and the media-size-supported/media-col-database
+        // builders silently skip any name missing from MEDIA_DIMENSIONS_HMM; this
+        // guarantees that never happens for what's actually advertised.
+        for name in STANDARD_MEDIA.iter().chain(STYLEWRITER_EXTRA_MEDIA.iter()) {
+            assert!(media_dimensions_hmm(name).is_some(), "{name} has no MEDIA_DIMENSIONS_HMM entry");
+        }
+    }
 
     #[test]
     fn test_parse_ppm_pages_concatenated() {
