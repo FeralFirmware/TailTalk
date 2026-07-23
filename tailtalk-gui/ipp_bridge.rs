@@ -10,7 +10,7 @@
 /// to the printer, which is much faster - it typically starts printing as soon as the job is fully sent.
 /// The rasterization is done via Ghostscript, which must be installed on the system for this to work.
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io::{Cursor, Read as _, Write as _},
     net::IpAddr,
     sync::{Arc, atomic::{AtomicU32, Ordering}},
@@ -18,7 +18,7 @@ use std::{
 };
 
 use axum::{Router, body::Bytes, extract::{Path, State}, routing::post};
-use ipp::{parser::IppParser, prelude::*, reader::IppReader};
+use ipp::{parser::IppParser, prelude::*, reader::IppReader, value::IppName};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tailtalk::{
     CancellationToken,
@@ -48,11 +48,98 @@ const STANDARD_MEDIA: &[&str] = &[
     "iso_dl_110x220mm",
 ];
 
-// Extra sizes the StyleWriter's sheet feeder handles beyond STANDARD_MEDIA.
-// "invoice" is the PWG self-describing name for half letter / statement.
+// Extra sizes the StyleWriter's sheet feeder handles beyond STANDARD_MEDIA:
+// half-letter plus the common photo print sizes its color cartridge targets.
+// "invoice" is the PWG self-describing name for half letter / statement;
+// "index-*" names are PWG's self-describing terms for photo index prints.
 const STYLEWRITER_EXTRA_MEDIA: &[&str] = &[
     "na_invoice_5.5x8.5in",
+    "na_index-3x5_3x5in",
+    "na_index-4x6_4x6in",
+    "na_5x7_5x7in",
+    "na_8x10_8x10in",
 ];
+
+/// Physical dimensions, in hundredths of a millimeter (PWG 5100.3 units), for
+/// every PWG self-describing media name in STANDARD_MEDIA/STYLEWRITER_EXTRA_MEDIA.
+/// Backs media-size-supported/media-col-database: IPP Everywhere clients (macOS,
+/// iOS) need the actual dimensions to build a paper-size picker — media-supported
+/// keywords alone leave them showing only the default size.
+const MEDIA_DIMENSIONS_HMM: &[(&str, i32, i32)] = &[
+    ("na_letter_8.5x11in", 21590, 27940),
+    ("na_legal_8.5x14in", 21590, 35560),
+    ("iso_a4_210x297mm", 21000, 29700),
+    ("iso_b5_176x250mm", 17600, 25000),
+    ("na_executive_7.25x10.5in", 18415, 26670),
+    ("na_number-10_4.125x9.5in", 10477, 24130),
+    ("na_monarch_3.875x7.5in", 9843, 19050),
+    ("iso_c5_162x229mm", 16200, 22900),
+    ("iso_dl_110x220mm", 11000, 22000),
+    ("na_invoice_5.5x8.5in", 13970, 21590),
+    ("na_index-3x5_3x5in", 7620, 12700),
+    ("na_index-4x6_4x6in", 10160, 15240),
+    ("na_5x7_5x7in", 12700, 17780),
+    ("na_8x10_8x10in", 20320, 25400),
+];
+
+fn media_dimensions_hmm(name: &str) -> Option<(i32, i32)> {
+    MEDIA_DIMENSIONS_HMM.iter().find(|(n, _, _)| *n == name).map(|&(_, w, h)| (w, h))
+}
+
+/// The StyleWriter carriage/feed path's design width: 8.5in (215.9mm), the US
+/// Letter width `lpstyl`, this bridge's margins, and Apple's own PPD all
+/// assume. Nothing wider physically clears the print head regardless of what
+/// gets added to STANDARD_MEDIA/STYLEWRITER_EXTRA_MEDIA later.
+const SW_MAX_PAPER_WIDTH_HMM: i32 = 21590;
+
+fn fits_stylewriter_carriage(name: &str) -> bool {
+    match media_dimensions_hmm(name) {
+        Some((w, _)) => w <= SW_MAX_PAPER_WIDTH_HMM,
+        None => true, // unknown dimensions: nothing to check against, so don't drop it
+    }
+}
+
+/// Builds a `media-size` collection value ({x,y}-dimension in hundredths of mm).
+fn media_size_collection(w: i32, h: i32) -> Option<IppValue> {
+    let x: IppName = "x-dimension".try_into().ok()?;
+    let y: IppName = "y-dimension".try_into().ok()?;
+    Some(IppValue::Collection(BTreeMap::from([(x, IppValue::Integer(w)), (y, IppValue::Integer(h))])))
+}
+
+/// StyleWriter margins for a given paper width, in hundredths of a mm
+/// (left, right, top, bottom). Left/top/bottom mirror the fixed crop
+/// constants `sw_printable_rows`/`ppm_page_to_planar` already use; right
+/// varies with paper width because the print head only covers
+/// `SW2200_PRINT_WIDTH` dots; letter-width paper leaves an unprinted strip
+/// on the right, narrower paper (e.g. the photo/index sizes) does not.
+fn stylewriter_margins_hmm(width_hmm: i32) -> (i32, i32, i32, i32) {
+    let px_to_hmm = |px: i32| (px as f64 / SW_DPI as f64 * 2540.0).round() as i32;
+    let hmm_to_px = |hmm: i32| (hmm as f64 / 2540.0 * SW_DPI as f64).round() as i32;
+    let left_px = SW_LEFT_MARGIN_PX as i32;
+    let print_w_px = (hmm_to_px(width_hmm) - left_px).clamp(0, SW2200_PRINT_WIDTH as i32);
+    let right_px = (hmm_to_px(width_hmm) - left_px - print_w_px).max(0);
+    (
+        px_to_hmm(left_px),
+        px_to_hmm(right_px),
+        px_to_hmm(SW_TOP_MARGIN_ROWS as i32),
+        // sw_printable_rows excludes SW_BOTTOM_MARGIN_ROWS + 1 rows, not just SW_BOTTOM_MARGIN_ROWS.
+        px_to_hmm(SW_BOTTOM_MARGIN_ROWS as i32 + 1),
+    )
+}
+
+/// Builds one `media-col-database` entry: the media-size collection plus,
+/// when known, the printer's unprintable margins (left, right, top, bottom).
+fn media_col_entry(w: i32, h: i32, margins: Option<(i32, i32, i32, i32)>) -> Option<IppValue> {
+    let mut members = BTreeMap::new();
+    members.insert("media-size".try_into().ok()?, media_size_collection(w, h)?);
+    if let Some((l, r, t, b)) = margins {
+        members.insert("media-left-margin".try_into().ok()?, IppValue::Integer(l));
+        members.insert("media-right-margin".try_into().ok()?, IppValue::Integer(r));
+        members.insert("media-top-margin".try_into().ok()?, IppValue::Integer(t));
+        members.insert("media-bottom-margin".try_into().ok()?, IppValue::Integer(b));
+    }
+    Some(IppValue::Collection(members))
+}
 
 #[derive(Clone, Debug, PartialEq)]
 enum JobState {
@@ -89,6 +176,10 @@ enum PrinterKind {
     /// Color StyleWriter behind an EtherTalk adapter, driven over ADSP
     /// (NBP type "ColorStyleWriter2400AT").
     StyleWriter,
+    /// Apple ImageWriter II driven over PAP (NBP type "ImageWriter"). No
+    /// PostScript interpreter, so every job goes through Ghostscript's
+    /// `iwhi` device rather than being handed the client's document as-is.
+    ImageWriter,
 }
 
 /// StyleWriters print at a fixed 360 dpi.
@@ -98,6 +189,19 @@ const SW_DPI: u32 = 360;
 const SW_LEFT_MARGIN_PX: usize = 72;
 const SW_TOP_MARGIN_ROWS: usize = 90;
 const SW_BOTTOM_MARGIN_ROWS: usize = 90;
+
+/// Ghostscript's `iwhi` device (ImageWriter II) is 160x144 dpi; report the
+/// lower (vertical) figure for `printer-resolution-*` since IPP wants one
+/// symmetric value and this errs toward not overstating detail.
+const IW_DPI: u32 = 144;
+/// Physical carriage width: Ghostscript's `iwhi` device page geometry
+/// crashes if asked for anything wider (confirmed empirically).
+const IW_MAX_WIDTH_PT: f32 = 612.0;
+/// Page height must be an exact multiple of this many points (48 dots at
+/// 144dpi) — confirmed empirically by sweeping heights against real output;
+/// anything else makes gdevadmp's internal band-buffer sizing return a
+/// negative "unexpected value" and abort the whole job.
+const IW_HEIGHT_GRANULARITY_PT: f32 = 24.0;
 
 #[derive(Clone)]
 struct PrinterCaps {
@@ -274,6 +378,7 @@ fn printer_key(kind: PrinterKind, name: &str, addr: ServiceAddress) -> String {
     match kind {
         PrinterKind::LaserWriter => format!("{key}-{a}"),
         PrinterKind::StyleWriter => format!("{key}-{a}-sw"),
+        PrinterKind::ImageWriter => format!("{key}-{a}-iw"),
     }
 }
 
@@ -285,9 +390,10 @@ async fn discover(
     bridged_names: &crate::lw_bridge::BridgedNames,
 ) {
     // (kind, NBP type pattern) for each supported printer family.
-    let lookups: [(PrinterKind, &str); 2] = [
+    let lookups: [(PrinterKind, &str); 3] = [
         (PrinterKind::LaserWriter, "=:LaserWriter@*"),
         (PrinterKind::StyleWriter, "=:ColorStyleWriter2400AT@*"),
+        (PrinterKind::ImageWriter, "=:ImageWriter@*"),
     ];
 
     let entities: Vec<(PrinterKind, EntityName)> = lookups
@@ -377,6 +483,9 @@ async fn discover(
                     }
                 }
             }
+            // No PostScript to query and no cartridge-style capability probe worth
+            // having yet — every ImageWriter II gets the same fixed caps.
+            PrinterKind::ImageWriter => default_imagewriter_caps(),
         };
 
         // When two devices share a name, the mDNS instance name (which must be
@@ -442,6 +551,19 @@ fn default_stylewriter_caps() -> PrinterCaps {
         dpi: SW_DPI,
         color: true,
         model: "Apple Color StyleWriter".to_string(),
+        media_default: "na_letter_8.5x11in".to_string(),
+        tray_sources: vec!["main".into()],
+    }
+}
+
+/// Fixed caps for every ImageWriter II: there's no PostScript to query, no
+/// AppleTalk-visible cartridge/paper state to probe (unlike the StyleWriter),
+/// and the device is mono-only in the `iwhi` Ghostscript path we use.
+fn default_imagewriter_caps() -> PrinterCaps {
+    PrinterCaps {
+        dpi: IW_DPI,
+        color: false,
+        model: "Apple ImageWriter II".to_string(),
         media_default: "na_letter_8.5x11in".to_string(),
         tray_sources: vec!["main".into()],
     }
@@ -579,24 +701,39 @@ fn parse_pts_to_media(pts: &str) -> &'static str {
     let (Some(w), Some(h)) = (nums.next(), nums.next()) else {
         return "na_letter_8.5x11in";
     };
-    // Tolerance of 5 points covers rounding in printer firmware.
-    let known: &[(f32, f32, &str)] = &[
-        (612.0, 792.0,  "na_letter_8.5x11in"),
-        (612.0, 1008.0, "na_legal_8.5x14in"),
-        (595.0, 842.0,  "iso_a4_210x297mm"),
-        (516.0, 729.0,  "iso_b5_176x250mm"),
-        (522.0, 756.0,  "na_executive_7.25x10.5in"),
-        (297.0, 684.0,  "na_number-10_4.125x9.5in"),
-        (279.0, 540.0,  "na_monarch_3.875x7.5in"),
-        (459.0, 649.0,  "iso_c5_162x229mm"),
-        (312.0, 624.0,  "iso_dl_110x220mm"),
-    ];
-    for &(pw, ph, name) in known {
-        if (w - pw).abs() < 5.0 && (h - ph).abs() < 5.0 {
+    // Matches against MEDIA_DIMENSIONS_HMM (converted to points) rather than a
+    // second hand-maintained table; tolerance of 5 points covers rounding in
+    // printer firmware.
+    let hmm_to_pt = |hmm: i32| hmm as f32 * 72.0 / 2540.0;
+    for &(name, w_hmm, h_hmm) in MEDIA_DIMENSIONS_HMM {
+        if (w - hmm_to_pt(w_hmm)).abs() < 5.0 && (h - hmm_to_pt(h_hmm)).abs() < 5.0 {
             return name;
         }
     }
     "na_letter_8.5x11in"
+}
+
+/// A PWG media name → its nominal (width, height) in points, derived from
+/// `MEDIA_DIMENSIONS_HMM` (kept as the single hand-maintained source of truth
+/// rather than a second table — see `parse_pts_to_media`). Rounded to the
+/// nearest point: metric sizes don't land on whole points (e.g. true A4 is
+/// 595.28x841.89pt) and the forced page geometry doesn't need sub-point
+/// precision. Falls back to Letter for anything unrecognized.
+fn media_to_pts(name: &str) -> (f32, f32) {
+    let hmm_to_pt = |hmm: i32| (hmm as f32 * 72.0 / 2540.0).round();
+    media_dimensions_hmm(name)
+        .map(|(w, h)| (hmm_to_pt(w), hmm_to_pt(h)))
+        .unwrap_or((612.0, 792.0))
+}
+
+/// Clamp a requested page size to what Ghostscript's `iwhi` device can
+/// actually produce without crashing (see `IW_MAX_WIDTH_PT` /
+/// `IW_HEIGHT_GRANULARITY_PT`). Floors rather than rounds so the forced page
+/// is never taller/wider than the paper actually loaded.
+fn imagewriter_safe_page(w: f32, h: f32) -> (f32, f32) {
+    let w = w.min(IW_MAX_WIDTH_PT);
+    let h = (h / IW_HEIGHT_GRANULARITY_PT).floor().max(1.0) * IW_HEIGHT_GRANULARITY_PT;
+    (w, h)
 }
 
 fn ipp_bytes(resp: IppRequestResponse) -> axum::response::Response {
@@ -765,6 +902,7 @@ async fn handle_ipp(
 
             let fmt = doc_format(&parsed);
             let tray = job_media_source(&parsed);
+            let media = job_media(&parsed);
             let mut doc = Vec::new();
             parsed.payload_mut().read_to_end(&mut doc).ok();
             tracing::info!("IPP: PrintJob id={job_id} fmt={fmt:?} doc_bytes={} tray={tray:?}", doc.len());
@@ -834,6 +972,45 @@ async fn handle_ipp(
                     tokio::spawn(run_stylewriter_job(
                         job, ddp, addr, doc, fmt, color, quality, username, job_lock, job_id,
                     ));
+                }
+                PrinterKind::ImageWriter => {
+                    let addr: AtpAddress = printer.addr.into();
+                    // No PostScript interpreter to reinterpret the document's own
+                    // page size, so the client's `media` choice has to be forced
+                    // onto Ghostscript explicitly.
+                    let media_pts = media.as_deref().map(media_to_pts).unwrap_or((612.0, 792.0));
+                    tracing::info!("IPP: ImageWriter job {job_id}: media={media:?} → {media_pts:?}pt");
+                    tokio::spawn(async move {
+                        job.lock().await.state_message = "Rasterizing".to_string();
+                        let raster = match rasterize_for_imagewriter(doc, &fmt, media_pts, job_id).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::error!("IPP: ImageWriter rasterize failed: {e}");
+                                let mut j = job.lock().await;
+                                j.state = JobState::Aborted;
+                                j.state_message = format!("Rasterize failed: {e}");
+                                return;
+                            }
+                        };
+                        tracing::info!("IPP: rasterized ImageWriter job {job_id} to {} bytes", raster.len());
+                        job.lock().await.state_message = "Waiting for printer".to_string();
+                        let _pap_guard = job_lock.lock().await;
+                        job.lock().await.state_message = "Printing".to_string();
+                        match print_to_pap_imagewriter(ddp, addr, raster).await {
+                            Ok(()) => {
+                                let mut j = job.lock().await;
+                                j.impressions_completed = 1;
+                                j.state = JobState::Completed;
+                                j.state_message = "Completed".to_string();
+                            }
+                            Err(e) => {
+                                tracing::error!("IPP: job {job_id} PAP error: {e}");
+                                let mut j = job.lock().await;
+                                j.state = JobState::Aborted;
+                                j.state_message = format!("PAP error: {e}");
+                            }
+                        }
+                    });
                 }
             }
             job_created_response(job_id, &job_uri, req_id)
@@ -916,8 +1093,10 @@ fn printer_attributes(printer: &Printer, req_id: u32) -> axum::response::Respons
 
     // A StyleWriter with a black cartridge really is monochrome-only; the
     // LaserWriter path always accepts color input (ghostscript converts).
+    // ImageWriter is mono-only in the `iwhi` path we use, full stop.
     let color_modes: &[&str] = match printer.kind {
         PrinterKind::StyleWriter if !caps.color => &["monochrome"],
+        PrinterKind::ImageWriter => &["monochrome"],
         _ => &["auto", "color", "monochrome"],
     };
     let color_mode_default = if printer.kind == PrinterKind::StyleWriter && caps.color {
@@ -926,10 +1105,12 @@ fn printer_attributes(printer: &Printer, req_id: u32) -> axum::response::Respons
         "monochrome"
     };
     // StyleWriter quality maps to the printer's own mode string (normal/best);
-    // draft has no known string, so it isn't offered there.
+    // draft has no known string, so it isn't offered there. `iwhi` doesn't
+    // distinguish quality tiers at all, so ImageWriter only offers Normal.
     let qualities: &[i32] = match printer.kind {
         PrinterKind::LaserWriter => &[3, 4, 5],
         PrinterKind::StyleWriter => &[4, 5],
+        PrinterKind::ImageWriter => &[4],
     };
 
     let mut add = |name: &str, val: IppValue| {
@@ -976,7 +1157,11 @@ fn printer_attributes(printer: &Printer, req_id: u32) -> axum::response::Respons
         add("output-mode-supported", IppValue::Array(modes));
     }
     add("pages-per-minute", IppValue::Integer(
-        match printer.kind { PrinterKind::LaserWriter => 8, PrinterKind::StyleWriter => 1 },
+        match printer.kind {
+            PrinterKind::LaserWriter => 8,
+            PrinterKind::StyleWriter => 1,
+            PrinterKind::ImageWriter => 1,
+        },
     ));
     add("pdf-k-octets-supported", IppValue::RangeOfInteger { min: 1, max: 65535 });
     add("jpeg-k-octets-supported", IppValue::RangeOfInteger { min: 1, max: 65535 });
@@ -1035,12 +1220,28 @@ fn printer_attributes(printer: &Printer, req_id: u32) -> axum::response::Respons
         let mut media: Vec<&str> = STANDARD_MEDIA.to_vec();
         if printer.kind == PrinterKind::StyleWriter {
             media.extend_from_slice(STYLEWRITER_EXTRA_MEDIA);
+            media.retain(|m| fits_stylewriter_carriage(m));
         }
-        let vals: Vec<IppValue> = media.into_iter()
+        let vals: Vec<IppValue> = media.iter().copied()
             .filter_map(|m| m.try_into().ok())
             .map(IppValue::Keyword)
             .collect();
         add("media-supported", IppValue::Array(vals));
+
+        // LaserWriters aren't cropped by this bridge, so their margins aren't
+        // known here and are left unset.
+        let dims: Vec<(i32, i32)> = media.iter().copied().filter_map(media_dimensions_hmm).collect();
+        let size_vals: Vec<IppValue> = dims.iter().filter_map(|&(w, h)| media_size_collection(w, h)).collect();
+        if !size_vals.is_empty() {
+            add("media-size-supported", IppValue::Array(size_vals));
+        }
+        let col_vals: Vec<IppValue> = dims.iter().filter_map(|&(w, h)| {
+            let margins = (printer.kind == PrinterKind::StyleWriter).then(|| stylewriter_margins_hmm(w));
+            media_col_entry(w, h, margins)
+        }).collect();
+        if !col_vals.is_empty() {
+            add("media-col-database", IppValue::Array(col_vals));
+        }
     }
     if let Ok(k) = caps.media_default.as_str().try_into() {
         add("media-default", IppValue::Keyword(k));
@@ -1114,18 +1315,45 @@ fn doc_format(parsed: &IppRequestResponse) -> String {
 
 /// Extract the `media-source` job attribute, defaulting to `"main"`.
 fn job_media_source(parsed: &IppRequestResponse) -> String {
+    let group = parsed.attributes()
+        .groups_of(DelimiterTag::JobAttributes)
+        .next();
+
+    let media_source = group
+        .and_then(|g| g.attributes().get("media-source"))
+        .and_then(|a| match a.value() {
+            IppValue::Keyword(k) => Some(k.as_str().to_string()),
+            _ => None,
+        });
+
+    // PPD-backed CUPS queues (e.g. macOS's built-in "Generic PostScript
+    // Printer") never send the PWG media-source keyword at all — tray
+    // choice comes across as the PPD's own InputSlot keyword instead.
+    let input_slot = group
+        .and_then(|g| g.attributes().get("InputSlot"))
+        .and_then(|a| match a.value() {
+            IppValue::NameWithoutLanguage(n) => Some(n.as_str().to_lowercase()),
+            IppValue::Keyword(k) => Some(k.as_str().to_lowercase()),
+            _ => None,
+        });
+
+    media_source.or(input_slot).unwrap_or_else(|| "main".to_string())
+}
+
+/// Extract the `media` job attribute (a PWG media keyword, e.g.
+/// `na_letter_8.5x11in`) — used only by the ImageWriter path, which has no
+/// PostScript interpreter to reinterpret a document's own page size and so
+/// must be told explicitly what page size Ghostscript should force.
+fn job_media(parsed: &IppRequestResponse) -> Option<String> {
     parsed.attributes()
         .groups_of(DelimiterTag::JobAttributes)
         .next()
-        .and_then(|g| g.attributes().get("media-source"))
-        .and_then(|a| {
-            if let IppValue::Keyword(k) = a.value() {
-                Some(k.as_str().to_string())
-            } else {
-                None
-            }
+        .and_then(|g| g.attributes().get("media"))
+        .and_then(|a| match a.value() {
+            IppValue::Keyword(k) => Some(k.as_str().to_string()),
+            IppValue::NameWithoutLanguage(n) => Some(n.as_str().to_string()),
+            _ => None,
         })
-        .unwrap_or_else(|| "main".to_string())
 }
 
 /// Extract the requested color mode: `print-color-mode`, falling back to the
@@ -1344,6 +1572,14 @@ async fn gs_raster(mut data: Vec<u8>, fmt: &str, device: &str, dpi: u32, job_tok
 async fn rasterize_to_ps(data: Vec<u8>, fmt: &str, tray_source: &str, dpi: u32, job_token: u32) -> anyhow::Result<(Vec<u8>, usize)> {
     if fmt == "application/postscript" || fmt == "application/vnd.cups-postscript" {
         let page_count = data.windows(7).filter(|w| *w == b"%%Page:").count().max(1);
+        // The client's own PostScript never encodes IPP-level tray choice
+        // (that's carried out-of-band as the media-source job attribute), so
+        // it has to be injected here even on the passthrough path or manual
+        // feed silently has no effect.
+        let data = match tray_setpagedevice(tray_source) {
+            Some(cmd) => inject_ps_setup(data, cmd),
+            None => data,
+        };
         return Ok((data, page_count));
     }
 
@@ -1353,6 +1589,70 @@ async fn rasterize_to_ps(data: Vec<u8>, fmt: &str, tray_source: &str, dpi: u32, 
 
     let page_count = pages.len();
     Ok((build_ps_raster(&pages, dpi, tray_source), page_count))
+}
+
+/// Rasterize directly to raw ImageWriter II command bytes via Ghostscript's
+/// `iwhi` device, forcing the page to `media_pts` (clamped to what the
+/// device can actually produce — see `imagewriter_safe_page`). Unlike
+/// LaserWriter/StyleWriter, there's no PS-passthrough shortcut here: the
+/// printer has no interpreter of its own, so everything goes through `gs`
+/// regardless of the incoming document format.
+async fn rasterize_for_imagewriter(
+    mut data: Vec<u8>,
+    fmt: &str,
+    media_pts: (f32, f32),
+    job_token: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let is_urf = fmt == "image/urf" || data.starts_with(b"UNIRAST");
+    if is_urf {
+        data = urf_to_rasterizable(data, job_token).await?;
+    }
+
+    let tmp = std::env::temp_dir();
+    let out_path = tmp.join(format!("tailtalk-iw-{job_token}.iwhi"));
+
+    #[cfg(target_os = "linux")]
+    let input_ext = if is_urf { "ps" } else { "pdf" };
+    #[cfg(not(target_os = "linux"))]
+    let input_ext = "pdf";
+    let input_path = tmp.join(format!("tailtalk-iw-in-{job_token}.{input_ext}"));
+    tokio::fs::write(&input_path, &data).await?;
+
+    let (w, h) = imagewriter_safe_page(media_pts.0, media_pts.1);
+    let width_arg = format!("-dDEVICEWIDTHPOINTS={w}");
+    let height_arg = format!("-dDEVICEHEIGHTPOINTS={h}");
+
+    let output = tokio::process::Command::new(gs_command())
+        .args([
+            "-dNOPAUSE", "-dBATCH", "-dSAFER",
+            "-sDEVICE=iwhi",
+            &width_arg, &height_arg, "-dFIXEDMEDIA",
+            "-o",
+        ])
+        .arg(&out_path)
+        .arg(&input_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = tokio::fs::remove_file(&out_path).await;
+        anyhow::bail!(
+            "gs iwhi exited with {} (input kept at {})\nstderr: {}\nstdout: {}",
+            output.status,
+            input_path.display(),
+            stderr.trim(),
+            stdout.trim(),
+        );
+    }
+    let _ = tokio::fs::remove_file(&input_path).await;
+
+    let raster = tokio::fs::read(&out_path).await;
+    let _ = tokio::fs::remove_file(&out_path).await;
+    Ok(raster?)
 }
 
 /// One page of raw planar StyleWriter scanlines: rows → planes (1 for mono,
@@ -1671,6 +1971,56 @@ fn encode_asciihex(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The `setpagedevice` call, if any, that selects the given IPP
+/// `media-source` keyword on a LaserWriter.
+fn tray_setpagedevice(tray_source: &str) -> Option<&'static str> {
+    match tray_source {
+        "manual" => Some("<< /ManualFeed true >> setpagedevice"),
+        "alternate" => Some("<< /MediaPosition 1 >> setpagedevice"),
+        _ => None,
+    }
+}
+
+/// Insert a tray-selecting `setpagedevice` call ahead of the first page of a
+/// pass-through PostScript job, so IPP media-source selection still applies
+/// when the document is a native PS job forwarded to the printer's own
+/// interpreter rather than rasterized by us.
+fn inject_ps_setup(data: Vec<u8>, cmd: &str) -> Vec<u8> {
+    let needle = b"%%Page:";
+    if let Some(pos) = data.windows(needle.len()).position(|w| w == needle) {
+        let line_start = data[..pos]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let mut out = Vec::with_capacity(data.len() + cmd.len() + 32);
+        out.extend_from_slice(&data[..line_start]);
+        out.extend_from_slice(b"%%BeginSetup\n");
+        out.extend_from_slice(cmd.as_bytes());
+        out.extend_from_slice(b"\n%%EndSetup\n");
+        out.extend_from_slice(&data[line_start..]);
+        out
+    } else {
+        // No DSC page markers found; run the command right after the header
+        // line so it still executes before any page content.
+        let mut out = Vec::with_capacity(data.len() + cmd.len() + 16);
+        match data.iter().position(|&b| b == b'\n') {
+            Some(nl) => {
+                out.extend_from_slice(&data[..=nl]);
+                out.extend_from_slice(cmd.as_bytes());
+                out.push(b'\n');
+                out.extend_from_slice(&data[nl + 1..]);
+            }
+            None => {
+                out.extend_from_slice(cmd.as_bytes());
+                out.push(b'\n');
+                out.extend_from_slice(&data);
+            }
+        }
+        out
+    }
+}
+
 /// Assemble a multi-page PS document from rasterized PBM pages.
 fn build_ps_raster(pages: &[(u32, u32, Vec<u8>)], dpi: u32, tray_source: &str) -> Vec<u8> {
     let mut out = Vec::new();
@@ -1678,18 +2028,10 @@ fn build_ps_raster(pages: &[(u32, u32, Vec<u8>)], dpi: u32, tray_source: &str) -
     let _ = writeln!(out, "%%LanguageLevel: 2");
     let _ = writeln!(out, "%%Pages: {}", pages.len());
     let _ = writeln!(out, "%%EndComments");
-    match tray_source {
-        "manual" => {
-            let _ = writeln!(out, "%%BeginSetup");
-            let _ = writeln!(out, "<< /ManualFeed true >> setpagedevice");
-            let _ = writeln!(out, "%%EndSetup");
-        }
-        "alternate" => {
-            let _ = writeln!(out, "%%BeginSetup");
-            let _ = writeln!(out, "<< /MediaPosition 1 >> setpagedevice");
-            let _ = writeln!(out, "%%EndSetup");
-        }
-        _ => {}
+    if let Some(cmd) = tray_setpagedevice(tray_source) {
+        let _ = writeln!(out, "%%BeginSetup");
+        let _ = writeln!(out, "{cmd}");
+        let _ = writeln!(out, "%%EndSetup");
     }
     for (i, (width, height, bitmap)) in pages.iter().enumerate() {
         let (width, height) = (*width, *height);
@@ -1734,6 +2076,23 @@ async fn print_to_pap(ddp: DdpHandle, addr: AtpAddress, doc: Vec<u8>) -> anyhow:
     Ok(output)
 }
 
+/// Like `print_to_pap`, but for ImageWriter: there's no PostScript
+/// interpreter behind it, so there's no interactive stdout to read back
+/// after the job.
+async fn print_to_pap_imagewriter(ddp: DdpHandle, addr: AtpAddress, doc: Vec<u8>) -> anyhow::Result<()> {
+    if doc.is_empty() {
+        tracing::warn!("IPP: empty ImageWriter document, skipping print");
+        return Ok(());
+    }
+    let (_, req, resp) = Atp::spawn(&ddp, None).await;
+    let mut pap = PapClient::new(req, resp);
+    pap.connect(addr).await?;
+    pap.chunk_size = Some(512);
+    pap.print_stream(Cursor::new(doc)).await?;
+    pap.close().await?;
+    Ok(())
+}
+
 /// Returns the PS error string from `%%[ Error: ]%%` lines; ignores `PrinterError`/`LastError`.
 fn parse_printer_error(output: &str) -> Option<String> {
     output.lines()
@@ -1745,6 +2104,36 @@ fn parse_printer_error(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_imagewriter_safe_page_clamps_and_floors() {
+        // Width above the physical 8.5in carriage gets clamped.
+        assert_eq!(imagewriter_safe_page(700.0, 792.0), (612.0, 792.0));
+        // Height not a multiple of 24pt gets floored to one — confirmed
+        // empirically against real gs output: anything else crashes the
+        // `iwhi` device's internal band-buffer sizing.
+        assert_eq!(imagewriter_safe_page(612.0, 792.0), (612.0, 792.0)); // Letter, already exact
+        assert_eq!(imagewriter_safe_page(595.0, 842.0), (595.0, 840.0)); // A4
+        assert_eq!(imagewriter_safe_page(279.0, 540.0), (279.0, 528.0)); // Monarch
+    }
+
+    #[test]
+    fn test_media_to_pts_roundtrips_known_names() {
+        assert_eq!(media_to_pts("na_letter_8.5x11in"), (612.0, 792.0));
+        assert_eq!(media_to_pts("iso_a4_210x297mm"), (595.0, 842.0));
+        // Unknown name falls back to Letter rather than panicking.
+        assert_eq!(media_to_pts("bogus_media_name"), (612.0, 792.0));
+    }
+
+    #[test]
+    fn all_advertised_media_have_dimensions() {
+        // fits_stylewriter_carriage() and the media-size-supported/media-col-database
+        // builders silently skip any name missing from MEDIA_DIMENSIONS_HMM; this
+        // guarantees that never happens for what's actually advertised.
+        for name in STANDARD_MEDIA.iter().chain(STYLEWRITER_EXTRA_MEDIA.iter()) {
+            assert!(media_dimensions_hmm(name).is_some(), "{name} has no MEDIA_DIMENSIONS_HMM entry");
+        }
+    }
 
     #[test]
     fn test_parse_ppm_pages_concatenated() {

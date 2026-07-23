@@ -90,6 +90,19 @@ pub struct StyleWriterInfo {
     pub submodel: Option<u8>,
     /// Status 'H' bit 0x80: a color ink cartridge is installed.
     pub color_cartridge: bool,
+    /// Raw reply to config query 'H' (0x01 = black installed, 0x81 = color
+    /// installed). Other bits are undocumented, so the raw byte is kept.
+    pub config_raw: Option<u8>,
+    /// Raw reply to status query '1'. lpstyl documents this only as "something
+    /// about the status of the printer" — the meaning is genuinely unknown, so
+    /// it is surfaced verbatim rather than decoded into a guess.
+    pub status_general: Option<u8>,
+    /// Raw reply to error-status query '2'. Only three values are documented:
+    /// 0x00 and 0x80 both mean "nothing wrong", 0x04 means out of paper.
+    pub status_error: Option<u8>,
+    /// Raw reply to buffer query 'B' — a fill gauge whose scale differs per
+    /// model. Both 0x80 and 0x20 set means idle on the CS family.
+    pub status_buffer: Option<u8>,
 }
 
 impl StyleWriterInfo {
@@ -114,6 +127,44 @@ impl StyleWriterInfo {
     /// (and only with a color cartridge installed).
     pub fn color_capable(&self) -> bool {
         self.identity == "CS" && self.color_cartridge
+    }
+
+    /// Human-readable reading of error status '2'.
+    ///
+    /// Only 0x00/0x80 ("nothing wrong") and 0x04 ("out of paper") are
+    /// documented; every other value is reported as an unknown code rather
+    /// than guessed at, since the printer's full error vocabulary — including
+    /// whether it even reports conditions like an open cover — was never
+    /// reverse-engineered.
+    pub fn error_text(&self) -> String {
+        match self.status_error {
+            Some(0x00) | Some(0x80) => "Ready — no error reported".to_string(),
+            Some(0x04) => "Out of paper".to_string(),
+            Some(c) => format!("Unrecognised error code 0x{c:02X}"),
+            None => "No response to error-status query".to_string(),
+        }
+    }
+
+    /// True when the printer reports being out of paper.
+    pub fn out_of_paper(&self) -> bool {
+        self.status_error == Some(0x04)
+    }
+
+    /// Whether the print buffer reports idle, per the CS-family two-bit mask.
+    /// `None` when the printer didn't answer, or isn't a CS model (the gauge
+    /// scale differs per model and only the CS reading is characterised).
+    pub fn buffer_idle(&self) -> Option<bool> {
+        let b = self.status_buffer?;
+        (self.identity == "CS").then(|| b & SW2200_IDLE_MASK == SW2200_IDLE_MASK)
+    }
+
+    /// Which ink cartridge is installed, per config query 'H'.
+    pub fn cartridge_text(&self) -> &'static str {
+        match self.config_raw {
+            None => "unknown (no response)",
+            Some(_) if self.color_cartridge => "Color (CMY)",
+            Some(_) => "Black only",
+        }
     }
 }
 
@@ -266,18 +317,34 @@ impl StyleWriterSession {
 
         // 'D' then 'H' is lpstyl's cartridge probe; non-CS printers have no
         // color cartridge to report, so skip the query (and its 'D') there.
-        let color_cartridge = if identity == "CS" {
+        let config_raw = if identity == "CS" {
             write_flush(&mut self.data, b"D").await?;
-            let h = self
-                .poll_status(b'H', deadline)
-                .await
-                .ok_or_else(|| anyhow::anyhow!("No reply to cartridge query 'H'"))?;
-            h & 0x80 != 0
+            Some(
+                self.poll_status(b'H', deadline)
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("No reply to cartridge query 'H'"))?,
+            )
         } else {
-            false
+            None
         };
+        let color_cartridge = config_raw.is_some_and(|h| h & 0x80 != 0);
 
-        Ok(StyleWriterInfo { identity, submodel, color_cartridge })
+        // Live condition. Unlike the identify queries these are non-fatal: a
+        // printer that answers '?' but not '1'/'2'/'B' should still report the
+        // model it did give us, with the status shown as unavailable.
+        let status_general = self.poll_status(b'1', deadline).await;
+        let status_error = self.poll_status(b'2', deadline).await;
+        let status_buffer = self.poll_status(b'B', deadline).await;
+
+        Ok(StyleWriterInfo {
+            identity,
+            submodel,
+            color_cartridge,
+            config_raw,
+            status_general,
+            status_error,
+            status_buffer,
+        })
     }
 
     /// Poll until status 'B' reports idle (lpstyl `waitStatus()`/`waitNonBusy()`),
@@ -802,6 +869,80 @@ impl StyleWriterEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build an info struct with the identify fields fixed to a Color
+    /// StyleWriter 2200, so status decoding can be exercised in isolation.
+    fn cs_info(config: Option<u8>, err: Option<u8>, buf: Option<u8>) -> StyleWriterInfo {
+        StyleWriterInfo {
+            identity: "CS".to_string(),
+            submodel: Some(0x02),
+            color_cartridge: config.is_some_and(|h| h & 0x80 != 0),
+            config_raw: config,
+            status_general: None,
+            status_error: err,
+            status_buffer: buf,
+        }
+    }
+
+    #[test]
+    fn test_error_status_decoding() {
+        // Both 0x00 and 0x80 are documented as "nothing wrong".
+        assert!(!cs_info(None, Some(0x00), None).out_of_paper());
+        assert!(!cs_info(None, Some(0x80), None).out_of_paper());
+        assert!(cs_info(None, Some(0x04), None).out_of_paper());
+
+        assert!(cs_info(None, Some(0x04), None).error_text().contains("Out of paper"));
+        assert!(cs_info(None, Some(0x80), None).error_text().contains("Ready"));
+
+        // An undocumented code is reported as unknown, not guessed at.
+        let odd = cs_info(None, Some(0x40), None);
+        assert!(!odd.out_of_paper());
+        assert!(odd.error_text().contains("0x40"), "{}", odd.error_text());
+
+        // No reply is distinct from a reply of zero.
+        assert!(cs_info(None, None, None).error_text().contains("No response"));
+    }
+
+    #[test]
+    fn test_buffer_idle_mask() {
+        // Idle needs both 0x80 and 0x20: 0xA2/0xA3 idle, 0x23 is a mid-drain
+        // gauge value that testing 0x20 alone would wrongly call idle.
+        assert_eq!(cs_info(None, None, Some(0xA3)).buffer_idle(), Some(true));
+        assert_eq!(cs_info(None, None, Some(0xA2)).buffer_idle(), Some(true));
+        assert_eq!(cs_info(None, None, Some(0x23)).buffer_idle(), Some(false));
+        assert_eq!(cs_info(None, None, Some(0x00)).buffer_idle(), Some(false));
+        assert_eq!(cs_info(None, None, None).buffer_idle(), None);
+
+        // The gauge scale is only characterised for the CS family.
+        let sw2 = StyleWriterInfo { identity: "SW".to_string(), ..cs_info(None, None, Some(0xA3)) };
+        assert_eq!(sw2.buffer_idle(), None);
+    }
+
+    #[test]
+    fn test_cartridge_decoding() {
+        // 'H' documents 0x01 = black installed, 0x81 = color installed.
+        let color = cs_info(Some(0x81), None, None);
+        assert!(color.color_cartridge);
+        assert!(color.color_capable());
+        assert_eq!(color.cartridge_text(), "Color (CMY)");
+
+        let black = cs_info(Some(0x01), None, None);
+        assert!(!black.color_cartridge);
+        assert!(!black.color_capable(), "black cartridge cannot print color");
+        assert_eq!(black.cartridge_text(), "Black only");
+
+        assert_eq!(cs_info(None, None, None).cartridge_text(), "unknown (no response)");
+
+        // Non-CS models are never color-capable even if 'H' somehow set 0x80.
+        let sw1 = StyleWriterInfo {
+            identity: "IJ10".to_string(),
+            submodel: None,
+            color_cartridge: true,
+            ..cs_info(Some(0x81), None, None)
+        };
+        assert!(!sw1.color_capable());
+        assert_eq!(sw1.model_name(), "Apple StyleWriter");
+    }
 
     #[test]
     fn test_encode_rect() {

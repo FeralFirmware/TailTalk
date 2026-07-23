@@ -23,8 +23,19 @@ pub struct PendingRequestState {
     pub eom_seq: Option<u8>,
     pub raw_packet: Vec<u8>,
     pub destination: AtpAddress,
+    /// The bitmap we sent in the request, i.e. which response packet slots we
+    /// said we'd accept. Per ATP spec, a responder that fills exactly this
+    /// many slots doesn't need to set EOM — we already know it's done.
+    pub requested_bitmap: u8,
     /// Number of retransmissions sent so far (not counting the initial send).
     pub retry_count: u8,
+    /// `received_packets.len()` as of the last time we chose to retransmit.
+    /// Some responders (e.g. certain ImageWriter PAP bridges) reply with fewer
+    /// packets than our bitmap allows and never set EOM, since strict ATP
+    /// semantics don't require it when the responder is simply done. If a
+    /// retransmit elicits no growth in this count, we treat what we have as
+    /// the full response rather than retrying until MAX_RETRIES.
+    pub received_at_last_retry: usize,
 }
 
 type AtpTransactionMap = HashMap<u16, PendingRequestState>;
@@ -52,6 +63,7 @@ pub struct AtpSendRequest {
     pub address: AtpAddress,
     pub user_bytes: [u8; 4],
     pub data: Vec<u8>,
+    pub bitmap: u8,
     pub chan: AtpResponseChannel,
 }
 
@@ -225,17 +237,38 @@ impl AtpRequestor {
         self.cmd_tx.send(cmd).await.map_err(io::Error::other)
     }
 
+    /// Send a request and await its response, accepting up to 8 response packets
+    /// (bitmap `0xff`). Use [`send_request_with_bitmap`](Self::send_request_with_bitmap)
+    /// when the reply is known to always fit in fewer packets.
     pub async fn send_request(
         &self,
         address: AtpAddress,
         user_bytes: [u8; 4],
         data: Vec<u8>,
     ) -> Result<(Vec<u8>, [u8; 4]), io::Error> {
+        self.send_request_with_bitmap(address, user_bytes, data, 0xff).await
+    }
+
+    /// Send a request, advertising exactly which response packet slots (0-7) we'll
+    /// accept via `bitmap`. A responder that fills every requested slot is
+    /// recognized as complete immediately, without waiting for EOM — per ATP spec,
+    /// EOM only matters when the responder sends *fewer* packets than requested.
+    /// Pass `0x01` for requests whose reply is known to always be a single packet
+    /// (e.g. PAP OpenConn/CloseConn) to skip the stalled-retransmit fallback in
+    /// `retransmit_pending` for responders that never set EOM.
+    pub async fn send_request_with_bitmap(
+        &self,
+        address: AtpAddress,
+        user_bytes: [u8; 4],
+        data: Vec<u8>,
+        bitmap: u8,
+    ) -> Result<(Vec<u8>, [u8; 4]), io::Error> {
         let (tx, rx) = oneshot::channel();
         let cmd = AtpCommand::SendRequest(AtpSendRequest {
             address,
             user_bytes,
             data,
+            bitmap,
             chan: tx,
         });
 
@@ -362,14 +395,31 @@ impl Atp {
 
         let mut to_evict: Vec<u16> = Vec::new();
         let mut to_resend: Vec<(u16, Vec<u8>, AtpAddress)> = Vec::new();
+        let mut to_finalize: Vec<(u16, AtpAddress)> = Vec::new();
 
         for (tid, state) in &mut self.pending_transactions {
             state.retry_count += 1;
             if state.retry_count > MAX_RETRIES {
                 to_evict.push(*tid);
+            } else if !state.received_packets.is_empty()
+                && state.received_packets.len() == state.received_at_last_retry
+            {
+                // We already have at least one packet, and a full retry interval
+                // passed with no growth — the responder isn't sending anything
+                // more. Stop waiting for an EOM that isn't coming.
+                to_finalize.push((*tid, state.destination));
             } else {
+                state.received_at_last_retry = state.received_packets.len();
                 to_resend.push((*tid, state.raw_packet.clone(), state.destination));
             }
+        }
+
+        for (tid, source) in to_finalize {
+            tracing::debug!(
+                "ATP: TID {} got no further packets after a retry with no EOM; treating received data as complete",
+                tid
+            );
+            self.complete_transaction(tid, source).await;
         }
 
         for tid in to_evict {
@@ -424,7 +474,7 @@ impl Atp {
             xo: true,   // internal assumption: always exactly once for now
             eom: false, // EOM must be 0 for TReq packets according to AppleTalk specs
             sts: false,
-            bitmap_seq_num: 0xff, // 8 buffers/packets
+            bitmap_seq_num: req.bitmap,
             tid,
             user_bytes: req.user_bytes,
         };
@@ -475,7 +525,9 @@ impl Atp {
                     eom_seq: None,
                     raw_packet,
                     destination: req.address,
+                    requested_bitmap: req.bitmap,
                     retry_count: 0,
+                    received_at_last_retry: 0,
                 },
             );
         }
@@ -589,6 +641,35 @@ impl Atp {
         }
     }
 
+    /// Remove a pending transaction, hand its accumulated data to the caller, and
+    /// (for XO transactions) send the Release that tells the responder it can
+    /// drop its retry cache entry for this TID.
+    async fn complete_transaction(&mut self, tid: u16, source: AtpAddress) {
+        let Some(mut state) = self.pending_transactions.remove(&tid) else {
+            return;
+        };
+
+        let mut full_data = Vec::new();
+        let expected_count = state
+            .eom_seq
+            .map(|e| e as usize + 1)
+            .unwrap_or(state.received_packets.len());
+        for i in 0..expected_count as u8 {
+            if let Some(p) = state.received_packets.remove(&i) {
+                full_data.extend_from_slice(&p);
+            }
+        }
+        let user_bytes = state.user_bytes.unwrap_or([0; 4]);
+        let xo = state.xo;
+
+        let _ = state.chan.send(Ok((full_data, user_bytes)));
+
+        if xo {
+            let rel = AtpSendRelease { destination: source, tid };
+            self.handle_send_release(rel).await;
+        }
+    }
+
     async fn handle_packet(&mut self, ddp: DdpPacket, payload: &mut [u8]) {
         let packet = match AtpPacket::parse(payload) {
             Ok(p) => p,
@@ -637,6 +718,7 @@ impl Atp {
             }
             AtpFunction::Response => {
                 // Client-side: handle response to our request
+                let mut is_complete = false;
                 if let std::collections::hash_map::Entry::Occupied(mut entry) =
                     self.pending_transactions.entry(packet.tid)
                 {
@@ -653,47 +735,33 @@ impl Atp {
                         }
 
                         // Check if complete
-                        let mut is_complete = false;
                         if let Some(eom) = state.eom_seq {
                             // if we have all packets from 0 to eom
                             if (0..=eom).all(|i| state.received_packets.contains_key(&i)) {
                                 is_complete = true;
                             }
-                        } else if state.received_packets.len() == 8 {
-                            // 8 packets received and no EOM
+                        } else if !state.received_packets.is_empty()
+                            && state.received_packets.len()
+                                == state.requested_bitmap.count_ones() as usize
+                        {
+                            // Filled every slot we asked for — per ATP spec, EOM isn't
+                            // required in this case since we already know the count.
                             is_complete = true;
-                        }
-
-                        if is_complete {
-                            let (_, mut state) = entry.remove_entry();
-                            let mut full_data = Vec::new();
-                            let expected_count = state.eom_seq.map(|e| e + 1).unwrap_or(8);
-                            for i in 0..expected_count {
-                                if let Some(p) = state.received_packets.remove(&i) {
-                                    full_data.extend_from_slice(&p);
-                                }
-                            }
-                            let user_bytes = state.user_bytes.unwrap_or([0; 4]);
-
-                            let _ = state.chan.send(Ok((full_data, user_bytes)));
-
-                            if state.xo {
-                                // send release
-                                let rel = AtpSendRelease {
-                                    destination: AtpAddress {
-                                        network_number: ddp.src_network_num,
-                                        node_number: ddp.src_node_id,
-                                        socket_number: ddp.src_sock_num,
-                                    },
-                                    tid: packet.tid,
-                                };
-                                self.handle_send_release(rel).await;
-                            }
                         }
                     } else {
                         tracing::warn!("ATP Response payload too short");
                         // We do not remove the transaction here, just ignore the bad packet
                     }
+                }
+                // `entry` (and its borrow of pending_transactions) is dropped here,
+                // so complete_transaction is free to remove it.
+                if is_complete {
+                    let source = AtpAddress {
+                        network_number: ddp.src_network_num,
+                        node_number: ddp.src_node_id,
+                        socket_number: ddp.src_sock_num,
+                    };
+                    self.complete_transaction(packet.tid, source).await;
                 }
             }
             AtpFunction::Release => {
