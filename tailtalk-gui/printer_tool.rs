@@ -6,6 +6,8 @@
 //!   * StyleWriter — rename, over the ADSP management socket (`sw-rename`).
 //!   * LaserWriter — rename, default paper size and power-on startup page, as
 //!     PostScript over PAP (`pap-print`).
+//!   * ImageWriter — rename, as the option card's `ESC b` command over PAP.
+//!     Status comes back from the same card as a packed status word.
 //!
 //! The server has to be running: we borrow its live `NbpHandle`/`DdpHandle`
 //! rather than building a second stack, which couldn't reopen an in-use
@@ -22,7 +24,8 @@ use tailtalk::{
     adsp::{Adsp, AdspAddress, AdspStream},
     atp::{Atp, AtpAddress},
     ddp::DdpHandle,
-    pap::PapClient,
+    imagewriter::{self, ImageWriter, ImageWriterStatus},
+    pap::{PapClient, PapStatusHandle},
     stylewriter::StyleWriterSession,
 };
 use tailtalk_packets::nbp::EntityName;
@@ -72,10 +75,29 @@ enum PrinterKind {
     /// Color StyleWriter behind an EtherTalk adapter, driven over ADSP
     /// (NBP type "ColorStyleWriter2400AT").
     StyleWriter,
+    /// Apple ImageWriter II/LQ behind a LocalTalk Option Card, queried over PAP
+    /// (NBP type "ImageWriter").
+    ImageWriter,
 }
 
 /// ADSP management socket — fixed at 129 on StyleWriter adapters (see `sw-rename`).
 const SW_MGMT_SOCKET: u8 = 129;
+
+/// Longest name each family accepts: the StyleWriter's Pascal-string rename
+/// takes 31, the LaserWriter's `PrinterName` 32. Drives both validation and the
+/// hint under the name field, so the two cannot disagree.
+const SW_MAX_NAME_LEN: usize = 31;
+const LW_MAX_NAME_LEN: usize = 32;
+
+impl PrinterKind {
+    fn max_name_len(self) -> usize {
+        match self {
+            PrinterKind::StyleWriter => SW_MAX_NAME_LEN,
+            PrinterKind::LaserWriter => LW_MAX_NAME_LEN,
+            PrinterKind::ImageWriter => imagewriter::MAX_NAME_LEN,
+        }
+    }
+}
 
 /// Attention codes used by the StyleWriter name-change protocol.
 const ATTN_GET_NAME: u16 = 0x0011;
@@ -112,7 +134,7 @@ impl Discovered {
         }
     }
 
-    /// The advertised print endpoint, as an ATP address (LaserWriter).
+    /// The advertised print endpoint, as an ATP address (LaserWriter, ImageWriter).
     fn atp_addr(&self) -> AtpAddress {
         AtpAddress {
             network_number: self.net,
@@ -127,9 +149,11 @@ impl Discovered {
             kind: match self.kind {
                 PrinterKind::LaserWriter => "LaserWriter (PostScript)".into(),
                 PrinterKind::StyleWriter => "Color StyleWriter".into(),
+                PrinterKind::ImageWriter => "ImageWriter".into(),
             },
             address: format!("{}.{} socket {}", self.net, self.node, self.socket).into(),
             is_stylewriter: self.kind == PrinterKind::StyleWriter,
+            is_imagewriter: self.kind == PrinterKind::ImageWriter,
         }
     }
 }
@@ -239,12 +263,13 @@ fn ps_escape(s: &str) -> String {
 
 // ── Async operations (reuse the existing protocol code) ───────────────────────
 
-/// Discover LaserWriters and Color StyleWriters — the same batched NBP lookup
-/// the IPP bridge performs.
+/// Discover LaserWriters, Color StyleWriters and ImageWriters, using the same
+/// batched NBP lookup the IPP bridge performs.
 async fn discover(handles: &PrinterHandles) -> anyhow::Result<Vec<Discovered>> {
-    const PATTERNS: [(PrinterKind, &str); 2] = [
+    const PATTERNS: [(PrinterKind, &str); 3] = [
         (PrinterKind::LaserWriter, "=:LaserWriter@*"),
         (PrinterKind::StyleWriter, "=:ColorStyleWriter2400AT@*"),
+        (PrinterKind::ImageWriter, "=:ImageWriter@*"),
     ];
 
     // Our own address on each transport, so registrations belonging to this
@@ -345,6 +370,62 @@ async fn query_stylewriter(ddp: &DdpHandle, addr: AdspAddress) -> anyhow::Result
     })
 }
 
+/// Query an ImageWriter's LocalTalk Option Card over PAP. No connection is
+/// opened, so this works even while the printer is mid-job. Everything the card
+/// reports is in one 16-bit word, so there is nothing further to ask it.
+async fn query_imagewriter(ddp: &DdpHandle, addr: AtpAddress) -> anyhow::Result<Queried> {
+    let s = ImageWriter::status_of(ddp, addr).await?;
+    Ok(Queried {
+        lines: imagewriter_lines(&s),
+        settings: None,
+    })
+}
+
+/// The whole info panel for one status word. Every row here bar the model comes
+/// out of that word, so the poller re-renders all of them together rather than
+/// refreshing the Condition line over a frozen copy of everything else.
+fn imagewriter_lines(s: &ImageWriterStatus) -> Vec<Line> {
+    let yes_no = |b: bool| if b { "Yes" } else { "No" };
+
+    vec![
+        Line::section("Status"),
+        Line::field("Condition", imagewriter_condition(s)),
+        Line::field("Paper", if s.paper_present() { "Loaded" } else { "Out of paper" }),
+        Line::field("Busy", yes_no(s.busy())),
+        Line::field("Printing", yes_no(s.active())),
+        Line::section("Hardware"),
+        Line::field("Model", "Apple ImageWriter II/LQ"),
+        Line::field("Ribbon", s.ribbon_text()),
+        Line::field(
+            "Colour printing",
+            if s.color_ribbon() { "Yes" } else { "No, black ribbon installed" },
+        ),
+        Line::field("Sheet feeder", yes_no(s.sheet_feeder())),
+        // The unaltered reply alongside the decode: a raw reading is what
+        // any "this status looks wrong" report needs.
+        Line::section("Raw protocol reply"),
+        Line::field("Status word", format!("0x{:04X}", s.raw)),
+        Line::field(
+            "Wire bytes",
+            s.wire_bytes().iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" "),
+        ),
+    ]
+}
+
+/// One-line summary for the Condition row, matching how the other two families
+/// phrase it: errors first, then whatever the printer is doing.
+fn imagewriter_condition(s: &ImageWriterStatus) -> String {
+    if let Some(e) = s.error_text() {
+        e
+    } else if s.active() {
+        "Printing".to_string()
+    } else if s.busy() {
+        "Busy: connection open or printer not ready".to_string()
+    } else {
+        "Ready".to_string()
+    }
+}
+
 /// Send one attention command and check the printer's two-byte acknowledgement.
 async fn attention(stream: &mut AdspStream, code: u16, payload: &[u8]) -> anyhow::Result<()> {
     stream.send_attention(code, payload).await?;
@@ -364,7 +445,7 @@ async fn rename_stylewriter(
     mgmt_addr: AdspAddress,
     new_name: &str,
 ) -> anyhow::Result<String> {
-    validate_name(new_name, 31)?;
+    validate_name(new_name, PrinterKind::StyleWriter.max_name_len())?;
 
     let mut stream = timeout(Duration::from_secs(10), Adsp::connect(ddp, mgmt_addr))
         .await
@@ -379,6 +460,27 @@ async fn rename_stylewriter(
     attention(&mut stream, ATTN_SET_NAME, &pascal).await?;
     attention(&mut stream, ATTN_COMMIT, &[0x00]).await?;
     stream.close().await?;
+
+    Ok(format!(
+        "Renamed to \"{new_name}\". Click Refresh in a moment to confirm re-registration."
+    ))
+}
+
+/// Rename an ImageWriter by sending the option card's `ESC b` command over PAP.
+/// The card takes the name out of the data stream instead of passing it to the
+/// printer, so this goes over an ordinary print connection.
+async fn rename_imagewriter(
+    ddp: &DdpHandle,
+    addr: AtpAddress,
+    new_name: &str,
+) -> anyhow::Result<String> {
+    validate_name(new_name, PrinterKind::ImageWriter.max_name_len())?;
+
+    let mut printer = ImageWriter::connect(ddp, addr).await?;
+    let result = printer.set_name(new_name).await;
+    // Close either way: leaving the connection open holds the printer busy.
+    let closed = printer.close().await;
+    result.and(closed)?;
 
     Ok(format!(
         "Renamed to \"{new_name}\". Click Refresh in a moment to confirm re-registration."
@@ -520,7 +622,7 @@ async fn save_laserwriter(
     startup: bool,
     name: &str,
 ) -> anyhow::Result<String> {
-    validate_name(name, 32)?;
+    validate_name(name, PrinterKind::LaserWriter.max_name_len())?;
     let (w, h) = size.points();
     let escaped_name = ps_escape(name);
     let job = format!(
@@ -652,11 +754,22 @@ pub fn open(
                 w.set_info_rows(to_model(Vec::new()));
                 w.set_error_text("".into());
                 w.set_edit_name(printer.name.as_str().into());
+                w.set_name_max(printer.kind.max_name_len() as i32);
             }
             begin_busy(&weak, "Querying printer…");
 
-            if printer.kind == PrinterKind::LaserWriter {
-                poll_status(&rt, weak.clone(), ddp.clone(), printer.atp_addr(), &generation, my_gen);
+            // Both PAP families can be re-polled cheaply; the StyleWriter's ADSP
+            // query needs a whole session, so it is left to the manual refresh.
+            if matches!(printer.kind, PrinterKind::LaserWriter | PrinterKind::ImageWriter) {
+                poll_status(
+                    &rt,
+                    weak.clone(),
+                    ddp.clone(),
+                    printer.atp_addr(),
+                    printer.kind,
+                    &generation,
+                    my_gen,
+                );
             }
 
             let weak = weak.clone();
@@ -668,6 +781,7 @@ pub fn open(
                         query_stylewriter(&ddp, printer.adsp_print_addr()).await
                     }
                     PrinterKind::LaserWriter => query_laserwriter(&ddp, printer.atp_addr()).await,
+                    PrinterKind::ImageWriter => query_imagewriter(&ddp, printer.atp_addr()).await,
                 };
                 slint::invoke_from_event_loop(move || {
                     let Some(w) = weak.upgrade() else { return };
@@ -736,6 +850,12 @@ pub fn open(
                         finish_save(weak, result, Some(index));
                     });
                 }
+                PrinterKind::ImageWriter => {
+                    rt.spawn(async move {
+                        let result = rename_imagewriter(&ddp, printer.atp_addr(), &name).await;
+                        finish_save(weak, result, None);
+                    });
+                }
             }
         });
     }
@@ -749,19 +869,33 @@ pub fn open(
     *slot.borrow_mut() = Some(window);
 }
 
-/// Re-check a LaserWriter's PAP status every few seconds for as long as it stays
-/// selected, so the Condition line doesn't sit stale between the much slower
-/// PostScript queries.
+/// What one poll produced: either the whole info panel, or just a new Condition
+/// line for families whose other rows this poll can't refresh.
+enum PollUpdate {
+    Rows(Vec<Line>),
+    Condition(String),
+}
+
+/// Re-check a PAP printer's status every few seconds for as long as it stays
+/// selected, so the panel doesn't sit stale between the much slower full
+/// queries. A LaserWriter answers with a PostScript status string, an
+/// ImageWriter with the packed status word.
+///
+/// Both families poll over one `PapStatusHandle`, allocated once for the life of
+/// the poller rather than per tick, and needing no PAP connection to the printer.
 fn poll_status(
     rt: &tokio::runtime::Handle,
     weak: Weak<PrinterToolWindow>,
     ddp: DdpHandle,
     addr: AtpAddress,
+    kind: PrinterKind,
     generation: &Arc<AtomicU64>,
     my_gen: u64,
 ) {
     let generation = generation.clone();
     rt.spawn(async move {
+        let status_socket = PapStatusHandle::new(&ddp, addr).await;
+        let imagewriter = imagewriter::StatusHandle::from(status_socket.clone());
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         ticker.tick().await; // the initial query already left a fresh status
         loop {
@@ -769,8 +903,23 @@ fn poll_status(
             if generation.load(Ordering::SeqCst) != my_gen {
                 return;
             }
-            let (_, req, _) = Atp::spawn(&ddp, None).await;
-            let status = PapClient::get_status(req, addr).await;
+            let update = match kind {
+                // Every ImageWriter row comes from the status word, so re-render
+                // the panel instead of leaving the raw reply showing an older
+                // reading than the Condition line above it.
+                PrinterKind::ImageWriter => {
+                    imagewriter.read().await.map(|s| PollUpdate::Rows(imagewriter_lines(&s)))
+                }
+                // A LaserWriter's other rows come from PostScript queries this
+                // poll doesn't run, so only the condition is refreshed.
+                _ => status_socket.read_text().await.map(|s| {
+                    PollUpdate::Condition(if s.is_empty() {
+                        "No status string returned".to_string()
+                    } else {
+                        s
+                    })
+                }),
+            };
 
             let weak = weak.clone();
             let generation = generation.clone();
@@ -779,11 +928,11 @@ fn poll_status(
                 if generation.load(Ordering::SeqCst) != my_gen {
                     return;
                 }
-                set_condition(&w, match status {
-                    Ok(s) if !s.is_empty() => s,
-                    Ok(_) => "No status string returned".to_string(),
-                    Err(e) => format!("Unavailable: {e}"),
-                });
+                match update {
+                    Ok(PollUpdate::Rows(lines)) => w.set_info_rows(to_model(lines)),
+                    Ok(PollUpdate::Condition(s)) => set_condition(&w, s),
+                    Err(e) => set_condition(&w, format!("Unavailable: {e}")),
+                }
             });
             if posted.is_err() {
                 return; // the Slint event loop is gone — the app is shutting down

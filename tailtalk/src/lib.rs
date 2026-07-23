@@ -22,6 +22,7 @@ pub mod atp;
 
 pub mod ddp;
 pub mod echo;
+pub mod imagewriter;
 pub mod nbp;
 pub mod pap;
 pub mod remote;
@@ -764,9 +765,43 @@ impl TalkStack {
     }
 
     /// Query the status string of a PAP printer without opening a full connection.
+    /// For repeated reads, keep a [`pap_status_handle`](Self::pap_status_handle):
+    /// this allocates a socket per call.
     pub async fn pap_status(&self, address: atp::AtpAddress) -> anyhow::Result<String> {
-        let (_, atp_requestor, _) = atp::Atp::spawn(&self.ddp, None).await;
-        pap::PapClient::get_status(atp_requestor, address).await
+        self.pap_status_handle(address).await.read_text().await
+    }
+
+    /// A reusable status socket for the PAP printer at `address`, independent of
+    /// any print connection, so it can be polled while a job streams.
+    pub async fn pap_status_handle(&self, address: atp::AtpAddress) -> pap::PapStatusHandle {
+        pap::PapStatusHandle::new(&self.ddp, address).await
+    }
+
+    /// Query an ImageWriter II/LQ LocalTalk Option Card's packed status word,
+    /// which is what that card returns instead of a PAP status string. No
+    /// connection is opened.
+    pub async fn imagewriter_status(
+        &self,
+        address: atp::AtpAddress,
+    ) -> anyhow::Result<imagewriter::ImageWriterStatus> {
+        imagewriter::ImageWriter::status_of(&self.ddp, address).await
+    }
+
+    /// Connect to the ImageWriter at `address`.
+    pub async fn imagewriter(
+        &self,
+        address: atp::AtpAddress,
+    ) -> anyhow::Result<imagewriter::ImageWriter> {
+        imagewriter::ImageWriter::connect(&self.ddp, address).await
+    }
+
+    /// Look an ImageWriter up by NBP object name (`=` for any) and connect to
+    /// the first one that answers.
+    pub async fn imagewriter_named(
+        &self,
+        object: &str,
+    ) -> anyhow::Result<imagewriter::ImageWriter> {
+        imagewriter::ImageWriter::connect_named(&self.ddp, &self.nbp, object).await
     }
 
     /// Create a PAP printer emulator.
