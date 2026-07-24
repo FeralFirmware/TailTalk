@@ -74,7 +74,7 @@ impl PapClient {
             tracing::info!("PAP: Sending OpenConn to {:?}", address);
             let (resp_data, resp_user_bytes) = self
                 .atp_requestor
-                .send_request(address, user_bytes, data.to_vec())
+                .send_request_with_bitmap(address, user_bytes, data.to_vec(), 0x01)
                 .await?;
 
             let reply = PapPacket::parse_from_atp(resp_user_bytes, &resp_data)?;
@@ -299,7 +299,7 @@ impl PapClient {
         let (ub, d) = close_pkt.to_atp_parts();
         // Must go to server_addr (per-connection socket), not remote_addr (NBP listening socket).
         self.atp_requestor
-            .send_request(self.server_addr, ub, d.to_vec())
+            .send_request_with_bitmap(self.server_addr, ub, d.to_vec(), 0x01)
             .await?;
         Ok(())
     }
@@ -313,7 +313,9 @@ impl PapClient {
             data: vec![],
         };
         let (ub, d) = pkt.to_atp_parts();
-        let (resp_data, resp_ub) = atp.send_request(address, ub, d.to_vec()).await?;
+        let (resp_data, resp_ub) = atp
+            .send_request_with_bitmap(address, ub, d.to_vec(), 0x01)
+            .await?;
 
         let reply = PapPacket::parse_from_atp(resp_ub, &resp_data)?;
 
