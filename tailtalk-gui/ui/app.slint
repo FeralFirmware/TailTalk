@@ -1,5 +1,9 @@
 import { Button, ComboBox, LineEdit, HorizontalBox, VerticalBox, CheckBox, Palette, ProgressIndicator } from "std-widgets.slint";
 
+// Re-exported so `slint::include_modules!()` generates them for the Rust side;
+// the Printer Tool is a separate window opened from the File menu.
+export { PrinterToolWindow, PrinterRow } from "printer_tool.slint";
+
 export component AppWindow inherits Window {
     title: "TailTalk AFP Server";
     min-width: 400px;
@@ -56,6 +60,7 @@ export component AppWindow inherits Window {
     callback inspect-finder-info();
     callback save-finder-info();
     callback open-log-dir();
+    callback open-printer-tool();
     // Returns the input truncated to 1 character; registered in Rust.
     callback clamp-to-one(string) -> string;
 
@@ -74,6 +79,13 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: "Inspect Finder Info…";
                 activated => { root.inspect-finder-info(); }
+            }
+            MenuItem {
+                // Needs the running stack's live NBP/DDP handles, so it can
+                // only be opened while the server is up.
+                title: "Printer Tool…";
+                enabled: root.running;
+                activated => { root.open-printer-tool(); }
             }
             MenuItem {
                 title: "Open Log Directory…";
