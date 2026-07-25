@@ -46,6 +46,12 @@ struct OutboundPacket {
     src_sock: SockNum,
     protocol: DdpProtocolType,
     payload: Box<[u8]>,
+    /// Restricts a link-layer broadcast to a single cable.
+    ///
+    /// Only consulted for the `{0, 255}` network-wide broadcast, which
+    /// otherwise goes out on every configured interface. Unicast is routed by
+    /// destination address, so the cable is not the caller's to choose.
+    iface: Option<Interface>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,17 +73,21 @@ pub struct DdpSocketSender {
 
 impl DdpSocketSender {
     pub async fn send_to(&self, buf: &[u8], addr: DdpAddress) -> Result<(), Error> {
-        self.send_to_typed(buf, addr, None).await
+        self.send_to_typed(buf, addr, None, None).await
     }
 
     /// Like [`Self::send_to`], but stamps `protocol` on this datagram instead
     /// of the type the socket was opened with. Used to serve clients whose
     /// socket API carries the DDP type per datagram rather than per socket.
+    ///
+    /// `iface` restricts a `{0, 255}` broadcast to one cable; see
+    /// [`DdpSocket::send_to_iface`].
     pub async fn send_to_typed(
         &self,
         buf: &[u8],
         addr: DdpAddress,
         protocol: Option<DdpProtocolType>,
+        iface: Option<Interface>,
     ) -> Result<(), Error> {
         if buf.len() > 586 {
             return Err(io::Error::new(
@@ -95,6 +105,7 @@ impl DdpSocketSender {
                     payload: buf.into(),
                     src_sock: self.sock_num,
                     protocol: protocol.unwrap_or(self.protocol),
+                    iface,
                 };
                 sender.send(DdpCommand::SendPkt(pkt)).await.map_err(|_| {
                     io::Error::new(io::ErrorKind::BrokenPipe, "DDP processor shut down")
@@ -102,7 +113,7 @@ impl DdpSocketSender {
             }
             DdpSender::Remote(client) => {
                 client
-                    .send_datagram(self.sock_num, addr.addr, addr.sock, buf)
+                    .send_datagram(self.sock_num, addr.addr, addr.sock, buf, iface)
                     .await?;
             }
         }
@@ -141,6 +152,31 @@ impl DdpSocket {
     }
 
     pub async fn send_to(&self, buf: &[u8], addr: DdpAddress) -> Result<(), Error> {
+        self.send_to_inner(buf, addr, None).await
+    }
+
+    /// Send a `{0, 255}` broadcast on one cable only, instead of on every
+    /// configured interface.
+    ///
+    /// Needed whenever the payload itself names an address of ours — an NBP
+    /// lookup's reply tuple, say — because that address differs per interface
+    /// and only the one belonging to the cable the datagram goes out on is
+    /// reachable by the nodes that receive it.
+    pub async fn send_to_iface(
+        &self,
+        buf: &[u8],
+        addr: DdpAddress,
+        iface: Interface,
+    ) -> Result<(), Error> {
+        self.send_to_inner(buf, addr, Some(iface)).await
+    }
+
+    async fn send_to_inner(
+        &self,
+        buf: &[u8],
+        addr: DdpAddress,
+        iface: Option<Interface>,
+    ) -> Result<(), Error> {
         if buf.len() > 586 {
             tracing::error!(
                 "DDP payload length {} exceeds maximum allowed (586 bytes)",
@@ -162,6 +198,7 @@ impl DdpSocket {
                     payload: buf.into(),
                     src_sock: self.sock_num,
                     protocol: self.protocol,
+                    iface,
                 };
                 sender.send(DdpCommand::SendPkt(pkt)).await.map_err(|_| {
                     io::Error::new(io::ErrorKind::BrokenPipe, "DDP processor shut down")
@@ -169,7 +206,7 @@ impl DdpSocket {
             }
             DdpSender::Remote(client) => {
                 client
-                    .send_datagram(self.sock_num, addr.addr, addr.sock, buf)
+                    .send_datagram(self.sock_num, addr.addr, addr.sock, buf, iface)
                     .await?;
             }
         }
@@ -430,24 +467,30 @@ impl DdpProcessor {
     async fn handle_outbound(&mut self, packet: OutboundPacket) {
         // Network-wide broadcast {0, 255}: send on every configured interface so
         // all nodes on each cable receive it, regardless of their network number.
+        // A caller that scoped the send to one cable gets only that one.
         if packet.dest.addr.network_number == 0 && packet.dest.addr.node_number == 255 {
+            let wanted = |iface| packet.iface.is_none_or(|only| only == iface);
             let mut sent = false;
-            if self.et_addressing.is_some() {
+            if self.et_addressing.is_some() && wanted(Interface::EtherTalk) {
                 let et_addr = self.et_addr().await.unwrap();
                 let dest_node = Node::EtherTalkPhase2(Addressing::APPLETALK_BROADCAST_MULTICAST);
                 self.send_ddp_to_node(&packet, dest_node, et_addr).await;
                 sent = true;
             }
-            if self.lt_addressing.is_some() {
+            if self.lt_addressing.is_some() && wanted(Interface::LocalTalk) {
                 let lt_addr = self.lt_addr().await.unwrap();
                 self.send_ddp_to_node(&packet, Node::LocalTalk(255), lt_addr).await;
                 sent = true;
             }
             if !sent {
                 tracing::error!(
-                    "DDP: dropping packet to {}.{} — no interfaces configured",
+                    "DDP: dropping packet to {}.{} — no interfaces configured{}",
                     packet.dest.addr.network_number,
                     packet.dest.addr.node_number,
+                    match packet.iface {
+                        Some(iface) => format!(" for the requested cable ({iface:?})"),
+                        None => String::new(),
+                    },
                 );
             }
             return;

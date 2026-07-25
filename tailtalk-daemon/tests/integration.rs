@@ -167,6 +167,7 @@ async fn ddp_socket_lifecycle() {
                 dest_socket: 2,
                 payload: vec![1, 2, 3],
                 ddp_type: 0,
+                iface: proto::AddressSource::Unknown as i32,
             }),
         )
         .await,

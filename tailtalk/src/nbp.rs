@@ -132,24 +132,18 @@ impl Nbp {
                                     z => self.route_table.nbp_dispatch(NbpZone::Named(z)),
                                 };
 
-                                // The reply address we advertise in the tuple: when
-                                // asking a router, use our address on that router's
-                                // cable so replies forwarded from other networks can
-                                // route back; otherwise the primary address.
-                                let reply_iface = match &dispatch {
-                                    NbpDispatch::RouterBroadcast(routers) => routers
-                                        .first()
-                                        .and_then(|r| self.route_table.interface_for_net(r.network_number)),
-                                    _ => None,
-                                };
-                                let our_addr = self.addr_on(reply_iface).await;
-
-                                let tuple = NbpTuple {
-                                    network_number: our_addr.network_number,
-                                    node_id: our_addr.node_number,
+                                // The request tuple names the address replies come
+                                // back to — responders answer the tuple, not the
+                                // DDP source. It is therefore built per outgoing
+                                // copy, from our address on the cable that copy
+                                // goes out on, and never shared across cables.
+                                let name = lookup.request;
+                                let make_tuple = |addr: AppleTalkAddress| NbpTuple {
+                                    network_number: addr.network_number,
+                                    node_id: addr.node_number,
                                     socket_number: 2,
                                     enumerator: 0,
-                                    entity_name: lookup.request,
+                                    entity_name: name.clone(),
                                 };
 
                                 let mut buf = [0u8; 1024];
@@ -160,15 +154,22 @@ impl Nbp {
                                         // router ("A-ROUTER") handles the whole request, so
                                         // stop at the first successful send — asking several
                                         // would only duplicate every reply.
-                                        let packet = NbpPacket {
-                                            operation: NbpOperation::BroadcastRequest,
-                                            transaction_id: tid,
-                                            tuples: vec![tuple],
-                                        };
-                                        let size = packet.to_bytes(&mut buf).expect("failed to serialize");
-
                                         let mut result = Err(io::Error::other("no routers to send BrRq to"));
                                         for router in routers {
+                                            // Our address on this router's cable, so
+                                            // replies it forwards back from other
+                                            // networks have somewhere to land. Resolved
+                                            // per router, since the loop may fall
+                                            // through to one on the other interface.
+                                            let iface = self.route_table.interface_for_net(router.network_number);
+                                            let our_addr = self.addr_on(iface).await;
+                                            let packet = NbpPacket {
+                                                operation: NbpOperation::BroadcastRequest,
+                                                transaction_id: tid,
+                                                tuples: vec![make_tuple(our_addr)],
+                                            };
+                                            let size = packet.to_bytes(&mut buf).expect("failed to serialize");
+
                                             let dest = crate::ddp::DdpAddress::new(router, 2);
                                             match self.sock.send_to(&buf[..size], dest).await {
                                                 Ok(()) => {
@@ -187,16 +188,44 @@ impl Nbp {
                                         result
                                     }
                                     NbpDispatch::LocalBroadcast | NbpDispatch::ZoneUnknown => {
-                                        let packet = NbpPacket {
-                                            operation: NbpOperation::Lookup,
-                                            transaction_id: tid,
-                                            tuples: vec![tuple],
-                                        };
-                                        let size = packet.to_bytes(&mut buf).expect("failed to serialize");
+                                        // One LkUp per cable, each carrying our address
+                                        // on that cable. A single broadcast fanned out
+                                        // by DDP would put one interface's address in
+                                        // front of both cables' nodes, and the ones that
+                                        // cannot reach it — LocalTalk devices handed our
+                                        // EtherTalk address, typically — would answer
+                                        // into the void.
+                                        let ifaces = [Interface::EtherTalk, Interface::LocalTalk]
+                                            .into_iter()
+                                            .filter(|i| self.has_iface(*i));
 
-                                        let dest_addr = tailtalk_packets::aarp::AppleTalkAddress { network_number: 0, node_number: 255 };
-                                        let dest = crate::ddp::DdpAddress::new(dest_addr, 2);
-                                        self.sock.send_to(&buf[..size], dest).await
+                                        let mut result = Err(io::Error::other(
+                                            "no interfaces configured to broadcast NBP LkUp on",
+                                        ));
+                                        for iface in ifaces {
+                                            let our_addr = self.addr_on(Some(iface)).await;
+                                            let packet = NbpPacket {
+                                                operation: NbpOperation::Lookup,
+                                                transaction_id: tid,
+                                                tuples: vec![make_tuple(our_addr)],
+                                            };
+                                            let size = packet.to_bytes(&mut buf).expect("failed to serialize");
+
+                                            let dest_addr = tailtalk_packets::aarp::AppleTalkAddress { network_number: 0, node_number: 255 };
+                                            let dest = crate::ddp::DdpAddress::new(dest_addr, 2);
+                                            // One cable failing must not cancel the
+                                            // lookup on the other, so any success wins.
+                                            match self.sock.send_to_iface(&buf[..size], dest, iface).await {
+                                                Ok(()) => result = Ok(()),
+                                                Err(e) => {
+                                                    tracing::warn!("NBP LkUp: failed to send on {iface:?}: {e}");
+                                                    if result.is_err() {
+                                                        result = Err(e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        result
                                     }
                                 };
 
@@ -285,6 +314,14 @@ impl Nbp {
                 io::ErrorKind::NotFound,
                 "entity name and sock num not registered",
             )));
+        }
+    }
+
+    /// Whether the given interface is configured on this stack.
+    fn has_iface(&self, iface: Interface) -> bool {
+        match iface {
+            Interface::EtherTalk => self.et_addressing.is_some(),
+            Interface::LocalTalk => self.lt_addressing.is_some(),
         }
     }
 
