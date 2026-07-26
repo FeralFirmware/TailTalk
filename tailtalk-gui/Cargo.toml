@@ -11,6 +11,9 @@ path = "main.rs"
 [features]
 default = ["tashtalk"]
 tashtalk = ["dep:serialport"]
+# Opt-in elsewhere; always on for macOS via the target dependency below, since a
+# `default` list can't be made target-conditional. See build.rs for the cfg the
+# source actually gates on.
 ethertalk = ["tailtalk/ethertalk"]
 
 [dependencies]
@@ -36,6 +39,11 @@ toml = "^1.1"
 tracing = { workspace = true } #unified
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# macOS ships libpcap, so EtherTalk costs nothing to build here and is on by default.
+[target.'cfg(target_os = "macos")'.dependencies]
+tailtalk = { workspace = true, features = ["ethertalk"] }
+libc = "0.2"
 
 [build-dependencies]
 slint-build = "1"

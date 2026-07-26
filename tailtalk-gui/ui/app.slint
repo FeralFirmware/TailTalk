@@ -7,9 +7,11 @@ export { PrinterToolWindow, PrinterRow } from "printer_tool.slint";
 export component AppWindow inherits Window {
     title: "TailTalk AFP Server";
     min-width: 400px;
-    min-height: 200px;
     preferred-width: 540px;
-    preferred-height: 495px;
+    // Height is deliberately left to the layout. Rows come and go at runtime
+    // (the EtherTalk picker, the three LaserWriter rows), so any fixed height is
+    // wrong for some combination of them: a hardcoded one used to clip the Start
+    // button off the bottom once enough options were enabled.
 
     in-out property <string> server-name: "TailTalk AFP";
     in property <[string]> ethernet-interfaces;
@@ -25,6 +27,9 @@ export component AppWindow inherits Window {
     // Set from Rust at startup to reflect compiled-in features
     in property <bool> feature-ethertalk: false;
     in property <bool> feature-tashtalk: false;
+    // EtherTalk is compiled in, but no BPF device can be opened, so the
+    // interface picker is replaced by a note on how to get access.
+    in property <bool> ethertalk-needs-chmodbpf: false;
     in-out property <string> error-message: "";
     in-out property <bool> pcap-enabled: false;
     in-out property <string> pcap-path;
@@ -130,6 +135,18 @@ export component AppWindow inherits Window {
                         horizontal-stretch: 1;
                         enabled: !root.running;
 
+                    }
+                }
+
+                if root.ethertalk-needs-chmodbpf : HorizontalBox {
+                    padding-top: 0; padding-bottom: 0;
+                    Text { text: "Ethernet Interface"; min-width: 140px; vertical-alignment: center; }
+                    Text {
+                        text: "Unavailable. Install Wireshark's ChmodBPF package, then log out and back in.";
+                        wrap: word-wrap;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        opacity: 0.7;
                     }
                 }
 

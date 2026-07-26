@@ -122,6 +122,20 @@ Install npcap 1.88 from [npcap.com](https://npcap.com/#download)
 macOS 11 and later includes support for the CP2102N USB chip out of the box. For 10.12 through 10.15 the driver from Silicon
 Labs is required for the device to be recognised: https://www.silabs.com/software-and-tools/usb-to-uart-bridge-vcp-drivers?tab=downloads
 
+## EtherTalk
+
+EtherTalk is compiled into the GUI by default on macOS, where libpcap ships with the OS. On Linux and Windows it is opt-in:
+build with `cargo build -p tailtalk-gui --features ethertalk` once libpcap (`libpcap-dev`) or the npcap SDK is installed.
+
+### macOS
+
+Packet capture and injection go through `/dev/bpf*`, which is root-only out of the box. To use EtherTalk as a regular user,
+install the **ChmodBPF** package that ships inside the Wireshark disk image (or run `brew install --cask wireshark-chmodbpf`).
+It creates an `access_bpf` group, hands the BPF devices to it, and adds you to the group.
+
+Group membership only applies to new login sessions, so **log out and back in** afterwards. Until then, and if ChmodBPF is not
+installed at all, the GUI hides the Ethernet Interface picker rather than offering a transport that would fail to start.
+
 ## Existing Programs
 There are 4 demo programs I have written to verify the functionality of this software as I have developed it:
 
@@ -133,7 +147,8 @@ There are 4 demo programs I have written to verify the functionality of this sof
 - [tailtalk-gui](/examples/tailtalk-gui/) - A simple GUI for sharing a folder as a volume over EtherTalk and/or LocalTalk (via TashTalk).
 
 All of the examples run a complete copy of the stack using a raw socket (if EtherTalk is enabled) and thus need to be run as root,
- or the appropriate setcap applied to the compiled binary. If only using TashTalk then this is not required.
+ or the appropriate setcap applied to the compiled binary (on macOS, ChmodBPF instead, see [EtherTalk](#ethertalk)). If only
+ using TashTalk then this is not required.
 
 ## Testing
 

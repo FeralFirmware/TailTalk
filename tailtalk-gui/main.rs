@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[cfg(any(feature = "ethertalk", feature = "tashtalk"))]
+#[cfg(any(ethertalk, feature = "tashtalk"))]
 use std::rc::Rc;
 #[cfg(feature = "tashtalk")]
 use std::cell::RefCell;
@@ -16,6 +16,8 @@ use tracing_subscriber::{EnvFilter, prelude::*};
 
 slint::include_modules!();
 
+#[cfg(ethertalk)]
+mod bpf;
 mod ipp_bridge;
 mod lw_bridge;
 mod printer_tool;
@@ -109,7 +111,7 @@ enum ServerCommand {
     Start {
         server_name: String,
         volume_name: String,
-        #[cfg(feature = "ethertalk")]
+        #[cfg(ethertalk)]
         ethernet: Option<String>,
         #[cfg(feature = "tashtalk")]
         tashtalk: Option<String>,
@@ -124,7 +126,7 @@ enum ServerCommand {
 
 // ── Interface enumeration ─────────────────────────────────────────────────────
 
-#[cfg(feature = "ethertalk")]
+#[cfg(ethertalk)]
 fn enumerate_ethernet() -> Vec<String> {
     let mut names = vec!["None".to_string()];
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
@@ -282,16 +284,32 @@ fn main() -> anyhow::Result<()> {
 
     let ui = AppWindow::new()?;
 
+    // EtherTalk is only usable if libpcap can open a BPF device, which on macOS
+    // means the ChmodBPF `access_bpf` group (or root). An interface picker we
+    // know will fail at Start is worse than none, so it gives way to a note
+    // explaining the fix.
+    #[cfg(ethertalk)]
+    let ethertalk_ready = bpf::capture_permitted();
+    #[cfg(not(ethertalk))]
+    let ethertalk_ready = false;
+    if cfg!(ethertalk) && !ethertalk_ready {
+        tracing::info!(
+            "Hiding the Ethernet interface picker: this session is not in the access_bpf \
+             group. Install Wireshark's ChmodBPF package, then log out and back in."
+        );
+    }
+
     // Inform the UI which transport sections to show
-    ui.set_feature_ethertalk(cfg!(feature = "ethertalk"));
+    ui.set_feature_ethertalk(ethertalk_ready);
+    ui.set_ethertalk_needs_chmodbpf(cfg!(ethertalk) && !ethertalk_ready);
     ui.set_feature_tashtalk(cfg!(feature = "tashtalk"));
 
-    #[cfg(feature = "ethertalk")]
+    #[cfg(ethertalk)]
     let ethernet_names = enumerate_ethernet();
     #[cfg(feature = "tashtalk")]
     let tashtalk_devices = Rc::new(RefCell::new(enumerate_serial()));
 
-    #[cfg(feature = "ethertalk")]
+    #[cfg(ethertalk)]
     {
         let eth_model: slint::ModelRc<SharedString> = Rc::new(slint::VecModel::from(
             ethernet_names
@@ -328,9 +346,18 @@ fn main() -> anyhow::Result<()> {
             .into(),
     );
 
+    // Kept aside so a run without BPF access writes the saved interface back
+    // untouched, rather than clearing a setting the user cannot currently see.
+    #[cfg(ethertalk)]
+    let saved_ethernet;
+
     // Restore previously saved settings
     {
         let config = load_config();
+        #[cfg(ethertalk)]
+        {
+            saved_ethernet = config.ethernet_interface.clone();
+        }
         if let Some(ref v) = config.server_name {
             ui.set_server_name(v.as_str().into());
         }
@@ -340,8 +367,9 @@ fn main() -> anyhow::Result<()> {
         if let Some(ref v) = config.volume_path {
             ui.set_volume_path(v.as_str().into());
         }
-        #[cfg(feature = "ethertalk")]
-        if let Some(ref iface) = config.ethernet_interface
+        #[cfg(ethertalk)]
+        if ethertalk_ready
+            && let Some(ref iface) = config.ethernet_interface
             && let Some(idx) = ethernet_names.iter().position(|n| n == iface)
         {
             ui.set_selected_ethernet(idx as i32);
@@ -392,7 +420,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let ui_weak = ui.as_weak();
-    #[cfg(feature = "ethertalk")]
+    #[cfg(ethertalk)]
     let eth_names = ethernet_names.clone();
     #[cfg(feature = "tashtalk")]
     let tash_devices = tashtalk_devices.clone();
@@ -405,14 +433,18 @@ fn main() -> anyhow::Result<()> {
                 tracing::warn!("Server command queue full; ignoring Stop");
             }
         } else {
-            #[cfg(feature = "ethertalk")]
-            let ethernet = {
-                let eth_idx = ui.get_selected_ethernet() as usize;
-                eth_names
-                    .get(eth_idx)
-                    .filter(|s| s.as_str() != "None")
-                    .cloned()
-            };
+            // Without BPF access the picker was never shown, so there is no
+            // selection to honour and EtherTalk stays out entirely.
+            #[cfg(ethertalk)]
+            let ethernet = ethertalk_ready
+                .then(|| {
+                    let eth_idx = ui.get_selected_ethernet() as usize;
+                    eth_names
+                        .get(eth_idx)
+                        .filter(|s| s.as_str() != "None")
+                        .cloned()
+                })
+                .flatten();
 
             #[cfg(feature = "tashtalk")]
             let tashtalk = {
@@ -425,7 +457,7 @@ fn main() -> anyhow::Result<()> {
 
             #[allow(unused_mut)]
             let mut any_transport = false;
-            #[cfg(feature = "ethertalk")]
+            #[cfg(ethertalk)]
             if ethernet.is_some() {
                 any_transport = true;
             }
@@ -527,9 +559,9 @@ fn main() -> anyhow::Result<()> {
                     { None }
                 },
                 ethernet_interface: {
-                    #[cfg(feature = "ethertalk")]
-                    { ethernet.clone() }
-                    #[cfg(not(feature = "ethertalk"))]
+                    #[cfg(ethertalk)]
+                    { if ethertalk_ready { ethernet.clone() } else { saved_ethernet.clone() } }
+                    #[cfg(not(ethertalk))]
                     { None }
                 },
                 pcap_enabled: ui.get_pcap_enabled(),
@@ -565,7 +597,7 @@ fn main() -> anyhow::Result<()> {
             let send_result = cmd_tx.try_send(ServerCommand::Start {
                 server_name: ui.get_server_name().to_string(),
                 volume_name: ui.get_volume_name().to_string(),
-                #[cfg(feature = "ethertalk")]
+                #[cfg(ethertalk)]
                 ethernet,
                 #[cfg(feature = "tashtalk")]
                 tashtalk,
@@ -939,7 +971,7 @@ async fn server_loop(
             ServerCommand::Start {
                 server_name,
                 volume_name,
-                #[cfg(feature = "ethertalk")]
+                #[cfg(ethertalk)]
                 ethernet,
                 #[cfg(feature = "tashtalk")]
                 tashtalk,
@@ -961,7 +993,7 @@ async fn server_loop(
                 tokio::spawn(run_server(
                     server_name,
                     volume_name,
-                    #[cfg(feature = "ethertalk")]
+                    #[cfg(ethertalk)]
                     ethernet,
                     #[cfg(feature = "tashtalk")]
                     tashtalk,
@@ -1907,7 +1939,7 @@ impl tailtalk::pap::PrintSink for LaserWriterSink {
 async fn run_server(
     server_name: String,
     volume_name: String,
-    #[cfg(feature = "ethertalk")] ethernet: Option<String>,
+    #[cfg(ethertalk)] ethernet: Option<String>,
     #[cfg(feature = "tashtalk")] tashtalk: Option<String>,
     volume: PathBuf,
     pcap_path: Option<PathBuf>,
@@ -1936,7 +1968,7 @@ async fn run_server(
     #[allow(unused_mut)]
     let mut stack_builder = TalkStack::builder();
 
-    #[cfg(feature = "ethertalk")]
+    #[cfg(ethertalk)]
     if let Some(ref intf) = ethernet {
         stack_builder = stack_builder.ethernet(intf);
     }
@@ -2084,18 +2116,18 @@ async fn run_server(
         }
     }
 
-    #[cfg(any(feature = "ethertalk", feature = "tashtalk"))]
+    #[cfg(any(ethertalk, feature = "tashtalk"))]
     {
-        #[cfg(all(feature = "ethertalk", feature = "tashtalk"))]
+        #[cfg(all(ethertalk, feature = "tashtalk"))]
         let transport_desc = match (&ethernet, &tashtalk) {
             (Some(eth), Some(tty)) => format!("{eth} + {tty}"),
             (Some(eth), None) => eth.clone(),
             (None, Some(tty)) => tty.clone(),
             (None, None) => unreachable!(),
         };
-        #[cfg(all(feature = "ethertalk", not(feature = "tashtalk")))]
+        #[cfg(all(ethertalk, not(feature = "tashtalk")))]
         let transport_desc = ethernet.as_deref().unwrap_or("(none)").to_string();
-        #[cfg(all(not(feature = "ethertalk"), feature = "tashtalk"))]
+        #[cfg(all(not(ethertalk), feature = "tashtalk"))]
         let transport_desc = tashtalk.as_deref().unwrap_or("(none)").to_string();
         tracing::info!("AFP server running on {transport_desc}");
     }
