@@ -178,6 +178,7 @@ mod tests {
                 dest_socket: 2,
                 payload: vec![0xAA; 100],
                 ddp_type: 0,
+                iface: AddressSource::Unknown as i32,
             })),
         }
     }

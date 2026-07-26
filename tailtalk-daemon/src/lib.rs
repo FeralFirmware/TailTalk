@@ -702,7 +702,17 @@ async fn socket_pump_outbound(
                 continue;
             }
         };
-        if let Err(e) = sender.send_to_typed(&send.payload, addr, protocol).await {
+        // Both EtherTalk phases name the same cable; UNKNOWN leaves a
+        // broadcast unscoped, i.e. going out on every interface.
+        let iface = match send.iface {
+            1 | 2 => Some(tailtalk::route_table::Interface::EtherTalk),
+            3 => Some(tailtalk::route_table::Interface::LocalTalk),
+            _ => None,
+        };
+        if let Err(e) = sender
+            .send_to_typed(&send.payload, addr, protocol, iface)
+            .await
+        {
             tracing::warn!("socket {socket_id}: send failed: {e}");
         }
     }

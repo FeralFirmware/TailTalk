@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::ddp::Packet;
+use crate::route_table::Interface;
 
 /// Where to reach the daemon.
 #[derive(Debug, Clone)]
@@ -180,6 +181,7 @@ impl RemoteClient {
         dest: AppleTalkAddress,
         dest_socket: u8,
         payload: &[u8],
+        iface: Option<Interface>,
     ) -> io::Result<()> {
         let req = proto::Request {
             id: 0,
@@ -192,6 +194,13 @@ impl RemoteClient {
                 dest_socket: dest_socket as u32,
                 payload: payload.to_vec(),
                 ddp_type: 0, // use the type the socket was opened with
+                // Phase 2 stands in for "the EtherTalk cable"; the daemon
+                // maps either phase back to the same interface.
+                iface: match iface {
+                    Some(Interface::EtherTalk) => proto::AddressSource::EthertalkPhase2 as i32,
+                    Some(Interface::LocalTalk) => proto::AddressSource::Localtalk as i32,
+                    None => proto::AddressSource::Unknown as i32,
+                },
             })),
         };
         self.req_tx

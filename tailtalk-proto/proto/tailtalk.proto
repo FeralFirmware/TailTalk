@@ -142,6 +142,17 @@ message SendDatagram {
   // the socket was opened with. Clients whose socket API carries the DDP
   // type per datagram (e.g. Netatalk's netddp) set this on every send.
   uint32 ddp_type = 5;
+  // Restricts a {0, 255} broadcast to the cable named here, instead of
+  // sending it on every interface the daemon has. Both EtherTalk phases
+  // name the same cable. UNKNOWN (the default) means "every interface",
+  // which is what unicast sends always use — their cable follows from the
+  // destination address.
+  //
+  // Needed when the payload itself carries one of the sender's addresses,
+  // as an NBP lookup's reply tuple does: that address differs per
+  // interface, and only the one belonging to the cable the datagram goes
+  // out on can be reached by the nodes receiving it.
+  AddressSource iface = 6;
 }
 
 enum AddressSource {
