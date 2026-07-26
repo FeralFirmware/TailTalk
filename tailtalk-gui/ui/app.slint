@@ -133,6 +133,7 @@ export component AppWindow inherits Window {
                         model: root.ethernet-interfaces;
                         current-index <=> root.selected-ethernet;
                         horizontal-stretch: 1;
+                        preferred-height: self.min-height;
                         enabled: !root.running;
 
                     }
@@ -157,6 +158,7 @@ export component AppWindow inherits Window {
                         model: root.tashtalk-ports;
                         current-index <=> root.selected-tashtalk;
                         horizontal-stretch: 1;
+                        preferred-height: self.min-height;
                         enabled: !root.running;
 
                     }
