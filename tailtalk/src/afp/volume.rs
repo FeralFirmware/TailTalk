@@ -32,8 +32,12 @@ struct TypeCreator {
 }
 
 /// Returns the `TypeCreator` by probing the file's content using pure-magic.
+///
+/// Must use `global()`, not `load()`: this runs once per file per directory
+/// listing, and `load()` rebuilds the whole compiled database each call (~37 ms
+/// in release) instead of sharing one `OnceLock` copy.
 fn infer_type_creator_from_content(path: &Path) -> Option<TypeCreator> {
-    let db = magic_db::load().ok()?;
+    let db = magic_db::global().ok()?;
     let magic = db.first_magic_file(path).ok()?;
 
     match magic.mime_type() {
@@ -267,8 +271,21 @@ impl Node {
             .await
             .map_err(|_| AfpError::ObjectNotFound)?;
 
+        // ATTRIBUTES and FINDER_INFO both come from the same Finder Info blob, and
+        // reading it can fall back to content-based type inference, so fetch it at
+        // most once and only when one of the two is actually asked for.
+        let finder_info = if bitmap.intersects(FPFileBitmap::ATTRIBUTES | FPFileBitmap::FINDER_INFO)
+        {
+            Some(self.get_finder_info(volume_root).await)
+        } else {
+            None
+        };
+
         if bitmap.contains(FPFileBitmap::ATTRIBUTES) {
-            let attributes = self.get_attributes(volume_root).await;
+            let invisible = finder_info
+                .as_ref()
+                .is_some_and(|fi| fi.flags.contains(FinderFlags::IS_INVISIBLE));
+            let attributes: u16 = if invisible { 0x0001 } else { 0 };
             output[offset..offset + 2].copy_from_slice(&attributes.to_be_bytes());
             offset += 2;
         }
@@ -297,7 +314,7 @@ impl Node {
         }
 
         if bitmap.contains(FPFileBitmap::FINDER_INFO) {
-            let raw: [u8; 32] = self.get_finder_info(volume_root).await.into();
+            let raw: [u8; 32] = finder_info.unwrap_or_default().into();
             output[offset..offset + 32].copy_from_slice(&raw);
             offset += 32;
         }
@@ -359,6 +376,15 @@ pub struct Volume {
     /// FPOpenFork access mode per fork_ref_num, used to reject writes to a
     /// read-only fork. 0 means the client left it unspecified (writes allowed).
     fork_access: HashMap<u16, u16>,
+    /// Current file offset per fork_ref_num, letting sequential reads and writes
+    /// skip the `seek` before each operation. Purely an optimisation: a missing
+    /// entry just means we seek, and I/O errors clear it so the next operation
+    /// re-seeks from a known state.
+    fork_pos: HashMap<u16, u64>,
+    /// Forks written since their last sync, as (node_id, fork_type). FPFlush syncs
+    /// only these rather than every open fork, so a flush after a read-only
+    /// traversal costs nothing.
+    dirty_forks: std::collections::HashSet<(u32, ForkType)>,
     next_fork_ref_num: u16,
     /// Tracks byte-range locks per fork. Key is fork_ref_num, value is a vector of (offset, length) tuples
     fork_locks: HashMap<u16, Vec<(u64, u64)>>,
@@ -562,6 +588,8 @@ impl Volume {
             next_id: 3, // Start IDs at 3 (1=Parent of Root, 2=Root)
             fork_ref_to_node_id: HashMap::new(),
             fork_access: HashMap::new(),
+            fork_pos: HashMap::new(),
+            dirty_forks: std::collections::HashSet::new(),
             next_fork_ref_num: 1,
             fork_locks: HashMap::new(),
             enum_cache: HashMap::new(),
@@ -1241,8 +1269,20 @@ impl Volume {
 
         let full_path = self.path.join(relative_path);
 
+        // As in `get_file_parms_resp`, ATTRIBUTES and FINDER_INFO share one read
+        // of the Finder Info blob rather than fetching it twice.
+        let finder_info =
+            if bitmap.intersects(FPDirectoryBitmap::ATTRIBUTES | FPDirectoryBitmap::FINDER_INFO) {
+                Some(node.get_finder_info(&self.path).await)
+            } else {
+                None
+            };
+
         if bitmap.contains(FPDirectoryBitmap::ATTRIBUTES) {
-            let attributes = node.get_attributes(&self.path).await;
+            let invisible = finder_info
+                .as_ref()
+                .is_some_and(|fi| fi.flags.contains(FinderFlags::IS_INVISIBLE));
+            let attributes: u16 = if invisible { 0x0001 } else { 0 };
             output[offset..offset + 2].copy_from_slice(&attributes.to_be_bytes());
             offset += 2;
         }
@@ -1271,7 +1311,7 @@ impl Volume {
         }
 
         if bitmap.contains(FPDirectoryBitmap::FINDER_INFO) {
-            let raw: [u8; 32] = node.get_finder_info(&self.path).await.into();
+            let raw: [u8; 32] = finder_info.unwrap_or_default().into();
             output[offset..offset + 32].copy_from_slice(&raw);
             offset += 32;
         }
@@ -1395,6 +1435,7 @@ impl Volume {
                 }
                 self.fork_ref_to_node_id.insert(fork_ref_num, (id, fork_type));
                 self.fork_access.insert(fork_ref_num, access_mode);
+                self.fork_pos.insert(fork_ref_num, 0);
 
                 output[offset..offset + 2].copy_from_slice(&bitmap.bits().to_be_bytes());
                 offset += 2;
@@ -1433,6 +1474,7 @@ impl Volume {
                 }
                 self.fork_ref_to_node_id.insert(fork_ref_num, (id, fork_type));
                 self.fork_access.insert(fork_ref_num, access_mode);
+                self.fork_pos.insert(fork_ref_num, 0);
 
                 output[offset..offset + 2].copy_from_slice(&bitmap.bits().to_be_bytes());
                 offset += 2;
@@ -1521,6 +1563,10 @@ impl Volume {
 
         self.fork_ref_to_node_id.remove(&fork_id);
         self.fork_access.remove(&fork_id);
+        self.fork_pos.remove(&fork_id);
+        // close_*_fork syncs on the way out, so this fork is clean (and its handle
+        // is gone, making a later flush a no-op regardless).
+        self.dirty_forks.remove(&(node_id, fork_type));
         self.fork_locks.remove(&fork_id);
 
         Ok(())
@@ -1557,35 +1603,54 @@ impl Volume {
         }
         .ok_or(AfpError::ObjectNotFound)?;
 
-        file.seek(std::io::SeekFrom::Start(read_req.offset as u64))
-            .await
-            .map_err(|e| {
+        let start_offset = read_req.offset as u64;
+        if self.fork_pos.get(&read_req.fork_id) != Some(&start_offset) {
+            if let Err(e) = file.seek(std::io::SeekFrom::Start(start_offset)).await {
                 error!("Failed to seek to offset {}: {:?}", read_req.offset, e);
-                AfpError::AccessDenied
-            })?;
+                self.fork_pos.remove(&read_req.fork_id);
+                return Err(AfpError::AccessDenied);
+            }
+            self.fork_pos.insert(read_req.fork_id, start_offset);
+        }
 
         let max_bytes = std::cmp::min(read_req.req_count as usize, output.len());
 
         let (bytes_read, is_eof) = if read_req.newline_mask != 0 {
+            // Read in bulk and scan for the newline in memory, rather than reading
+            // a byte at a time to avoid overshooting it.
             let mut total_read = 0;
             let mut hit_eof = false;
-            for i in 0..max_bytes {
-                match file.read_exact(&mut output[i..i + 1]).await {
-                    Ok(_) => {
-                        total_read += 1;
-                        if read_req.byte_matches_newline(output[i]) {
-                            break;
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            while total_read < max_bytes {
+                match file.read(&mut output[total_read..max_bytes]).await {
+                    Ok(0) => {
                         hit_eof = true;
                         break;
                     }
+                    Ok(n) => {
+                        let chunk_start = total_read;
+                        total_read += n;
+                        if let Some(i) = output[chunk_start..total_read]
+                            .iter()
+                            .position(|b| read_req.byte_matches_newline(*b))
+                        {
+                            // Keep everything through the newline and put the handle
+                            // back where the client expects it for the next read.
+                            total_read = chunk_start + i + 1;
+                            break;
+                        }
+                    }
                     Err(e) => {
                         error!("Failed to read from fork: {:?}", e);
+                        self.fork_pos.remove(&read_req.fork_id);
                         return Err(AfpError::AccessDenied);
                     }
                 }
+            }
+            let end_offset = start_offset + total_read as u64;
+            if let Err(e) = file.seek(std::io::SeekFrom::Start(end_offset)).await {
+                error!("Failed to rewind after newline scan: {:?}", e);
+                self.fork_pos.remove(&read_req.fork_id);
+                return Err(AfpError::AccessDenied);
             }
             (total_read, hit_eof)
         } else {
@@ -1605,12 +1670,16 @@ impl Volume {
                     }
                     Err(e) => {
                         error!("Failed to read from fork: {:?}", e);
+                        self.fork_pos.remove(&read_req.fork_id);
                         return Err(AfpError::AccessDenied);
                     }
                 }
             }
             (total_read, hit_eof)
         };
+
+        self.fork_pos
+            .insert(read_req.fork_id, start_offset + bytes_read as u64);
 
         Ok((bytes_read, is_eof))
     }
@@ -1626,6 +1695,7 @@ impl Volume {
             .get_mut(&node_id)
             .ok_or(AfpError::ObjectNotFound)?;
 
+        let mut resized = false;
         match fork_type {
             ForkType::Data => {
                 if cmd.resource_fork_length.is_some() {
@@ -1637,6 +1707,7 @@ impl Volume {
                         error!("Failed to set fork length: {:?}", e);
                         AfpError::AccessDenied
                     })?;
+                    resized = true;
                 }
             }
             ForkType::Resource => {
@@ -1652,8 +1723,17 @@ impl Volume {
                         error!("Failed to set resource fork length: {:?}", e);
                         AfpError::AccessDenied
                     })?;
+                    resized = true;
                 }
             }
+        }
+
+        // Only a request that actually resized the fork invalidates the cached
+        // offset (truncation can leave the handle past the new end of file) and
+        // leaves a new length to flush. A rejected or no-op request changes nothing.
+        if resized {
+            self.fork_pos.remove(&cmd.fork_ref_num);
+            self.dirty_forks.insert((node_id, fork_type));
         }
 
         Ok(())
@@ -2260,29 +2340,38 @@ impl Volume {
         Ok(new_id)
     }
 
-    /// Sync all open file handles to disk.
+    /// Flush written file contents to persistent storage, for FPFlush.
     ///
-    /// This ensures that both file content and metadata are written to persistent storage
-    /// for all currently open forks in the volume.
+    /// Only forks written since their last sync are touched. `sync_data` is
+    /// sufficient here: it persists the contents and the file size needed to read
+    /// them back, without `sync_all`'s extra metadata journal write.
     ///
     /// # Returns
     /// Ok(()) if all syncs succeeded, or an error if any sync operation failed
     pub async fn sync(&mut self) -> Result<(), AfpError> {
-        for node in self.nodes.values_mut() {
-            if let Some(file) = &mut node.data_fork {
-                file.sync_all().await.map_err(|e| {
-                    error!("Failed to sync data fork {:?}: {:?}", node.path, e);
-                    AfpError::AccessDenied
-                })?;
-            }
-            if let Some(file) = &mut node.resource_fork {
-                file.sync_all().await.map_err(|e| {
-                    error!("Failed to sync resource fork {:?}: {:?}", node.path, e);
-                    AfpError::AccessDenied
-                })?;
+        if self.dirty_forks.is_empty() {
+            return Ok(());
+        }
+
+        let mut result = Ok(());
+        for (node_id, fork_type) in std::mem::take(&mut self.dirty_forks) {
+            let Some(node) = self.nodes.get_mut(&node_id) else {
+                continue;
+            };
+            let file = match fork_type {
+                ForkType::Data => node.data_fork.as_mut(),
+                ForkType::Resource => node.resource_fork.as_mut(),
+            };
+            if let Some(file) = file
+                && let Err(e) = file.sync_data().await
+            {
+                error!("Failed to sync {:?} fork {:?}: {:?}", fork_type, node.path, e);
+                // Still dirty, so put it back for a later flush to retry.
+                self.dirty_forks.insert((node_id, fork_type));
+                result = Err(AfpError::AccessDenied);
             }
         }
-        Ok(())
+        result
     }
 
     /// Sync only the single fork named by `fork_id` to disk, for FPFlushFork.
@@ -2297,11 +2386,12 @@ impl Volume {
             ForkType::Resource => node.resource_fork.as_mut(),
         };
         if let Some(file) = file {
-            file.sync_all().await.map_err(|e| {
+            file.sync_data().await.map_err(|e| {
                 error!("Failed to sync fork {fork_id}: {:?}", e);
                 AfpError::AccessDenied
             })?;
         }
+        self.dirty_forks.remove(&(node_id, fork_type));
         Ok(())
     }
 
@@ -2321,14 +2411,14 @@ impl Volume {
             return Err(AfpError::AccessDenied);
         }
 
-        let (node_id, fork_type) = self
+        let &(node_id, fork_type) = self
             .fork_ref_to_node_id
             .get(&fork_id)
             .ok_or(AfpError::AccessDenied)?;
 
         let node = self
             .nodes
-            .get_mut(node_id)
+            .get_mut(&node_id)
             .ok_or(AfpError::ObjectNotFound)?;
 
         tracing::info!(
@@ -2346,11 +2436,29 @@ impl Volume {
         }
         .ok_or(AfpError::AccessDenied)?;
 
-        file.seek(tokio::io::SeekFrom::Start(offset))
-            .await
-            .map_err(|_| AfpError::MiscErr)?;
+        // Same conditional seek as `read`: sequential writes are already in position.
+        if self.fork_pos.get(&fork_id) != Some(&offset) {
+            if let Err(e) = file.seek(tokio::io::SeekFrom::Start(offset)).await {
+                error!("Failed to seek to offset {offset}: {:?}", e);
+                self.fork_pos.remove(&fork_id);
+                return Err(AfpError::MiscErr);
+            }
+            self.fork_pos.insert(fork_id, offset);
+        }
 
-        file.write_all(data).await.map_err(|_| AfpError::MiscErr)?;
+        let write_result = file.write_all(data).await;
+
+        // Mark dirty even on a partial/failed write: bytes may already have reached
+        // the page cache, and FPFlush must not skip them.
+        self.dirty_forks.insert((node_id, fork_type));
+
+        if let Err(e) = write_result {
+            error!("Failed to write to fork {fork_id}: {:?}", e);
+            self.fork_pos.remove(&fork_id);
+            return Err(AfpError::MiscErr);
+        }
+
+        self.fork_pos.insert(fork_id, offset + data.len() as u64);
 
         Ok(data.len())
     }
@@ -2422,6 +2530,26 @@ mod tests {
         let db = crate::afp::DesktopDatabase::open_or_create(&path).unwrap();
         Volume::new(name, path, 1, db).await
     }
+
+    /// Close a `Volume` and wait for its sled file lock to be released.
+    ///
+    /// `Volume` holds `sled::Tree` handles rather than the `Db`, and a live `Tree`
+    /// keeps the lock held. Dropping the `Volume` releases them, but the drop can
+    /// land on another tokio worker, so a restart-style test that reopens the same
+    /// path immediately can still hit `EWOULDBLOCK`. Block until the lock is
+    /// actually free so the reopen is deterministic.
+    async fn close_test_volume(volume: Volume) {
+        let path = volume.path.clone();
+        drop(volume);
+        for _ in 0..500 {
+            if crate::afp::DesktopDatabase::open_or_create(&path).is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("sled lock at {path:?} still held 500ms after dropping the Volume");
+    }
+
 
     #[test]
     fn afp_path_to_posix_strips_traversal() {
@@ -2867,6 +2995,187 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&buf[..n], rsrc_payload);
+    }
+
+    /// Open a data fork on a file containing `contents` and return the volume and fork ref.
+    async fn volume_with_open_data_fork(
+        dir: &Path,
+        name: &str,
+        contents: &[u8],
+    ) -> (Volume, u16) {
+        tokio::fs::write(dir.join(name), contents).await.unwrap();
+        let mut volume = make_test_volume("TestVol".to_string(), dir.to_path_buf()).await;
+        volume.walk_dir(PathBuf::new()).await.unwrap();
+
+        let mut output = [0u8; 256];
+        volume
+            .open_fork(
+                ForkType::Data,
+                FPFileBitmap::DATA_FORK_LENGTH,
+                0,
+                2,
+                &PathBuf::from(name),
+                &mut output,
+            )
+            .await
+            .unwrap();
+        let fork_ref = u16::from_be_bytes(output[2..4].try_into().unwrap());
+        (volume, fork_ref)
+    }
+
+    /// Reading with a newline mask stops just past the first matching byte, and
+    /// leaves the fork positioned there so the next sequential read continues
+    /// from the following line rather than skipping the buffered remainder.
+    #[tokio::test]
+    async fn test_read_newline_stops_and_leaves_offset_after_delimiter() {
+        let dir = tempdir().unwrap();
+        let (mut volume, fork_ref) =
+            volume_with_open_data_fork(dir.path(), "lines.txt", b"one\ntwo\nthree").await;
+
+        let read_line = |offset: u32| FPRead {
+            fork_id: fork_ref,
+            offset,
+            req_count: 256,
+            newline_mask: 0xFF,
+            newline_char: b'\n',
+        };
+
+        let mut buf = vec![0u8; 256];
+        let (n, _) = volume.read(&read_line(0), &mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"one\n", "read should stop just past the newline");
+
+        // The fork must now sit at offset 4, so the follow-up read picks up "two\n"
+        // instead of resuming past the bytes the bulk read pulled into memory.
+        let (n, _) = volume.read(&read_line(n as u32), &mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"two\n");
+
+        let (n, eof) = volume.read(&read_line(8), &mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"three");
+        assert!(eof, "final read with no trailing newline should report EOF");
+    }
+
+    /// Sequential reads reuse the cached fork position (skipping the seek), while a
+    /// random-access read still lands on the right bytes.
+    #[tokio::test]
+    async fn test_read_sequential_and_random_access_offsets() {
+        let dir = tempdir().unwrap();
+        let (mut volume, fork_ref) =
+            volume_with_open_data_fork(dir.path(), "abc.bin", b"ABCDEFGHIJ").await;
+
+        let read_at = |offset: u32, req_count: u32| FPRead {
+            fork_id: fork_ref,
+            offset,
+            req_count,
+            newline_mask: 0,
+            newline_char: 0,
+        };
+
+        let mut buf = vec![0u8; 4];
+        let (n, _) = volume.read(&read_at(0, 4), &mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ABCD");
+        assert_eq!(volume.fork_pos.get(&fork_ref), Some(&4));
+
+        // Sequential: hits the no-seek path.
+        let (n, _) = volume.read(&read_at(4, 4), &mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"EFGH");
+
+        // Backwards seek must still be honoured.
+        let (n, _) = volume.read(&read_at(1, 3), &mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"BCD");
+        assert_eq!(volume.fork_pos.get(&fork_ref), Some(&4));
+    }
+
+    /// FPFlush only syncs forks that were actually written, and writing marks the
+    /// fork dirty so the flush is not skipped.
+    #[tokio::test]
+    async fn test_flush_tracks_dirty_forks() {
+        let dir = tempdir().unwrap();
+        let (mut volume, fork_ref) =
+            volume_with_open_data_fork(dir.path(), "data.bin", b"initial").await;
+
+        // Opening and reading alone leaves nothing to flush.
+        let mut buf = vec![0u8; 8];
+        volume
+            .read(
+                &FPRead { fork_id: fork_ref, offset: 0, req_count: 7, newline_mask: 0, newline_char: 0 },
+                &mut buf,
+            )
+            .await
+            .unwrap();
+        assert!(volume.dirty_forks.is_empty(), "a read must not dirty the fork");
+
+        volume.write_fork(fork_ref, 0, b"changed").await.unwrap();
+        assert!(!volume.dirty_forks.is_empty(), "a write must dirty the fork");
+
+        volume.sync().await.unwrap();
+        assert!(volume.dirty_forks.is_empty(), "flush must clear the dirty set");
+        assert_eq!(
+            tokio::fs::read(dir.path().join("data.bin")).await.unwrap(),
+            b"changed"
+        );
+    }
+
+    /// Newline reads must report EOF exactly as a byte-at-a-time scan would:
+    /// true when the file runs out before a delimiter, false when one is found.
+    #[tokio::test]
+    async fn test_read_newline_eof_semantics() {
+        let dir = tempdir().unwrap();
+
+        // No newline anywhere, file shorter than req_count -> EOF reported.
+        let (mut v, f) = volume_with_open_data_fork(dir.path(), "noeol.txt", b"abc").await;
+        let mut buf = vec![0u8; 64];
+        let (n, eof) = v.read(&FPRead { fork_id: f, offset: 0, req_count: 10,
+            newline_mask: 0xFF, newline_char: b'\n' }, &mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"abc");
+        assert!(eof, "running out of data before a delimiter must report EOF");
+
+        // Newline present -> not EOF, even though more data follows.
+        let dir2 = tempdir().unwrap();
+        let (mut v2, f2) = volume_with_open_data_fork(dir2.path(), "eol.txt", b"abc\ndef").await;
+        let (n, eof) = v2.read(&FPRead { fork_id: f2, offset: 0, req_count: 10,
+            newline_mask: 0xFF, newline_char: b'\n' }, &mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"abc\n");
+        assert!(!eof, "finding a delimiter is not EOF");
+
+        // Delimiter beyond req_count -> fills exactly req_count, not EOF.
+        let dir3 = tempdir().unwrap();
+        let (mut v3, f3) = volume_with_open_data_fork(dir3.path(), "far.txt", b"abcdefghij\nrest").await;
+        let (n, eof) = v3.read(&FPRead { fork_id: f3, offset: 0, req_count: 4,
+            newline_mask: 0xFF, newline_char: b'\n' }, &mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"abcd");
+        assert!(!eof, "hitting req_count before the delimiter is not EOF");
+    }
+
+    /// A rejected FPSetForkParms must not dirty the fork or drop its cached
+    /// offset: nothing on disk changed, so a later flush has nothing to do.
+    #[tokio::test]
+    async fn test_set_fork_parms_rejected_request_is_not_dirtying() {
+        let dir = tempdir().unwrap();
+        let (mut v, f) = volume_with_open_data_fork(dir.path(), "sz.bin", b"0123456789").await;
+
+        // Establish a cached position via a read.
+        let mut buf = vec![0u8; 4];
+        v.read(&FPRead { fork_id: f, offset: 0, req_count: 4, newline_mask: 0, newline_char: 0 },
+            &mut buf).await.unwrap();
+        assert_eq!(v.fork_pos.get(&f), Some(&4));
+
+        // Setting a resource-fork length on a data fork is a BitmapErr, and must
+        // leave both the dirty set and the cached offset untouched.
+        let err = v.set_fork_parms(FPSetForkParms {
+            fork_ref_num: f, file_bitmap: FPFileBitmap::RESOURCE_FORK_LENGTH,
+            data_fork_length: None, resource_fork_length: Some(1),
+        }).await.unwrap_err();
+        assert_eq!(err, AfpError::BitmapErr);
+        assert!(v.dirty_forks.is_empty(), "a rejected resize must not dirty the fork");
+        assert_eq!(v.fork_pos.get(&f), Some(&4), "a rejected resize must not drop the offset");
+
+        // A real resize does dirty it and does invalidate the offset.
+        v.set_fork_parms(FPSetForkParms {
+            fork_ref_num: f, file_bitmap: FPFileBitmap::DATA_FORK_LENGTH,
+            data_fork_length: Some(2), resource_fork_length: None,
+        }).await.unwrap();
+        assert!(!v.dirty_forks.is_empty(), "a real resize must dirty the fork");
+        assert_eq!(v.fork_pos.get(&f), None, "a real resize must drop the cached offset");
     }
 
     #[tokio::test]
@@ -3357,6 +3666,7 @@ mod tests {
             volume
                 .set_comment(2, Path::new("persist.txt"), b"survives restart")
                 .unwrap();
+            close_test_volume(volume).await;
         }
 
         // Second volume instance (simulates server restart): comment must still be there
@@ -3472,8 +3782,8 @@ mod tests {
         };
         volume.delete(&delete_req).await.unwrap();
 
-        // Drop the volume to release the sled handle, then reopen to verify the comment is gone.
-        drop(volume);
+        // Close the volume to release the sled handle, then reopen to verify the comment is gone.
+        close_test_volume(volume).await;
         let verify_db = crate::afp::DesktopDatabase::open_or_create(&root_path).unwrap();
         assert_eq!(
             crate::afp::DesktopDatabase::from_db(verify_db, 1).unwrap()
@@ -3650,6 +3960,7 @@ mod tests {
             let mut vol = make_test_volume("TestVol".to_string(), root_path.clone()).await;
             vol.open_dt().await.unwrap();
             vol.ensure_dir_populated(2).await.unwrap();
+            close_test_volume(vol).await;
         } // vol is dropped — in-memory path_to_id is gone, sled entry persists on disk.
 
         // Session 2: new Volume backed by the same on-disk DB; mangle entry survives.
