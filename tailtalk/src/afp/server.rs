@@ -1169,8 +1169,12 @@ impl AspSession {
         // Cap the output buffer to the ATP transport limit for this request.
         // req_count is allowed to exceed the ATP QuantumSize per spec; the server
         // must truncate to what fits so the client can issue a follow-up read.
+        // The ceiling is a whole number of ATP packets so no response wastes a
+        // partly-filled one.
         let atp_limit = command.atp_max_response_bytes;
-        let effective_len = (read_cmd.req_count as usize).min(atp_limit).min(4096);
+        let effective_len = (read_cmd.req_count as usize)
+            .min(atp_limit)
+            .min(crate::atp::ATP_MAX_DATA_PER_PACKET * 8);
         let mut output_buf = vec![0u8; effective_len];
 
         match our_volume.read(&read_cmd, &mut output_buf).await {

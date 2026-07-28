@@ -469,8 +469,22 @@ mod tests {
     use tempfile::tempdir;
 
     fn open_db(root: &std::path::Path) -> DesktopDatabase {
-        let db = DesktopDatabase::open_or_create(root).unwrap();
-        DesktopDatabase::from_db(db, 1).unwrap()
+        DesktopDatabase::from_db(DesktopDatabase::open_or_create(root).unwrap(), 1).unwrap()
+    }
+
+    /// Close a `DesktopDatabase` and wait for its sled file lock to be released.
+    /// It holds `sled::Tree` handles rather than the `Db`, and a live `Tree` keeps
+    /// the lock held, so a test reopening the same path needs the drop to complete
+    /// before it can succeed.
+    fn close_db(dt: DesktopDatabase, root: &std::path::Path) {
+        drop(dt);
+        for _ in 0..500 {
+            if DesktopDatabase::open_or_create(root).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("sled lock at {root:?} still held 500ms after dropping the database");
     }
 
     #[test]
@@ -503,6 +517,7 @@ mod tests {
         {
             let dt = open_db(dir.path());
             dt.register_mangle(&mangled, long_name);
+            close_db(dt, dir.path());
         }
 
         // Session 2: reopen the same on-disk DB and verify the entry is still there.
