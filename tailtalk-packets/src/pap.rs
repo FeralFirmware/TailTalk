@@ -27,18 +27,19 @@ impl TryFrom<u8> for PapFunction {
     type Error = PapError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(PapFunction::OpenConn),
-            2 => Ok(PapFunction::OpenConnReply),
-            3 => Ok(PapFunction::SendData),
-            4 => Ok(PapFunction::Data),
-            5 => Ok(PapFunction::Tickle),
-            6 => Ok(PapFunction::CloseConn),
-            7 => Ok(PapFunction::CloseConnReply),
-            8 => Ok(PapFunction::SendStatus),
-            9 => Ok(PapFunction::Status),
-            _ => Err(PapError::UnknownFunction { code: value }),
-        }
+        use PapFunction::*;
+        Ok(match value {
+            1 => OpenConn,
+            2 => OpenConnReply,
+            3 => SendData,
+            4 => Data,
+            5 => Tickle,
+            6 => CloseConn,
+            7 => CloseConnReply,
+            8 => SendStatus,
+            9 => Status,
+            _ => return Err(PapError::UnknownFunction { code: value }),
+        })
     }
 }
 
@@ -339,10 +340,12 @@ mod tests {
 
     #[test]
     fn test_atp_helpers() {
+        // A sequence number above 255 so the big-endian split across user bytes 2-3
+        // is actually exercised; a low-byte-only value would pass either way.
         let original = PapPacket {
             connection_id: 10,
             function: PapFunction::SendData,
-            sequence_num: 57,
+            sequence_num: 0x0139, // 313
             eof: false,
             data: b"Data Payload".to_vec(),
         };
@@ -350,11 +353,33 @@ mod tests {
         let (user_bytes, data) = original.to_atp_parts();
         assert_eq!(user_bytes[0], 10);
         assert_eq!(user_bytes[1], 3); // SendData
-        assert_eq!(user_bytes[2], 0); // reserved
-        assert_eq!(user_bytes[3], 57); // sequence_num
+        assert_eq!(user_bytes[2], 0x01); // sequence_num high byte
+        assert_eq!(user_bytes[3], 0x39); // sequence_num low byte
         assert_eq!(data, b"Data Payload");
 
         let parsed = PapPacket::parse_from_atp(user_bytes, data).expect("failed to parse from atp");
         assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn test_data_eof_flag_round_trip() {
+        // Data carries EOF in user byte 2 and has no sequence number; make sure the
+        // flag survives a round trip and doesn't get read back as a sequence number.
+        let original = PapPacket {
+            connection_id: 4,
+            function: PapFunction::Data,
+            sequence_num: 0,
+            eof: true,
+            data: b"tail".to_vec(),
+        };
+
+        let (user_bytes, data) = original.to_atp_parts();
+        assert_eq!(user_bytes[2], 1); // EOF set
+        assert_eq!(user_bytes[3], 0); // unused for Data
+
+        let parsed = PapPacket::parse_from_atp(user_bytes, data).expect("failed to parse from atp");
+        assert_eq!(original, parsed);
+        assert!(parsed.eof);
+        assert_eq!(parsed.sequence_num, 0);
     }
 }

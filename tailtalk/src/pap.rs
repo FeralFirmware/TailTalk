@@ -13,6 +13,45 @@ use tokio::time::{Duration, interval};
 /// us to respond with 8 (i.e quantum size) ATP fragments per SendData request.
 pub const PAP_MAX_DATA_PER_PACKET: usize = 512;
 
+/// Default cap on how much printer stdout [`PapClient::read_response`] will accumulate
+/// before giving up. A printer stuck in a PostScript error loop can emit output forever;
+/// without a bound the read never returns and the buffer grows unchecked.
+pub const PAP_DEFAULT_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// How many recent replies to keep for answering printer retransmits. The PAP flow
+/// quantum caps outstanding SendData requests at 8, so 8 covers every request that can
+/// still be in flight.
+const PAP_REPLY_CACHE_LEN: usize = 8;
+
+/// Advance a PAP sequence number.
+///
+/// Spec: sequence numbers run 1–65535 then wrap back to 1; 0 is reserved to mean
+/// "unsequenced" and must never be produced by normal advancement.
+fn next_pap_seq(seq: u16) -> u16 {
+    if seq == u16::MAX { 1 } else { seq + 1 }
+}
+
+/// A reply we sent, kept so an identical retransmit gets the identical answer.
+type CachedReply = (u16, [u8; 4], Vec<u8>);
+
+/// Look up a cached reply by sequence number.
+fn cached_reply(cache: &std::collections::VecDeque<CachedReply>, seq: u16) -> Option<&CachedReply> {
+    cache.iter().find(|(s, _, _)| *s == seq)
+}
+
+/// Record a reply, evicting the oldest once the cache is full.
+fn remember_reply(
+    cache: &mut std::collections::VecDeque<CachedReply>,
+    seq: u16,
+    user_bytes: [u8; 4],
+    data: Vec<u8>,
+) {
+    if cache.len() == PAP_REPLY_CACHE_LEN {
+        cache.pop_front();
+    }
+    cache.push_back((seq, user_bytes, data));
+}
+
 #[derive(Debug)]
 pub struct PapClient {
     atp_requestor: AtpRequestor,
@@ -22,12 +61,19 @@ pub struct PapClient {
     remote_addr: AtpAddress,
     /// The printer's connection socket from OpenConnReply — used for all post-connect traffic.
     server_addr: AtpAddress,
-    /// Next SendData (read) sequence number. Continues across jobs for the
-    /// connection's lifetime — restarting it makes papd-style servers see stale retransmits.
+    /// Next SendData (read) sequence number. Reset by [`connect`](Self::connect), then
+    /// continues across every job for that connection's lifetime. Restarting it
+    /// mid-connection makes papd-style servers see stale retransmits.
     read_seq: u16,
     /// Override the read buffer size per SendData cycle. When `None`, capacity is
     /// `bitmap_count × PAP_MAX_DATA_PER_PACKET` derived from the printer's per-request bitmap.
     pub chunk_size: Option<usize>,
+    /// Cap on bytes accumulated by [`read_response`](Self::read_response).
+    /// Defaults to [`PAP_DEFAULT_MAX_RESPONSE_BYTES`].
+    pub max_response_bytes: usize,
+    /// Overall deadline for a single [`read_response`](Self::read_response) call.
+    /// Defaults to 60 s; `None` waits indefinitely for the printer's EOF.
+    pub response_timeout: Option<Duration>,
 }
 
 impl PapClient {
@@ -37,18 +83,12 @@ impl PapClient {
             atp_responder,
             connection_id: 0,
             flow_quantum: 8,
-            remote_addr: AtpAddress {
-                network_number: 0,
-                node_number: 0,
-                socket_number: 0,
-            },
-            server_addr: AtpAddress {
-                network_number: 0,
-                node_number: 0,
-                socket_number: 0,
-            },
+            remote_addr: AtpAddress::default(),
+            server_addr: AtpAddress::default(),
             read_seq: 1,
             chunk_size: None,
+            max_response_bytes: PAP_DEFAULT_MAX_RESPONSE_BYTES,
+            response_timeout: Some(Duration::from_secs(60)),
         }
     }
 
@@ -71,11 +111,22 @@ impl PapClient {
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
+            // Check before sending too: the ATP retry budget alone runs ~16 s, which
+            // would otherwise blow past a shorter caller-supplied timeout.
+            if tokio::time::Instant::now() >= deadline {
+                return Err(anyhow!("PAP OpenConn timed out after {:?}", timeout));
+            }
+
             tracing::info!("PAP: Sending OpenConn to {:?}", address);
-            let (resp_data, resp_user_bytes) = self
-                .atp_requestor
-                .send_request_with_bitmap(address, user_bytes, data.to_vec(), 0x01)
-                .await?;
+            let request = self.atp_requestor.send_request_with_bitmap(
+                address,
+                user_bytes,
+                data.to_vec(),
+                0x01,
+            );
+            let (resp_data, resp_user_bytes) = tokio::time::timeout_at(deadline, request)
+                .await
+                .map_err(|_| anyhow!("PAP OpenConn timed out after {:?}", timeout))??;
 
             let reply = PapPacket::parse_from_atp(resp_user_bytes, &resp_data)?;
 
@@ -94,11 +145,13 @@ impl PapClient {
             let result = ((reply.data[2] as u16) << 8) | (reply.data[3] as u16);
 
             if result != 0 {
-                if tokio::time::Instant::now() >= deadline {
+                // Per PAP spec, retry every 2 seconds, but never sleep past the deadline.
+                let retry_at = tokio::time::Instant::now() + Duration::from_secs(2);
+                if retry_at >= deadline {
                     return Err(anyhow!("PAP OpenConn failed with result code: {} (server busy)", result));
                 }
                 tracing::info!("PAP: Server busy (result={}), retrying in 2s", result);
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep_until(retry_at).await;
                 continue;
             }
 
@@ -126,11 +179,19 @@ impl PapClient {
         let mut last_activity = tokio::time::Instant::now();
         let mut tickle_interval = interval(Duration::from_secs(30));
         tickle_interval.tick().await; // skip the immediate first tick
-        let mut eof_sent = false;
-        // Skip the 30-s Tickle wait after EOF; return on the next printer SendData or a short deadline.
-        let mut eof_deadline: Option<tokio::time::Instant> = None;
-        // Retransmit of the same seq must get the identical reply, not fresh source bytes.
-        let mut last_reply: Option<(u16, [u8; 4], Vec<u8>)> = None;
+
+        // Once EOF is sent the job is delivered; all that remains is draining SendData
+        // requests the printer already had in flight, each of which holds an XO slot open
+        // until answered. `drain_deadline` bounds that wait so we never sit through the
+        // 30-s Tickle cycle for a printer that has nothing more to send.
+        let mut drain_deadline: Option<tokio::time::Instant> = None;
+
+        // A retransmit must get the byte-identical reply, never fresh source bytes:
+        // answering a duplicate with new data silently drops a chunk of the job. The
+        // printer may have up to `flow_quantum` (max 8) requests outstanding, so keep
+        // more than just the most recent reply.
+        let mut reply_cache: std::collections::VecDeque<CachedReply> =
+            std::collections::VecDeque::with_capacity(PAP_REPLY_CACHE_LEN);
 
         loop {
             tokio::select! {
@@ -152,32 +213,37 @@ impl PapClient {
                         PapFunction::SendData => {
                             let seq_num = pap_req.sequence_num;
 
+                            // A sequence number we have already answered is a retransmit
+                            // (our reply was lost). Replay the identical bytes, since reading
+                            // fresh ones from `source` would silently drop a chunk of the
+                            // job. Cache membership is the test rather than an ordering
+                            // comparison, so this stays correct across the 65535→1 wrap.
                             if seq_num != 0
-                                && let Some((seq, ub, chunk)) = &last_reply
-                                && *seq == seq_num
+                                && let Some((_, ub, chunk)) = cached_reply(&reply_cache, seq_num)
                             {
                                 let _ = req
-                                    .send_response_chunked(chunk.clone(), *ub, PAP_MAX_DATA_PER_PACKET)
+                                    .send_response_chunked(chunk, *ub, PAP_MAX_DATA_PER_PACKET)
                                     .await;
                                 continue;
                             }
 
-                            let max_packets = if req.bitmap == 0x00 { 8 } else { req.bitmap.count_ones() as usize }.clamp(1, 8);
-                            let capacity = self.chunk_size.unwrap_or(max_packets * PAP_MAX_DATA_PER_PACKET);
+                            let capacity = self
+                                .chunk_size
+                                .unwrap_or(req.max_packets() * PAP_MAX_DATA_PER_PACKET);
 
-                            let (n, buf) = if eof_sent {
-                                // Each ATP SendData is an XO transaction; the printer's slot stays
-                                // locked until it gets a response, so drain in-flight ones with EOF.
-                                (0, vec![])
+                            let buf = if drain_deadline.is_some() {
+                                // Post-EOF: answer in-flight requests with another EOF so the
+                                // printer can release its XO slots. Never touch `source` again.
+                                Vec::new()
                             } else {
                                 tracing::info!("PAP received SendData seq={}", seq_num);
                                 let mut buf = vec![0u8; capacity];
                                 let n = source.read(&mut buf).await?;
                                 buf.truncate(n);
-                                (n, buf)
+                                buf
                             };
 
-                            let eof = n == 0;
+                            let eof = buf.is_empty();
                             let pap_resp = PapPacket {
                                 connection_id: self.connection_id,
                                 function: PapFunction::Data,
@@ -186,25 +252,28 @@ impl PapClient {
                                 data: buf,
                             };
                             let (user_bytes, chunk_data) = pap_resp.to_atp_parts();
-                            req.send_response_chunked(chunk_data.to_vec(), user_bytes, PAP_MAX_DATA_PER_PACKET).await?;
+                            req.send_response_chunked(chunk_data, user_bytes, PAP_MAX_DATA_PER_PACKET).await?;
                             if seq_num != 0 {
-                                last_reply = Some((seq_num, user_bytes, chunk_data.to_vec()));
+                                remember_reply(&mut reply_cache, seq_num, user_bytes, chunk_data.to_vec());
                             }
 
-                            if eof && !eof_sent {
-                                tracing::info!("PAP: EOF sent");
-                                eof_sent = true;
-                                eof_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(500));
-                            } else if eof_sent {
-                                // Drained the in-flight SendData after our EOF; safe to return.
-                                return Ok(());
+                            match (eof, drain_deadline) {
+                                // First EOF: the job is delivered. Give the printer a brief
+                                // window to drain anything already in flight, then finish.
+                                (true, None) => {
+                                    tracing::info!("PAP: EOF sent");
+                                    drain_deadline =
+                                        Some(tokio::time::Instant::now() + Duration::from_millis(500));
+                                }
+                                // Answered an in-flight request after EOF; nothing left to drain.
+                                (_, Some(_)) => return Ok(()),
+                                (false, None) => {}
                             }
                         }
                         PapFunction::Tickle => {
                             tracing::debug!("PAP: Received Tickle from printer");
-                            if eof_sent {
-                                return Ok(());
-                            }
+                            // A Tickle is not a SendData, so it says nothing about whether the
+                            // printer still has requests in flight. Let `drain_deadline` decide.
                         }
                         PapFunction::CloseConn => {
                             let reply = PapPacket {
@@ -215,8 +284,8 @@ impl PapClient {
                                 data: vec![],
                             };
                             let (ub, d) = reply.to_atp_parts();
-                            let _ = req.send_response(d.to_vec(), ub).await;
-                            if eof_sent {
+                            let _ = req.send_response(d, ub).await;
+                            if drain_deadline.is_some() {
                                 return Ok(());
                             }
                             return Err(anyhow!("Printer closed the connection before the job completed"));
@@ -241,13 +310,15 @@ impl PapClient {
                     let _ = self.atp_requestor.send_alo(self.server_addr, ub).await;
                 }
 
+                // Fires only after EOF; `pending()` parks this arm for the rest of the job.
                 _ = async {
-                    match eof_deadline {
+                    match drain_deadline {
                         Some(d) => tokio::time::sleep_until(d).await,
                         None => std::future::pending().await,
                     }
                 } => {
-                    // Short deadline after EOF elapsed with no further printer activity.
+                    // Nothing further arrived after EOF, so the printer had no requests
+                    // left in flight and the job is done.
                     return Ok(());
                 }
             }
@@ -255,7 +326,20 @@ impl PapClient {
     }
 
     /// Pull the printer's PS stdout by issuing SendData requests until the printer sends EOF.
+    ///
+    /// Bounded by [`max_response_bytes`](Self::max_response_bytes) and
+    /// [`response_timeout`](Self::response_timeout). A printer stuck emitting output,
+    /// a PostScript error loop for instance, would otherwise never yield EOF.
     pub async fn read_response(&mut self) -> Result<Vec<u8>> {
+        match self.response_timeout {
+            Some(t) => tokio::time::timeout(t, self.read_response_inner())
+                .await
+                .map_err(|_| anyhow!("PAP: printer sent no EOF within {:?}", t))?,
+            None => self.read_response_inner().await,
+        }
+    }
+
+    async fn read_response_inner(&mut self) -> Result<Vec<u8>> {
         let mut response = Vec::new();
 
         loop {
@@ -276,12 +360,18 @@ impl PapClient {
                 return Err(anyhow!("Expected PAP Data response, got {:?}", data_pkt.function));
             }
 
-            // Spec: sequence numbers run 1–65535 then wrap back to 1; 0 is reserved (unsequenced).
-            self.read_seq = if self.read_seq == 65535 { 1 } else { self.read_seq + 1 };
+            self.read_seq = next_pap_seq(self.read_seq);
 
             response.extend_from_slice(&data_pkt.data);
             if data_pkt.eof {
                 break;
+            }
+
+            if response.len() > self.max_response_bytes {
+                return Err(anyhow!(
+                    "PAP: printer output exceeded {} bytes without EOF",
+                    self.max_response_bytes
+                ));
             }
         }
 
@@ -298,9 +388,18 @@ impl PapClient {
         };
         let (ub, d) = close_pkt.to_atp_parts();
         // Must go to server_addr (per-connection socket), not remote_addr (NBP listening socket).
-        self.atp_requestor
+        let (resp_data, resp_ub) = self
+            .atp_requestor
             .send_request_with_bitmap(self.server_addr, ub, d.to_vec(), 0x01)
             .await?;
+
+        let reply = PapPacket::parse_from_atp(resp_ub, &resp_data)?;
+        if reply.function != PapFunction::CloseConnReply {
+            return Err(anyhow!(
+                "Expected PAP CloseConnReply, got {:?}",
+                reply.function
+            ));
+        }
         Ok(())
     }
 
@@ -318,15 +417,21 @@ impl PapClient {
             .await?;
 
         let reply = PapPacket::parse_from_atp(resp_ub, &resp_data)?;
+        if reply.function != PapFunction::Status {
+            return Err(anyhow!("Expected PAP Status reply, got {:?}", reply.function));
+        }
 
         // Status reply: 4 unused bytes, then a pascal string (length byte then content).
-        if reply.data.len() > 5 {
-            let len = reply.data[4] as usize;
-            let end = (5 + len).min(reply.data.len());
-            Ok(String::from_utf8_lossy(&reply.data[5..end]).to_string())
-        } else {
-            Ok("".to_string())
-        }
+        // A well-formed reply with an empty string is exactly 5 bytes, so anything
+        // shorter is malformed rather than merely empty.
+        let Some(&len) = reply.data.get(4) else {
+            return Err(anyhow!(
+                "PAP Status reply too short ({} bytes, need at least 5)",
+                reply.data.len()
+            ));
+        };
+        let end = (5 + len as usize).min(reply.data.len());
+        Ok(String::from_utf8_lossy(&reply.data[5..end]).to_string())
     }
 }
 
@@ -547,7 +652,7 @@ impl PapServer {
                         data: status_payload,
                     };
                     let (ub, d) = reply.to_atp_parts();
-                    let _ = req.send_response(d.to_vec(), ub).await;
+                    let _ = req.send_response(d, ub).await;
                 }
                 PapFunction::OpenConn => {
                     if pap.data.len() < 2 {
@@ -594,7 +699,7 @@ impl PapServer {
             data: reply_data,
         };
         let (ub, d) = reply.to_atp_parts();
-        if let Err(e) = open_req.send_response(d.to_vec(), ub).await {
+        if let Err(e) = open_req.send_response(d, ub).await {
             tracing::warn!("PAP: failed to send OpenConnReply: {e}");
             return Ok(());
         }
@@ -619,7 +724,6 @@ impl PapServer {
             }
         };
 
-        // Spec: sequence numbers run 1–65535 then wrap to 1; 0 is reserved (unsequenced).
         let mut seq: u16 = 1;
         let mut pull = Box::pin(make_pull(seq));
 
@@ -632,8 +736,9 @@ impl PapServer {
         let mut pending_read: Option<(crate::atp::AtpReceivedRequest, u16)> = None;
         // Next expected client read sequence number, for spotting retransmits.
         let mut read_seq: u16 = 1;
-        // Re-sent verbatim if the client retransmits this read (reply lost on the wire).
-        let mut last_read_reply: Option<(u16, [u8; 4], Vec<u8>)> = None;
+        // Re-sent verbatim if the client retransmits a read (reply lost on the wire).
+        let mut read_reply_cache: std::collections::VecDeque<CachedReply> =
+            std::collections::VecDeque::with_capacity(PAP_REPLY_CACHE_LEN);
 
         let mut last_activity = tokio::time::Instant::now();
         let mut tickle_interval = interval(Duration::from_secs(30));
@@ -698,7 +803,7 @@ impl PapServer {
                                 response_ready = true;
                             }
 
-                            seq = if seq == 65535 { 1 } else { seq + 1 };
+                            seq = next_pap_seq(seq);
                             pull = Box::pin(make_pull(seq));
                         }
                         Err(_) => {
@@ -733,13 +838,13 @@ impl PapServer {
                             // A retransmit of an already-answered read means our reply
                             // was lost; anything else out of sequence is stale (papd's rseq check).
                             if pap.sequence_num != 0 && pap.sequence_num != read_seq {
-                                match &last_read_reply {
-                                    Some((seq, ub, chunk)) if *seq == pap.sequence_num => {
+                                match cached_reply(&read_reply_cache, pap.sequence_num) {
+                                    Some((_, ub, chunk)) => {
                                         let _ = req
-                                            .send_response_chunked(chunk.clone(), *ub, PAP_MAX_DATA_PER_PACKET)
+                                            .send_response_chunked(chunk, *ub, PAP_MAX_DATA_PER_PACKET)
                                             .await;
                                     }
-                                    _ => {
+                                    None => {
                                         tracing::debug!("PAP: ignoring stale client read seq={}", pap.sequence_num);
                                     }
                                 }
@@ -760,7 +865,7 @@ impl PapServer {
                                 data: vec![],
                             };
                             let (ub, d) = reply.to_atp_parts();
-                            let _ = req.send_response(d.to_vec(), ub).await;
+                            let _ = req.send_response(d, ub).await;
                             if !job_data.is_empty() {
                                 tracing::warn!(
                                     "PAP: client closed mid-job, discarding {} partial bytes",
@@ -795,7 +900,7 @@ impl PapServer {
                                 data: status_payload,
                             };
                             let (ub, d) = reply.to_atp_parts();
-                            let _ = req.send_response(d.to_vec(), ub).await;
+                            let _ = req.send_response(d, ub).await;
                         }
                         PapFunction::OpenConn => {
                             // Single-session server: refuse with a busy result; the driver retries every 2s.
@@ -810,7 +915,7 @@ impl PapServer {
                                 data: reply_data,
                             };
                             let (ub, d) = reply.to_atp_parts();
-                            let _ = req.send_response(d.to_vec(), ub).await;
+                            let _ = req.send_response(d, ub).await;
                         }
                         _ => {}
                     }
@@ -835,12 +940,9 @@ impl PapServer {
 
             // Answer a waiting client read once this job's output is ready; eof on the
             // final chunk tells the driver we're done, then we reset for the next job.
-            if response_ready && pending_read.is_some() {
-                let (req, this_seq) = pending_read.take().unwrap();
-                let max_packets =
-                    if req.bitmap == 0x00 { 8 } else { req.bitmap.count_ones() as usize }.clamp(1, 8);
+            if response_ready && let Some((req, this_seq)) = pending_read.take() {
                 let remaining = stdout.len().saturating_sub(stdout_pos);
-                let take = remaining.min(max_packets * PAP_MAX_DATA_PER_PACKET);
+                let take = remaining.min(req.max_packets() * PAP_MAX_DATA_PER_PACKET);
                 let chunk = stdout[stdout_pos..stdout_pos + take].to_vec();
                 let eof = stdout_pos + take >= stdout.len();
                 stdout_pos += take;
@@ -853,11 +955,11 @@ impl PapServer {
                 };
                 let (ub, d) = reply.to_atp_parts();
                 let _ = req
-                    .send_response_chunked(d.to_vec(), ub, PAP_MAX_DATA_PER_PACKET)
+                    .send_response_chunked(d, ub, PAP_MAX_DATA_PER_PACKET)
                     .await;
                 if this_seq != 0 {
-                    read_seq = if read_seq == 65535 { 1 } else { read_seq + 1 };
-                    last_read_reply = Some((this_seq, ub, d.to_vec()));
+                    read_seq = next_pap_seq(read_seq);
+                    remember_reply(&mut read_reply_cache, this_seq, ub, d.to_vec());
                 }
                 if eof {
                     // This job's output is fully served; ready for the next job.
@@ -1020,4 +1122,81 @@ fn pqp_font_answer(font_list: &str) -> String {
         .collect();
     lines.push("*".to_string());
     lines.join("\r")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn seq_wraps_past_zero() {
+        assert_eq!(next_pap_seq(1), 2);
+        assert_eq!(next_pap_seq(65534), 65535);
+        // 0 is reserved for "unsequenced" and must be skipped on wrap.
+        assert_eq!(next_pap_seq(65535), 1);
+    }
+
+    #[test]
+    fn reply_cache_answers_retransmits_out_of_order() {
+        let mut cache: VecDeque<CachedReply> = VecDeque::new();
+        for seq in 1..=4u16 {
+            remember_reply(&mut cache, seq, [0, 4, 0, 0], vec![seq as u8]);
+        }
+
+        // A retransmit of any still-cached seq must replay its own bytes, not the
+        // most recent reply; answering with fresh data would drop part of the job.
+        for seq in 1..=4u16 {
+            let (_, _, data) = cached_reply(&cache, seq).expect("reply should be cached");
+            assert_eq!(data, &vec![seq as u8]);
+        }
+        assert!(cached_reply(&cache, 9).is_none());
+    }
+
+    #[test]
+    fn reply_cache_evicts_oldest_when_full() {
+        let mut cache: VecDeque<CachedReply> = VecDeque::new();
+        for seq in 1..=(PAP_REPLY_CACHE_LEN as u16 + 2) {
+            remember_reply(&mut cache, seq, [0, 4, 0, 0], vec![seq as u8]);
+        }
+
+        assert_eq!(cache.len(), PAP_REPLY_CACHE_LEN);
+        // The two oldest aged out; everything within the flow quantum is retained.
+        assert!(cached_reply(&cache, 1).is_none());
+        assert!(cached_reply(&cache, 2).is_none());
+        assert!(cached_reply(&cache, 3).is_some());
+        assert!(cached_reply(&cache, PAP_REPLY_CACHE_LEN as u16 + 2).is_some());
+    }
+
+    #[test]
+    fn reply_cache_survives_sequence_wrap() {
+        // Around the 65535→1 wrap the cache holds both high and low numbers at once.
+        // Lookup is by membership, not ordering, so a fresh seq=1 after the wrap is
+        // only treated as a retransmit if it is genuinely still cached.
+        let mut cache: VecDeque<CachedReply> = VecDeque::new();
+        remember_reply(&mut cache, 65534, [0, 4, 0, 0], vec![0xAA]);
+        remember_reply(&mut cache, 65535, [0, 4, 0, 0], vec![0xBB]);
+
+        assert!(cached_reply(&cache, 1).is_none(), "post-wrap seq=1 is new, not a retransmit");
+        assert_eq!(cached_reply(&cache, 65535).unwrap().2, vec![0xBB]);
+    }
+
+    #[test]
+    fn pqp_answers_uam_query_with_no_authentication() {
+        let attrs = PrinterAttributes::default();
+        // Answering anything but "*" makes the LaserWriter driver believe a login is
+        // required and abort the query session.
+        assert_eq!(pqp_answer(&attrs, "RBIUAMListQuery", "fallback"), "*");
+        // Unrecognised queries fall back to the driver's own default.
+        assert_eq!(pqp_answer(&attrs, "SomeUnknownQuery", "fallback"), "fallback");
+    }
+
+    #[test]
+    fn pqp_stdout_answers_each_block_with_trailing_cr() {
+        let attrs = PrinterAttributes::default();
+        let job = b"%!PS-Adobe-3.0 Query\r\
+                    %%?BeginQuery: RBIUAMListQuery\r(*)= flush\r%%?EndQuery: *\r\
+                    %%?BeginFeatureQuery: *LanguageLevel\r%%?EndFeatureQuery: 1\r";
+        assert_eq!(pqp_stdout(&attrs, job), b"*\r2\r".to_vec());
+    }
 }

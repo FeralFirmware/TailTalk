@@ -15,6 +15,14 @@ pub const ATP_MAX_DATA_PER_PACKET: usize = 578;
 // Type aliases for complex channel types
 type AtpResponseChannel = oneshot::Sender<Result<(Vec<u8>, [u8; 4]), io::Error>>;
 
+/// How long to wait for a response before retransmitting a pending request.
+const ATP_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often the actor wakes to check for expired retransmit deadlines. Finer than
+/// [`ATP_RETRY_INTERVAL`] so each transaction's deadline is honoured to within a tick
+/// rather than being rounded to the shared timer's phase.
+const ATP_RETRY_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub struct PendingRequestState {
     pub chan: AtpResponseChannel,
     pub xo: bool,
@@ -29,12 +37,16 @@ pub struct PendingRequestState {
     pub requested_bitmap: u8,
     /// Number of retransmissions sent so far (not counting the initial send).
     pub retry_count: u8,
+    /// When this request next becomes eligible for retransmission. Tracked per
+    /// transaction so a request registered just before a timer tick still gets a
+    /// full [`ATP_RETRY_INTERVAL`] before its first retry.
+    pub retry_at: tokio::time::Instant,
 }
 
 type AtpTransactionMap = HashMap<u16, PendingRequestState>;
 
 // Helper struct since DdpAddress might be ambiguous if not imported carefully
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct AtpAddress {
     pub network_number: u16,
     pub node_number: u8,
@@ -47,6 +59,29 @@ impl From<tailtalk_packets::nbp::ServiceAddress> for AtpAddress {
             network_number: a.network_number,
             node_number: a.node_number,
             socket_number: a.socket_number,
+        }
+    }
+}
+
+impl From<AtpAddress> for crate::ddp::DdpAddress {
+    fn from(a: AtpAddress) -> Self {
+        crate::ddp::DdpAddress::new(
+            tailtalk_packets::aarp::AppleTalkAddress {
+                network_number: a.network_number,
+                node_number: a.node_number,
+            },
+            a.socket_number,
+        )
+    }
+}
+
+impl AtpAddress {
+    /// Build an address from the source fields of a received DDP packet.
+    fn from_ddp_source(ddp: &DdpPacket) -> Self {
+        Self {
+            network_number: ddp.src_network_num,
+            node_number: ddp.src_node_id,
+            socket_number: ddp.src_sock_num,
         }
     }
 }
@@ -101,68 +136,43 @@ pub struct AtpReceivedRequest {
     pub user_bytes: [u8; 4],
     pub data: Vec<u8>,
     pub response_sender: mpsc::Sender<AtpCommand>,
-    pub release_rx: Option<oneshot::Receiver<()>>,
     /// The ATP bitmap from the request: each set bit = one response packet the client will accept.
     /// bit 0 = packet 0, bit 1 = packet 1, ..., bit 7 = packet 7 (max 8 packets).
     pub bitmap: u8,
 }
 
 impl AtpReceivedRequest {
+    /// Number of response packets this request's bitmap allows us to send (1-8).
+    ///
+    /// IMPORTANT: Classic Mac OS sends bitmap=0x00 in ASP SPCommand TReqs, which is
+    /// non-standard per the ATP spec (0x00 means "no buffers"), but in practice it means
+    /// "no restriction": treat it the same as 0xFF (all 8 packets allowed). Clamping it
+    /// to 1 packet would silently truncate multi-packet responses and corrupt the
+    /// client's file offset.
+    pub fn max_packets(&self) -> usize {
+        let effective_bitmap = if self.bitmap == 0x00 { 0xFF } else { self.bitmap };
+        (effective_bitmap.count_ones() as usize).clamp(1, 8)
+    }
+
     /// Returns the maximum number of response data bytes this request can accept,
     /// derived from the client's ATP bitmap. Use this to cap response payloads
     /// before calling send_response so AFP/ASP layers can truncate cleanly.
     pub fn max_response_bytes(&self) -> usize {
-        let effective_bitmap = if self.bitmap == 0x00 { 0xFF } else { self.bitmap };
-        let max_packets = (effective_bitmap.count_ones() as usize).clamp(1, 8);
-        max_packets * ATP_MAX_DATA_PER_PACKET
+        self.max_packets() * ATP_MAX_DATA_PER_PACKET
     }
 
-    /// Send a response with automatic fragmentation.
+    /// Send a response with automatic fragmentation at the ATP packet limit.
     ///
     /// Respects the client's ATP bitmap: only sends as many packets as the client
-    /// declared it can receive (count of set bits in `self.bitmap`, max 8).
-    /// Sending more packets than the bitmap allows causes ASP error -1067 (aspBufTooSmall).
-    pub async fn send_response(&self, data: Vec<u8>, user_bytes: [u8; 4]) -> Result<(), io::Error> {
-        // The client bitmap tells us how many response packets it will accept.
-        // Each set bit in the bitmap corresponds to one acceptable packet (bit 0 = pkt 0, etc.).
-        //
-        // IMPORTANT: Classic Mac OS sends bitmap=0x00 in ASP SPCommand TReqs, which is non-standard
-        // per the ATP spec (0x00 means "no buffers"), but in practice it means "no restriction" —
-        // treat it the same as 0xFF (all 8 packets allowed). Clamping it to 1 packet would
-        // silently truncate multi-packet responses and corrupt the client's file offset.
-        let effective_bitmap = if self.bitmap == 0x00 {
-            0xFF
-        } else {
-            self.bitmap
-        };
-        let max_packets = (effective_bitmap.count_ones() as usize).clamp(1, 8);
-        let max_data = max_packets * ATP_MAX_DATA_PER_PACKET;
-
-        if data.len() > max_data {
-            tracing::warn!(
-                "ATP response truncated: {} bytes requested but client bitmap 0x{:02x} only allows {} bytes ({} packets)",
-                data.len(),
-                self.bitmap,
-                max_data,
-                max_packets
-            );
-        }
-
-        // Split data into chunks, honouring the client's bitmap limit
-        let mut packets: Vec<AtpResponse> = data[..data.len().min(max_data)]
-            .chunks(ATP_MAX_DATA_PER_PACKET)
-            .map(|chunk| AtpResponse {
-                data: chunk.to_vec(),
-                user_bytes,
-            })
-            .collect();
-
-        // ATP requires at least one TResp even for zero-length data.
-        if packets.is_empty() {
-            packets.push(AtpResponse { data: vec![], user_bytes });
-        }
-
-        self.send_response_internal(packets).await
+    /// declared it can receive. Sending more packets than the bitmap allows causes
+    /// ASP error -1067 (aspBufTooSmall).
+    pub async fn send_response(
+        &self,
+        data: impl AsRef<[u8]>,
+        user_bytes: [u8; 4],
+    ) -> Result<(), io::Error> {
+        self.send_response_chunked(data, user_bytes, ATP_MAX_DATA_PER_PACKET)
+            .await
     }
 
     /// Send a response fragmented at `chunk_size` bytes per ATP packet.
@@ -171,20 +181,32 @@ impl AtpReceivedRequest {
     /// `ATP_MAX_DATA_PER_PACKET`. PAP, for example, caps each packet at 512 bytes.
     pub async fn send_response_chunked(
         &self,
-        data: Vec<u8>,
+        data: impl AsRef<[u8]>,
         user_bytes: [u8; 4],
         chunk_size: usize,
     ) -> Result<(), io::Error> {
+        let data = data.as_ref();
         assert!(chunk_size > 0, "chunk_size must be positive");
-        let effective_bitmap = if self.bitmap == 0x00 { 0xFF } else { self.bitmap };
-        let max_packets = (effective_bitmap.count_ones() as usize).clamp(1, 8);
+        let max_packets = self.max_packets();
         let max_data = max_packets * chunk_size;
+
+        if data.len() > max_data {
+            tracing::warn!(
+                "ATP response truncated: {} bytes requested but client bitmap 0x{:02x} only allows {} bytes ({} packets of {})",
+                data.len(),
+                self.bitmap,
+                max_data,
+                max_packets,
+                chunk_size
+            );
+        }
 
         let mut packets: Vec<AtpResponse> = data[..data.len().min(max_data)]
             .chunks(chunk_size)
             .map(|chunk| AtpResponse { data: chunk.to_vec(), user_bytes })
             .collect();
 
+        // ATP requires at least one TResp even for zero-length data.
         if packets.is_empty() {
             packets.push(AtpResponse { data: vec![], user_bytes });
         }
@@ -289,8 +311,6 @@ pub struct Atp {
     cmd_tx: mpsc::Sender<AtpCommand>,
     // Map Transaction ID to pending request channel and XO status
     pending_transactions: AtpTransactionMap,
-    // Map (Source, TID) to release signal channel
-    pending_releases: HashMap<(AtpAddress, u16), oneshot::Sender<()>>,
     next_tid: u16,
 }
 
@@ -315,7 +335,6 @@ impl Atp {
             incoming_req_tx,
             cmd_tx: request_send.clone(),
             pending_transactions: HashMap::new(),
-            pending_releases: HashMap::new(),
             next_tid: 1, // Start TID at 1
         };
 
@@ -338,7 +357,7 @@ impl Atp {
     }
 
     async fn run(mut self) {
-        let mut retry_interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+        let mut retry_interval = tokio::time::interval(ATP_RETRY_TICK);
         retry_interval.tick().await; // skip the immediate first tick
 
         loop {
@@ -386,11 +405,18 @@ impl Atp {
         // ATP spec: give up after 8 retransmits (9 total attempts).
         const MAX_RETRIES: u8 = 8;
 
+        let now = tokio::time::Instant::now();
         let mut to_evict: Vec<u16> = Vec::new();
         let mut to_resend: Vec<(u16, Vec<u8>, AtpAddress)> = Vec::new();
 
+        // Only touch transactions whose own deadline has elapsed, so a request
+        // registered just before a tick still gets its full retry interval.
         for (tid, state) in &mut self.pending_transactions {
+            if now < state.retry_at {
+                continue;
+            }
             state.retry_count += 1;
+            state.retry_at = now + ATP_RETRY_INTERVAL;
             if state.retry_count > MAX_RETRIES {
                 to_evict.push(*tid);
             } else {
@@ -409,14 +435,7 @@ impl Atp {
         }
 
         for (tid, packet, dest_addr) in to_resend {
-            let dest = crate::ddp::DdpAddress::new(
-                tailtalk_packets::aarp::AppleTalkAddress {
-                    network_number: dest_addr.network_number,
-                    node_number: dest_addr.node_number,
-                },
-                dest_addr.socket_number,
-            );
-            if let Err(e) = self.sock.send_to(&packet, dest).await {
+            if let Err(e) = self.sock.send_to(&packet, dest_addr.into()).await {
                 tracing::warn!("ATP retransmit failed for TID {}: {}", tid, e);
             } else {
                 tracing::debug!("ATP retransmitting TID {}", tid);
@@ -424,25 +443,33 @@ impl Atp {
         }
     }
 
-    async fn handle_send_request(&mut self, req: AtpSendRequest) {
-        // Skip any TID that is still in pending_transactions to prevent aliasing a live
-        // transaction on wrapping. A freed TID is naturally eligible for reuse.
-        let tid = {
-            let start = self.next_tid;
-            loop {
-                let candidate = self.next_tid;
-                self.next_tid = self.next_tid.wrapping_add(1);
-                if !self.pending_transactions.contains_key(&candidate) {
-                    break candidate;
-                }
-                if self.next_tid == start {
-                    let _ = req.chan.send(Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "ATP: all transaction IDs in use",
-                    )));
-                    return;
-                }
+    /// Allocate a transaction ID that is not currently in flight.
+    ///
+    /// Skips any TID still in `pending_transactions` to prevent aliasing a live
+    /// transaction on wrapping, since a late response for a reused TID would otherwise be
+    /// misrouted into the wrong transaction's reassembly buffer. A freed TID is
+    /// naturally eligible for reuse. Returns `None` if all 65536 IDs are in flight.
+    fn allocate_tid(&mut self) -> Option<u16> {
+        let start = self.next_tid;
+        loop {
+            let candidate = self.next_tid;
+            self.next_tid = self.next_tid.wrapping_add(1);
+            if !self.pending_transactions.contains_key(&candidate) {
+                return Some(candidate);
             }
+            if self.next_tid == start {
+                return None;
+            }
+        }
+    }
+
+    async fn handle_send_request(&mut self, req: AtpSendRequest) {
+        let Some(tid) = self.allocate_tid() else {
+            let _ = req.chan.send(Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "ATP: all transaction IDs in use",
+            )));
+            return;
         };
 
         let packet = AtpPacket {
@@ -455,13 +482,8 @@ impl Atp {
             user_bytes: req.user_bytes,
         };
 
-        let mut buf = [0u8; 600]; // DDP max is 586
-
-        let header_len = packet
-            .to_bytes(&mut buf)
-            .expect("failed to serialize ATP header");
-
-        let total_len = header_len + req.data.len();
+        // Check the length before serializing: the copy below would otherwise panic
+        // on an out-of-range slice for oversized data.
         if req.data.len() > ATP_MAX_DATA_PER_PACKET {
             tracing::error!(
                 "ATP request data too large: {} (max {})",
@@ -475,20 +497,18 @@ impl Atp {
             return;
         }
 
-        buf[header_len..total_len].copy_from_slice(&req.data);
+        let mut buf = [0u8; 600]; // DDP max is 586
 
-        // Construct DdpAddress
-        let dest = crate::ddp::DdpAddress::new(
-            tailtalk_packets::aarp::AppleTalkAddress {
-                network_number: req.address.network_number,
-                node_number: req.address.node_number,
-            },
-            req.address.socket_number,
-        );
+        let header_len = packet
+            .to_bytes(&mut buf)
+            .expect("failed to serialize ATP header");
+
+        let total_len = header_len + req.data.len();
+        buf[header_len..total_len].copy_from_slice(&req.data);
 
         let raw_packet = buf[..total_len].to_vec();
 
-        if let Err(e) = self.sock.send_to(&buf[..total_len], dest).await {
+        if let Err(e) = self.sock.send_to(&buf[..total_len], req.address.into()).await {
             let _ = req.chan.send(Err(io::Error::other(e)));
         } else {
             self.pending_transactions.insert(
@@ -503,6 +523,7 @@ impl Atp {
                     destination: req.address,
                     requested_bitmap: req.bitmap,
                     retry_count: 0,
+                    retry_at: tokio::time::Instant::now() + ATP_RETRY_INTERVAL,
                 },
             );
         }
@@ -533,24 +554,20 @@ impl Atp {
 
             buf[header_len..total_len].copy_from_slice(&node.data);
 
-            let dest = crate::ddp::DdpAddress::new(
-                tailtalk_packets::aarp::AppleTalkAddress {
-                    network_number: resp.destination.network_number,
-                    node_number: resp.destination.node_number,
-                },
-                resp.destination.socket_number,
-            );
-
-            if let Err(e) = self.sock.send_to(&buf[..total_len], dest).await {
+            if let Err(e) = self.sock.send_to(&buf[..total_len], resp.destination.into()).await {
                 tracing::error!("Failed to send ATP response packet {}: {}", i, e);
             }
         }
-
     }
 
     async fn handle_send_alo(&mut self, alo: AtpSendAlo) {
-        let tid = self.next_tid;
-        self.next_tid = self.next_tid.wrapping_add(1);
+        // Allocate through the same collision-checked path as real requests: a TID
+        // that aliased a live transaction would let a stray response for this ALO be
+        // reassembled into that transaction's buffer.
+        let Some(tid) = self.allocate_tid() else {
+            tracing::warn!("ATP: no free TID for ALO packet, dropping");
+            return;
+        };
 
         let packet = AtpPacket {
             function: AtpFunction::Request,
@@ -567,15 +584,7 @@ impl Atp {
             .to_bytes(&mut buf)
             .expect("failed to serialize ATP ALO header");
 
-        let dest = crate::ddp::DdpAddress::new(
-            tailtalk_packets::aarp::AppleTalkAddress {
-                network_number: alo.address.network_number,
-                node_number: alo.address.node_number,
-            },
-            alo.address.socket_number,
-        );
-
-        if let Err(e) = self.sock.send_to(&buf[..header_len], dest).await {
+        if let Err(e) = self.sock.send_to(&buf[..header_len], alo.address.into()).await {
             tracing::warn!("Failed to send ATP ALO packet: {}", e);
         }
         // No pending transaction registered — any response is silently discarded.
@@ -603,15 +612,7 @@ impl Atp {
             .to_bytes(&mut buf)
             .expect("failed to serialize ATP release header");
 
-        let dest = crate::ddp::DdpAddress::new(
-            tailtalk_packets::aarp::AppleTalkAddress {
-                network_number: rel.destination.network_number,
-                node_number: rel.destination.node_number,
-            },
-            rel.destination.socket_number,
-        );
-
-        if let Err(e) = self.sock.send_to(&buf[..header_len], dest).await {
+        if let Err(e) = self.sock.send_to(&buf[..header_len], rel.destination.into()).await {
             tracing::error!("Failed to send ATP Release: {}", e);
         }
     }
@@ -624,20 +625,40 @@ impl Atp {
             return;
         };
 
-        let mut full_data = Vec::new();
         let expected_count = state
             .eom_seq
             .map(|e| e as usize + 1)
             .unwrap_or(state.received_packets.len());
+
+        // Reassemble in sequence order. The caller is only signalled complete once every
+        // slot below EOM has arrived, so a gap here means the completion check let a
+        // partial transaction through. Report it rather than silently handing back a
+        // short buffer, which upper layers would read as a truncated (but successful) reply.
+        let mut full_data = Vec::new();
+        let mut missing = None;
         for i in 0..expected_count as u8 {
-            if let Some(p) = state.received_packets.remove(&i) {
-                full_data.extend_from_slice(&p);
+            match state.received_packets.remove(&i) {
+                Some(p) => full_data.extend_from_slice(&p),
+                None => {
+                    missing = Some(i);
+                    break;
+                }
             }
         }
-        let user_bytes = state.user_bytes.unwrap_or([0; 4]);
-        let xo = state.xo;
 
-        let _ = state.chan.send(Ok((full_data, user_bytes)));
+        let result = match missing {
+            Some(i) => {
+                debug_assert!(false, "ATP: completed TID {tid} missing response packet {i}");
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("ATP: incomplete response, missing packet {i} of {expected_count}"),
+                ))
+            }
+            None => Ok((full_data, state.user_bytes.unwrap_or([0; 4]))),
+        };
+
+        let xo = state.xo;
+        let _ = state.chan.send(result);
 
         if xo {
             let rel = AtpSendRelease { destination: source, tid };
@@ -663,27 +684,12 @@ impl Atp {
                     Vec::new()
                 };
 
-                let from = AtpAddress {
-                    network_number: ddp.src_network_num,
-                    node_number: ddp.src_node_id,
-                    socket_number: ddp.src_sock_num,
-                };
-
-                let release_rx = if packet.xo {
-                    let (tx, rx) = oneshot::channel();
-                    self.pending_releases.insert((from, packet.tid), tx);
-                    Some(rx)
-                } else {
-                    None
-                };
-
                 let req = AtpReceivedRequest {
                     transaction_id: packet.tid,
-                    source: from,
+                    source: AtpAddress::from_ddp_source(&ddp),
                     user_bytes: packet.user_bytes,
                     data: request_data,
                     response_sender: self.cmd_tx.clone(),
-                    release_rx,
                     bitmap: packet.bitmap_seq_num,
                 };
 
@@ -731,29 +737,19 @@ impl Atp {
                 // `entry` (and its borrow of pending_transactions) is dropped here,
                 // so complete_transaction is free to remove it.
                 if is_complete {
-                    let source = AtpAddress {
-                        network_number: ddp.src_network_num,
-                        node_number: ddp.src_node_id,
-                        socket_number: ddp.src_sock_num,
-                    };
-                    self.complete_transaction(packet.tid, source).await;
+                    self.complete_transaction(packet.tid, AtpAddress::from_ddp_source(&ddp))
+                        .await;
                 }
             }
             AtpFunction::Release => {
-                let from = AtpAddress {
-                    network_number: ddp.src_network_num,
-                    node_number: ddp.src_node_id,
-                    socket_number: ddp.src_sock_num,
-                };
+                // We send TRel to close out our own XO requests, but nothing in this
+                // stack waits on an inbound one: responders here build each reply on
+                // demand rather than keeping a retry cache to be released. Log and drop.
                 tracing::debug!(
                     "Received ATP Release packet from {:?} tid={}",
-                    from,
+                    AtpAddress::from_ddp_source(&ddp),
                     packet.tid
                 );
-
-                if let Some(chan) = self.pending_releases.remove(&(from, packet.tid)) {
-                    let _ = chan.send(());
-                }
             }
         }
     }
