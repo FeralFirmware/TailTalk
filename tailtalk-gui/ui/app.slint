@@ -5,13 +5,7 @@ import { Button, ComboBox, LineEdit, HorizontalBox, VerticalBox, CheckBox, Palet
 export { PrinterToolWindow, PrinterRow } from "printer_tool.slint";
 
 export component AppWindow inherits Window {
-    title: "TailTalk AFP Server";
-    min-width: 400px;
-    preferred-width: 540px;
-    // Height is deliberately left to the layout. Rows come and go at runtime
-    // (the EtherTalk picker, the three LaserWriter rows), so any fixed height is
-    // wrong for some combination of them: a hardcoded one used to clip the Start
-    // button off the bottom once enough options were enabled.
+    title: "TailTalk";
 
     in-out property <string> server-name: "TailTalk AFP";
     in property <[string]> ethernet-interfaces;
