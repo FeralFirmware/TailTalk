@@ -55,26 +55,60 @@ fn crc16_ccitt(data: &[u8]) -> u16 {
 }
 
 /// A utility type for handling Macintosh Pascal strings (1-byte length prefix followed by MacRoman encoded data).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct MacString(String);
+///
+/// When decoded from the wire the number of bytes the string occupied is recorded
+/// alongside the decoded text. MacRoman decoding is not round-trip length
+/// preserving: a byte with no MacRoman mapping comes back from `encoding_rs` as an
+/// HTML numeric character reference (the literal ASCII `&#65533;`), so
+/// re-encoding a decoded string can be several times longer than the bytes it was
+/// read from. Parsers advance their offsets by [`Self::byte_len`], so that value
+/// has to be the real wire length or the offset walks past the end of the packet.
+#[derive(Debug, Clone, Default)]
+pub struct MacString {
+    value: String,
+    /// Bytes this string occupied on the wire (length prefix included), when it
+    /// came from [`TryFrom<&[u8]>`]. `None` for strings built in memory, which
+    /// have no wire representation yet.
+    wire_len: Option<usize>,
+}
+
+/// Compares the decoded text only. `wire_len` records where a string came from,
+/// not what it is, so a name parsed off the wire compares equal to the same name
+/// built in memory - which is what round-trip encode/decode checks rely on.
+impl PartialEq for MacString {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl Eq for MacString {}
+
+impl std::hash::Hash for MacString {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+    }
+}
 
 impl MacString {
     pub fn new(s: String) -> Self {
-        Self(s)
+        Self {
+            value: s,
+            wire_len: None,
+        }
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.value
     }
 
     pub fn into_string(self) -> String {
-        self.0
+        self.value
     }
 
     /// Encodes the string to MacRoman and writes it as a Pascal string to the provided buffer.
     /// Returns the number of bytes written (1 byte length + data).
     pub fn bytes(&self, buf: &mut [u8]) -> Result<usize, AfpError> {
-        let (encoded, _, _) = MACINTOSH.encode(&self.0);
+        let (encoded, _, _) = MACINTOSH.encode(&self.value);
         let len = encoded.len().min(255);
 
         if buf.len() < 1 + len {
@@ -87,11 +121,30 @@ impl MacString {
         Ok(1 + len)
     }
 
-    /// Returns the length in bytes of the MacRoman encoded Pascal string (1 byte length prefix + data).
+    /// Bytes this Pascal string occupies on the wire, length prefix included.
+    ///
+    /// For a string decoded from a packet this is exactly the number of bytes
+    /// consumed, so parsers can safely use it to advance an offset. For a string
+    /// built in memory it falls back to the encoded length, which is what a
+    /// subsequent [`Self::bytes`] call would write.
+    ///
+    /// Use [`Self::encoded_len`] instead when sizing a buffer to encode into:
+    /// the two differ whenever the MacRoman round trip is not length preserving.
     pub fn byte_len(&self) -> usize {
-        let (encoded, _, _) = MACINTOSH.encode(&self.0);
-        let len = encoded.len().min(255);
-        1 + len
+        match self.wire_len {
+            Some(len) => len,
+            None => self.encoded_len(),
+        }
+    }
+
+    /// Bytes [`Self::bytes`] would write for this string, length prefix included.
+    ///
+    /// This is the value to size an encode buffer with. It can exceed
+    /// [`Self::byte_len`] for a string decoded from bytes that have no MacRoman
+    /// round trip.
+    pub fn encoded_len(&self) -> usize {
+        let (encoded, _, _) = MACINTOSH.encode(&self.value);
+        1 + encoded.len().min(255)
     }
 }
 
@@ -108,7 +161,11 @@ impl TryFrom<&[u8]> for MacString {
 
         let len = buf[0] as usize;
         if len == 0 {
-            return Ok(MacString(String::new()));
+            // A zero-length name still occupies its length byte.
+            return Ok(MacString {
+                value: String::new(),
+                wire_len: Some(1),
+            });
         }
 
         if buf.len() < 1 + len {
@@ -118,13 +175,18 @@ impl TryFrom<&[u8]> for MacString {
         let string_data = &buf[1..1 + len];
         let (decoded, _, _) = MACINTOSH.decode(string_data);
 
-        Ok(MacString(decoded.into_owned()))
+        Ok(MacString {
+            value: decoded.into_owned(),
+            // Record what was actually consumed rather than recomputing it from
+            // the decoded text, which can re-encode to a different length.
+            wire_len: Some(1 + len),
+        })
     }
 }
 
 impl AsRef<str> for MacString {
     fn as_ref(&self) -> &str {
-        &self.0
+        &self.value
     }
 }
 
@@ -132,37 +194,119 @@ impl std::ops::Deref for MacString {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.value
     }
 }
 
 impl From<String> for MacString {
     fn from(s: String) -> Self {
-        Self(s)
+        Self::new(s)
     }
 }
 
 impl From<&str> for MacString {
     fn from(s: &str) -> Self {
-        Self(s.to_string())
+        Self::new(s.to_string())
     }
 }
 
 impl AsRef<std::ffi::OsStr> for MacString {
     fn as_ref(&self) -> &std::ffi::OsStr {
-        std::ffi::OsStr::new(&self.0)
+        std::ffi::OsStr::new(&self.value)
     }
 }
 
 impl std::fmt::Display for MacString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}", self.value)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name whose bytes have no MacRoman round trip must still report the
+    /// number of bytes it actually occupied. `0xFF 0xFE 0x0A` re-encodes to the
+    /// literal ASCII `&#65533;`, so the old implementation reported 9 for a
+    /// 4-byte field and pushed callers' offsets past the end of the packet.
+    #[test]
+    fn byte_len_reports_wire_length_not_reencoded_length() {
+        let wire: &[u8] = &[3, 0xFF, 0xFE, 0x0A];
+        let s = MacString::try_from(wire).expect("should decode");
+
+        assert_eq!(s.byte_len(), 4, "byte_len must be the bytes consumed");
+        assert!(
+            s.encoded_len() > s.byte_len(),
+            "this input is only interesting if re-encoding grows it",
+        );
+    }
+
+    /// Every valid Pascal string must report a wire length that fits the buffer
+    /// it was decoded from, for any length prefix and any byte values.
+    #[test]
+    fn byte_len_never_exceeds_source_buffer() {
+        for len in 0u8..=8 {
+            for filler in [0x00u8, 0x41, 0x80, 0xFE, 0xFF] {
+                let mut wire = vec![len];
+                wire.extend(std::iter::repeat_n(filler, len as usize));
+                let s = MacString::try_from(wire.as_slice()).expect("should decode");
+                assert!(
+                    s.byte_len() <= wire.len(),
+                    "byte_len {} exceeds the {}-byte source (len={len}, filler={filler:#04x})",
+                    s.byte_len(),
+                    wire.len(),
+                );
+            }
+        }
+    }
+
+    /// Re-encoding can also *shrink* a name, so no ordering holds between
+    /// `byte_len` and `encoded_len`. `0xFF 0xFE` is the UTF-16 byte order mark,
+    /// which the decoder consumes whole, leaving an empty string from two wire
+    /// bytes. Recomputing `byte_len` from the decoded text would under-report
+    /// here just as it over-reports elsewhere.
+    #[test]
+    fn byte_len_survives_a_name_that_decodes_to_nothing() {
+        let wire: &[u8] = &[2, 0xFF, 0xFE];
+        let s = MacString::try_from(wire).expect("should decode");
+
+        assert_eq!(s.as_str(), "", "the BOM is consumed by the decoder");
+        assert_eq!(s.byte_len(), 3, "byte_len must still be the bytes consumed");
+        assert!(s.byte_len() > s.encoded_len(), "re-encoding shrinks this name");
+    }
+
+    /// `encoded_len` is the buffer-sizing method, so `bytes` must always fit in
+    /// exactly that much space.
+    #[test]
+    fn encoded_len_sizes_a_buffer_that_bytes_fits() {
+        let wire: &[u8] = &[3, 0xFF, 0xFE, 0x0A];
+        let s = MacString::try_from(wire).expect("should decode");
+
+        let mut buf = vec![0u8; s.encoded_len()];
+        let written = s.bytes(&mut buf).expect("must fit encoded_len bytes");
+        assert_eq!(written, s.encoded_len());
+    }
+
+    /// Provenance must not leak into equality: the same name compares equal
+    /// whether it came off the wire or was built in memory.
+    #[test]
+    fn equality_ignores_wire_provenance() {
+        let parsed = MacString::try_from([5u8, b'M', b'a', b'c', b'O', b'S'].as_slice())
+            .expect("should decode");
+        let in_memory = MacString::from("MacOS");
+
+        assert_eq!(parsed, in_memory);
+
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let hash = |s: &MacString| {
+            let mut h = DefaultHasher::new();
+            s.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash(&parsed), hash(&in_memory), "Hash must match Eq");
+    }
 
     #[test]
     fn short_name_passes_through_unchanged() {
