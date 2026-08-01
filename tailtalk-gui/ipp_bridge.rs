@@ -25,6 +25,7 @@ use tailtalk::{
     adsp::AdspAddress,
     atp::{Atp, AtpAddress},
     ddp::DdpHandle,
+    imagewriter::{self, ImageWriter},
     nbp::NbpHandle,
     pap::PapClient,
     stylewriter::{
@@ -169,6 +170,7 @@ struct JobRecord {
 }
 
 /// Which AppleTalk print path a discovered printer uses.
+#[allow(clippy::enum_variant_names, reason = "these are Apple's product names")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PrinterKind {
     /// PostScript printer driven over PAP (NBP type "LaserWriter").
@@ -176,6 +178,10 @@ enum PrinterKind {
     /// Color StyleWriter behind an EtherTalk adapter, driven over ADSP
     /// (NBP type "ColorStyleWriter2400AT").
     StyleWriter,
+    /// Apple ImageWriter II driven over PAP (NBP type "ImageWriter"). No
+    /// PostScript interpreter, so every job is rasterized by Ghostscript rather
+    /// than handed to the printer as-is.
+    ImageWriter,
 }
 
 /// StyleWriters print at a fixed 360 dpi.
@@ -185,6 +191,18 @@ const SW_DPI: u32 = 360;
 const SW_LEFT_MARGIN_PX: usize = 72;
 const SW_TOP_MARGIN_ROWS: usize = 90;
 const SW_BOTTOM_MARGIN_ROWS: usize = 90;
+
+/// Ghostscript's `iwhi`/`iwhic` devices (ImageWriter II) are 160x144 dpi; report the
+/// lower (vertical) figure for `printer-resolution-*` since IPP wants one
+/// symmetric value and this errs toward not overstating detail.
+const IW_DPI: u32 = 144;
+/// Physical carriage width. Ghostscript's `iwhi` device page geometry crashes
+/// if asked for anything wider.
+const IW_MAX_WIDTH_PT: f32 = 612.0;
+/// Page height must be an exact multiple of this many points (48 dots at
+/// 144dpi). Anything else makes gdevadmp's internal band-buffer sizing return a
+/// negative "unexpected value" and abort the whole job.
+const IW_HEIGHT_GRANULARITY_PT: f32 = 24.0;
 
 #[derive(Clone)]
 struct PrinterCaps {
@@ -226,12 +244,87 @@ impl Printer {
     }
 }
 
+/// How long after a job finishes a printer stays safe from pruning. A printer
+/// that has just ejected a page can still be slow to answer NBP.
+const PRUNE_GRACE: Duration = Duration::from_secs(60);
+
+/// Which printers currently have a job on them, so discovery doesn't prune a
+/// printer we are in the middle of using.
+///
+/// A printer busy with a job may not answer NBP for the length of that job,
+/// which on an ImageWriter is minutes, and one missed lookup is otherwise
+/// enough to unregister it. Registrations are held for as long as a job is
+/// running and for [`PRUNE_GRACE`] after the last one finishes.
+#[derive(Default)]
+struct ActivePrinters(std::sync::Mutex<HashMap<String, PrinterActivity>>);
+
+#[derive(Default)]
+struct PrinterActivity {
+    /// Jobs in flight. Counted rather than a flag: jobs queue on `job_locks`,
+    /// so a second can be waiting while the first still holds the printer.
+    jobs: usize,
+    /// When the last job finished, starting the grace period.
+    idle_since: Option<Instant>,
+}
+
+impl ActivePrinters {
+    /// Protect `key` until the returned guard drops.
+    fn begin(self: &Arc<Self>, key: String) -> PrintingGuard {
+        let mut map = self.0.lock().unwrap();
+        let entry = map.entry(key.clone()).or_default();
+        entry.jobs += 1;
+        entry.idle_since = None;
+        PrintingGuard { owner: self.clone(), key }
+    }
+
+    /// Whether `key` is printing or still inside the grace period. Expired
+    /// entries are dropped here so the map doesn't grow with every job.
+    fn protected(&self, key: &str) -> bool {
+        let mut map = self.0.lock().unwrap();
+        let Some(activity) = map.get(key) else {
+            return false;
+        };
+        if activity.jobs > 0 {
+            return true;
+        }
+        match activity.idle_since {
+            Some(t) if t.elapsed() < PRUNE_GRACE => true,
+            _ => {
+                map.remove(key);
+                false
+            }
+        }
+    }
+}
+
+/// Holds a printer's registration open for the life of a job. Releasing on drop
+/// means an aborted or panicking job still starts the grace period rather than
+/// pinning the printer forever.
+struct PrintingGuard {
+    owner: Arc<ActivePrinters>,
+    key: String,
+}
+
+impl Drop for PrintingGuard {
+    fn drop(&mut self) {
+        let mut map = self.owner.0.lock().unwrap();
+        if let Some(activity) = map.get_mut(&self.key) {
+            activity.jobs = activity.jobs.saturating_sub(1);
+            if activity.jobs == 0 {
+                activity.idle_since = Some(Instant::now());
+            }
+        }
+    }
+}
+
 struct BridgeState {
     printers: Arc<RwLock<Vec<Printer>>>,
     ddp: DdpHandle,
     jobs: RwLock<HashMap<u32, Arc<Mutex<JobRecord>>>>,
     next_job_id: AtomicU32,
     start_time: Instant,
+    /// Printers with a job on them, exempt from discovery pruning.
+    active: Arc<ActivePrinters>,
     /// Per-printer locks (keyed by printer key) serialising print sessions:
     /// LaserWriters accept one PAP connection at a time (and connect() gives
     /// up after 60s of busy-retries); StyleWriters likewise hold a single
@@ -255,14 +348,17 @@ pub async fn run(
         }
     };
 
+    let active: Arc<ActivePrinters> = Arc::new(ActivePrinters::default());
+
     let ddp2 = ddp.clone();
     let nbp2 = nbp.clone();
     let printers2 = printers.clone();
     let mdns2 = mdns.clone();
     let token2 = token.clone();
     let bridged2 = bridged_names.clone();
+    let active2 = active.clone();
 
-    discover(&nbp, &ddp, &printers, &mdns, &bridged_names).await;
+    discover(&nbp, &ddp, &printers, &mdns, &bridged_names, &active).await;
 
     let state = Arc::new(BridgeState {
         printers: printers.clone(),
@@ -270,6 +366,7 @@ pub async fn run(
         jobs: RwLock::new(HashMap::new()),
         next_job_id: AtomicU32::new(1),
         start_time: Instant::now(),
+        active,
         job_locks: std::sync::Mutex::new(HashMap::new()),
     });
 
@@ -298,7 +395,9 @@ pub async fn run(
         loop {
             tokio::select! {
                 _ = token2.cancelled() => break,
-                _ = interval.tick() => discover(&nbp2, &ddp2, &printers2, &mdns2, &bridged2).await,
+                _ = interval.tick() => {
+                    discover(&nbp2, &ddp2, &printers2, &mdns2, &bridged2, &active2).await
+                }
             }
         }
     });
@@ -361,6 +460,7 @@ fn printer_key(kind: PrinterKind, name: &str, addr: ServiceAddress) -> String {
     match kind {
         PrinterKind::LaserWriter => format!("{key}-{a}"),
         PrinterKind::StyleWriter => format!("{key}-{a}-sw"),
+        PrinterKind::ImageWriter => format!("{key}-{a}-iw"),
     }
 }
 
@@ -370,11 +470,13 @@ async fn discover(
     printers: &Arc<RwLock<Vec<Printer>>>,
     mdns: &ServiceDaemon,
     bridged_names: &crate::lw_bridge::BridgedNames,
+    active: &Arc<ActivePrinters>,
 ) {
     // (kind, NBP type pattern) for each supported printer family.
-    let lookups: [(PrinterKind, &str); 2] = [
+    let lookups: [(PrinterKind, &str); 3] = [
         (PrinterKind::LaserWriter, "=:LaserWriter@*"),
         (PrinterKind::StyleWriter, "=:ColorStyleWriter2400AT@*"),
+        (PrinterKind::ImageWriter, "=:ImageWriter@*"),
     ];
 
     let entities: Vec<(PrinterKind, EntityName)> = lookups
@@ -421,7 +523,12 @@ async fn discover(
     let mut current_keys: HashSet<String> = {
         let mut current = printers.write().await;
         current.retain(|p| {
+            // A printer we are printing to may go quiet on NBP for the whole
+            // job, so keep it registered until the job has been done a while.
             if new_keys.contains(&p.key) || !lookup_ok.contains(&p.kind) {
+                true
+            } else if active.protected(&p.key) {
+                tracing::debug!("IPP bridge: '{}' missed a lookup but has a job on it", p.name);
                 true
             } else {
                 if let Ok(rx) = mdns.unregister(&p.mdns_fullname) { drop(rx); }
@@ -461,6 +568,15 @@ async fn discover(
                     Err(e) => {
                         tracing::warn!("IPP bridge: StyleWriter caps query for '{name}' failed ({e}), using defaults");
                         default_stylewriter_caps()
+                    }
+                }
+            }
+            PrinterKind::ImageWriter => {
+                match query_imagewriter_caps(ddp, addr.into()).await {
+                    Ok(caps) => caps,
+                    Err(e) => {
+                        tracing::warn!("IPP bridge: ImageWriter caps query for '{name}' failed ({e}), using defaults");
+                        default_imagewriter_caps()
                     }
                 }
             }
@@ -532,6 +648,49 @@ fn default_stylewriter_caps() -> PrinterCaps {
         media_default: "na_letter_8.5x11in".to_string(),
         tray_sources: vec!["main".into()],
     }
+}
+
+/// Fallback caps when an ImageWriter is discovered but its status query fails.
+/// Assume mono: a black ribbon is the common case, and printing a colour job
+/// through the colour Ghostscript device onto a black ribbon wastes a page,
+/// whereas mono on a colour ribbon still prints correctly (in black).
+fn default_imagewriter_caps() -> PrinterCaps {
+    PrinterCaps {
+        dpi: IW_DPI,
+        color: false,
+        model: "Apple ImageWriter II".to_string(),
+        media_default: "na_letter_8.5x11in".to_string(),
+        tray_sources: vec!["main".into()],
+    }
+}
+
+/// Query an ImageWriter's LocalTalk Option Card for the one capability it
+/// exposes: whether a colour ribbon is installed.
+///
+/// The sheet-feeder bit deliberately does not become a second `media-source`:
+/// the feeder replaces the friction/tractor path rather than adding a
+/// selectable tray, and there is no command to choose between them.
+async fn query_imagewriter_caps(ddp: &DdpHandle, addr: AtpAddress) -> anyhow::Result<PrinterCaps> {
+    let status = ImageWriter::status_of(ddp, addr).await?;
+
+    tracing::info!(
+        "IPP bridge: ImageWriter status 0x{:04X} ribbon={} feeder={} busy={}{}",
+        status.raw,
+        status.ribbon_text(),
+        status.sheet_feeder(),
+        status.busy(),
+        status.error_text().map(|e| format!(" error='{e}'")).unwrap_or_default(),
+    );
+
+    Ok(PrinterCaps {
+        color: status.color_ribbon(),
+        model: if status.color_ribbon() {
+            "Apple ImageWriter II (color ribbon)".to_string()
+        } else {
+            "Apple ImageWriter II".to_string()
+        },
+        ..default_imagewriter_caps()
+    })
 }
 
 /// Query a StyleWriter's model and installed cartridge over a short-lived
@@ -676,6 +835,35 @@ fn parse_pts_to_media(pts: &str) -> &'static str {
         }
     }
     "na_letter_8.5x11in"
+}
+
+/// A PWG media name → its nominal (width, height) in points, derived from
+/// `MEDIA_DIMENSIONS_HMM` so there is no second table to keep in step. Rounded
+/// to the nearest point: metric sizes don't land on whole points (true A4 is
+/// 595.28x841.89pt) and the forced page geometry doesn't need sub-point
+/// precision. Falls back to Letter for anything unrecognized.
+fn media_to_pts(name: &str) -> (f32, f32) {
+    let hmm_to_pt = |hmm: i32| (hmm as f32 * 72.0 / 2540.0).round();
+    media_dimensions_hmm(name)
+        .map(|(w, h)| (hmm_to_pt(w), hmm_to_pt(h)))
+        .unwrap_or((612.0, 792.0))
+}
+
+/// Clamp a requested page size to what Ghostscript's `iwhi` device can
+/// actually produce without crashing (see `IW_MAX_WIDTH_PT` /
+/// `IW_HEIGHT_GRANULARITY_PT`). Floors rather than rounds so the forced page
+/// is never taller/wider than the paper actually loaded.
+fn imagewriter_safe_page(w: f32, h: f32) -> (f32, f32) {
+    let w = w.min(IW_MAX_WIDTH_PT);
+    let h = (h / IW_HEIGHT_GRANULARITY_PT).floor().max(1.0) * IW_HEIGHT_GRANULARITY_PT;
+    (w, h)
+}
+
+/// `iwhic` is the colour twin of `iwhi`, driving the four-band colour ribbon.
+/// Mono jobs stay on `iwhi` even with a colour ribbon fitted, where they strike
+/// the ribbon's black band directly instead of laying down a composite.
+fn imagewriter_gs_device(color: bool) -> &'static str {
+    if color { "iwhic" } else { "iwhi" }
 }
 
 fn ipp_bytes(resp: IppRequestResponse) -> axum::response::Response {
@@ -853,11 +1041,15 @@ async fn handle_ipp(
                 let mut locks = state.job_locks.lock().unwrap();
                 locks.entry(printer.key.clone()).or_default().clone()
             };
+            // Held for the life of the job, whichever family runs it, so
+            // discovery leaves the printer registered while it is in use.
+            let active_guard = state.active.begin(printer.key.clone());
             match printer.kind {
                 PrinterKind::LaserWriter => {
                     let addr: AtpAddress = printer.addr.into();
                     let dpi = printer.caps.dpi;
                     tokio::spawn(async move {
+                        let _active_guard = active_guard;
                         job.lock().await.state_message = "Rasterizing".to_string();
                         let (ps, page_count) = match rasterize_to_ps(doc, &fmt, &tray, dpi, job_id).await {
                             Ok(r) => r,
@@ -912,7 +1104,89 @@ async fn handle_ipp(
                     );
                     tokio::spawn(run_stylewriter_job(
                         job, ddp, addr, doc, fmt, color, quality, username, job_lock, job_id,
+                        active_guard,
                     ));
+                }
+                PrinterKind::ImageWriter => {
+                    let addr: AtpAddress = printer.addr.into();
+                    let media_pts = job_media_pts(&parsed, &printer.caps.media_default);
+                    let wants_color = job_color_mode(&parsed).as_deref() != Some("monochrome");
+                    let caps_color = printer.caps.color;
+                    tracing::info!(
+                        "IPP: ImageWriter job {job_id}: media={media_pts:?}pt wants_color={wants_color}"
+                    );
+                    tokio::spawn(async move {
+                        let _active_guard = active_guard;
+                        // One socket, read twice: once now to pick the device, and
+                        // again once we hold the printer.
+                        let status = imagewriter::StatusHandle::new(&ddp, addr).await;
+
+                        // The ribbon can be swapped between discovery and now, and
+                        // the status call needs no connection, so ask again rather
+                        // than rasterize for a ribbon that has since changed.
+                        let color = match status.read().await {
+                            Ok(s) if s.out_of_paper() => {
+                                let msg = s.error_text().unwrap_or_else(|| "Out of paper".to_string());
+                                tracing::error!("IPP: ImageWriter job {job_id} refused: {msg}");
+                                let mut j = job.lock().await;
+                                j.state = JobState::Aborted;
+                                j.state_message = msg;
+                                return;
+                            }
+                            Ok(s) => wants_color && s.color_ribbon(),
+                            Err(e) => {
+                                // Not fatal: the job can still print, it just uses
+                                // the ribbon seen at discovery.
+                                tracing::warn!("IPP: ImageWriter job {job_id} status query failed ({e})");
+                                wants_color && caps_color
+                            }
+                        };
+                        job.lock().await.state_message = "Rasterizing".to_string();
+                        let raster = match rasterize_for_imagewriter(doc, &fmt, media_pts, color, job_id).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::error!("IPP: ImageWriter rasterize failed: {e}");
+                                let mut j = job.lock().await;
+                                j.state = JobState::Aborted;
+                                j.state_message = format!("Rasterize failed: {e}");
+                                return;
+                            }
+                        };
+                        tracing::info!("IPP: rasterized ImageWriter job {job_id} to {} bytes", raster.len());
+                        job.lock().await.state_message = "Waiting for printer".to_string();
+                        let _pap_guard = job_lock.lock().await;
+
+                        // The check above can be minutes stale by now if this job
+                        // queued behind another, so confirm there is still paper
+                        // before feeding it. A failed read is not fatal here; the
+                        // print itself is the better error in that case.
+                        if let Ok(s) = status.read().await
+                            && s.out_of_paper()
+                        {
+                            let msg = s.error_text().unwrap_or_else(|| "Out of paper".to_string());
+                            tracing::error!("IPP: ImageWriter job {job_id} refused at print time: {msg}");
+                            let mut j = job.lock().await;
+                            j.state = JobState::Aborted;
+                            j.state_message = msg;
+                            return;
+                        }
+
+                        job.lock().await.state_message = "Printing".to_string();
+                        match print_to_pap_imagewriter(ddp, addr, raster).await {
+                            Ok(()) => {
+                                let mut j = job.lock().await;
+                                j.impressions_completed = 1;
+                                j.state = JobState::Completed;
+                                j.state_message = "Completed".to_string();
+                            }
+                            Err(e) => {
+                                tracing::error!("IPP: job {job_id} PAP error: {e}");
+                                let mut j = job.lock().await;
+                                j.state = JobState::Aborted;
+                                j.state_message = format!("PAP error: {e}");
+                            }
+                        }
+                    });
                 }
             }
             job_created_response(job_id, &job_uri, req_id)
@@ -993,22 +1267,24 @@ fn printer_attributes(printer: &Printer, req_id: u32) -> axum::response::Respons
     let uri = format!("ipp://localhost:8631/ipp/{}", printer.key);
     let caps = &printer.caps;
 
-    // A StyleWriter with a black cartridge really is monochrome-only; the
-    // LaserWriter path always accepts color input (ghostscript converts).
+    // A StyleWriter with a black cartridge, or an ImageWriter with a black
+    // ribbon, really is monochrome-only; the LaserWriter path always accepts
+    // color input (ghostscript converts).
     let color_modes: &[&str] = match printer.kind {
-        PrinterKind::StyleWriter if !caps.color => &["monochrome"],
+        PrinterKind::StyleWriter | PrinterKind::ImageWriter if !caps.color => &["monochrome"],
         _ => &["auto", "color", "monochrome"],
     };
-    let color_mode_default = if printer.kind == PrinterKind::StyleWriter && caps.color {
-        "auto"
-    } else {
-        "monochrome"
+    let color_mode_default = match printer.kind {
+        PrinterKind::StyleWriter | PrinterKind::ImageWriter if caps.color => "auto",
+        _ => "monochrome",
     };
     // StyleWriter quality maps to the printer's own mode string (normal/best);
-    // draft has no known string, so it isn't offered there.
+    // draft has no known string, so it isn't offered there. `iwhi` doesn't
+    // distinguish quality tiers at all, so ImageWriter only offers Normal.
     let qualities: &[i32] = match printer.kind {
         PrinterKind::LaserWriter => &[3, 4, 5],
         PrinterKind::StyleWriter => &[4, 5],
+        PrinterKind::ImageWriter => &[4],
     };
 
     let mut add = |name: &str, val: IppValue| {
@@ -1055,7 +1331,11 @@ fn printer_attributes(printer: &Printer, req_id: u32) -> axum::response::Respons
         add("output-mode-supported", IppValue::Array(modes));
     }
     add("pages-per-minute", IppValue::Integer(
-        match printer.kind { PrinterKind::LaserWriter => 8, PrinterKind::StyleWriter => 1 },
+        match printer.kind {
+            PrinterKind::LaserWriter => 8,
+            PrinterKind::StyleWriter => 1,
+            PrinterKind::ImageWriter => 1,
+        },
     ));
     add("pdf-k-octets-supported", IppValue::RangeOfInteger { min: 1, max: 65535 });
     add("jpeg-k-octets-supported", IppValue::RangeOfInteger { min: 1, max: 65535 });
@@ -1234,6 +1514,58 @@ fn job_media_source(parsed: &IppRequestResponse) -> String {
     media_source.or(input_slot).unwrap_or_else(|| "main".to_string())
 }
 
+/// The page size the job asked for, in points, falling back to `default_media`.
+///
+/// Clients express this two ways and both turn up in practice: the flat `media`
+/// keyword, or a `media-col` collection carrying `media-size` dimensions. Since
+/// this bridge advertises `media-col-database`, AirPrint clients in particular
+/// tend to answer in the collection form.
+///
+/// Only the ImageWriter path needs this. The other families have a PostScript
+/// interpreter that honours the document's own page size, but the ImageWriter
+/// has to be told explicitly what geometry to force on Ghostscript.
+fn job_media_pts(parsed: &IppRequestResponse, default_media: &str) -> (f32, f32) {
+    let group = parsed.attributes().groups_of(DelimiterTag::JobAttributes).next();
+
+    let keyword = group
+        .and_then(|g| g.attributes().get("media"))
+        .and_then(|a| match a.value() {
+            IppValue::Keyword(k) => Some(k.as_str()),
+            IppValue::NameWithoutLanguage(n) => Some(n.as_str()),
+            _ => None,
+        });
+    if let Some(name) = keyword {
+        return media_to_pts(name);
+    }
+
+    // media-col → media-size → {x,y}-dimension, in hundredths of a mm.
+    let member = |coll: &IppValue, want: &str| -> Option<IppValue> {
+        match coll {
+            IppValue::Collection(members) => members
+                .iter()
+                .find(|(k, _)| k.as_str() == want)
+                .map(|(_, v)| v.clone()),
+            _ => None,
+        }
+    };
+    let dimension = |size: &IppValue, want: &str| -> Option<f32> {
+        match member(size, want) {
+            Some(IppValue::Integer(hmm)) => Some(hmm as f32 * 72.0 / 2540.0),
+            _ => None,
+        }
+    };
+    let size = group
+        .and_then(|g| g.attributes().get("media-col"))
+        .and_then(|a| member(a.value(), "media-size"));
+    if let Some(size) = size
+        && let (Some(w), Some(h)) = (dimension(&size, "x-dimension"), dimension(&size, "y-dimension"))
+    {
+        return (w.round(), h.round());
+    }
+
+    media_to_pts(default_media)
+}
+
 /// Extract the requested color mode: `print-color-mode`, falling back to the
 /// older Apple `output-mode` synonym.
 fn job_color_mode(parsed: &IppRequestResponse) -> Option<String> {
@@ -1392,17 +1724,29 @@ pub fn gs_probe() -> bool {
 
 /// Rasterize a PDF/PS/URF document with Ghostscript to a raw raster device
 /// (`pbmraw`, `ppmraw`, …) at `dpi`, returning the concatenated raw pages.
-async fn gs_raster(mut data: Vec<u8>, fmt: &str, device: &str, dpi: u32, job_token: u32) -> anyhow::Result<Vec<u8>> {
+async fn gs_raster(data: Vec<u8>, fmt: &str, device: &str, dpi: u32, job_token: u32) -> anyhow::Result<Vec<u8>> {
+    gs_device_run(data, fmt, device, &[format!("-r{dpi}")], job_token).await
+}
+
+/// Run Ghostscript over a document with `device_args` controlling how the
+/// device renders (resolution, page geometry, …), returning the device's raw
+/// output. Raw raster devices cannot write to stdout, so this goes via a temp
+/// file either way.
+async fn gs_device_run(
+    mut data: Vec<u8>,
+    fmt: &str,
+    device: &str,
+    device_args: &[String],
+    job_token: u32,
+) -> anyhow::Result<Vec<u8>> {
     // Track whether urf_to_rasterizable ran — on Linux it returns PostScript, not PDF.
     let is_urf = fmt == "image/urf" || data.starts_with(b"UNIRAST");
     if is_urf {
         data = urf_to_rasterizable(data, job_token).await?;
     }
 
-    // Raw raster devices cannot write to stdout, so use a temp file.
     let tmp = std::env::temp_dir();
     let out_path = tmp.join(format!("tailtalk-rip-{job_token}.{device}"));
-    let res_arg = format!("-r{dpi}");
     let dev_arg = format!("-sDEVICE={device}");
 
     // Use .ps extension when we know the content is PostScript (Linux ippeveps output),
@@ -1416,9 +1760,11 @@ async fn gs_raster(mut data: Vec<u8>, fmt: &str, device: &str, dpi: u32, job_tok
     tokio::fs::write(&input_path, &data).await?;
 
     let output = tokio::process::Command::new(gs_command())
+        .args(["-dNOPAUSE", "-dBATCH", "-dSAFER", &dev_arg])
+        .args(device_args)
         // Pass -sOutputFile as a separate -o arg so the OS handles path quoting,
         // avoiding issues with spaces in the temp directory path on Windows.
-        .args(["-dNOPAUSE", "-dBATCH", "-dSAFER", &dev_arg, &res_arg, "-o"])
+        .arg("-o")
         .arg(&out_path)
         .arg(&input_path)
         .stdout(std::process::Stdio::piped())
@@ -1467,6 +1813,27 @@ async fn rasterize_to_ps(data: Vec<u8>, fmt: &str, tray_source: &str, dpi: u32, 
 
     let page_count = pages.len();
     Ok((build_ps_raster(&pages, dpi, tray_source), page_count))
+}
+
+/// Rasterize directly to raw ImageWriter II command bytes via Ghostscript's
+/// `iwhi`/`iwhic` device, forcing the page to `media_pts` (clamped by
+/// `imagewriter_safe_page`). Unlike LaserWriter/StyleWriter there's no
+/// PS-passthrough shortcut: the printer has no interpreter of its own, so
+/// everything goes through `gs` whatever the incoming document format.
+async fn rasterize_for_imagewriter(
+    data: Vec<u8>,
+    fmt: &str,
+    media_pts: (f32, f32),
+    color: bool,
+    job_token: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let (w, h) = imagewriter_safe_page(media_pts.0, media_pts.1);
+    let args = [
+        format!("-dDEVICEWIDTHPOINTS={w}"),
+        format!("-dDEVICEHEIGHTPOINTS={h}"),
+        "-dFIXEDMEDIA".to_string(),
+    ];
+    gs_device_run(data, fmt, imagewriter_gs_device(color), &args, job_token).await
 }
 
 /// One page of raw planar StyleWriter scanlines: rows → planes (1 for mono,
@@ -1627,6 +1994,8 @@ async fn run_stylewriter_job(
     username: String,
     job_lock: Arc<Mutex<()>>,
     job_id: u32,
+    // Held, not read: keeps the printer registered until this job is done.
+    _active_guard: PrintingGuard,
 ) {
     job.lock().await.state_message = "Rasterizing".to_string();
     let pages = match rasterize_for_stylewriter(doc, &fmt, color, job_id).await {
@@ -1890,6 +2259,19 @@ async fn print_to_pap(ddp: DdpHandle, addr: AtpAddress, doc: Vec<u8>) -> anyhow:
     Ok(output)
 }
 
+/// Like `print_to_pap`, but for ImageWriter: there's no PostScript
+/// interpreter behind it, so there's no interactive stdout to read back
+/// after the job.
+async fn print_to_pap_imagewriter(ddp: DdpHandle, addr: AtpAddress, doc: Vec<u8>) -> anyhow::Result<()> {
+    if doc.is_empty() {
+        tracing::warn!("IPP: empty ImageWriter document, skipping print");
+        return Ok(());
+    }
+    let mut printer = ImageWriter::connect(&ddp, addr).await?;
+    printer.print_bytes(&doc).await?;
+    printer.close().await
+}
+
 /// Returns the PS error string from `%%[ Error: ]%%` lines; ignores `PrinterError`/`LastError`.
 fn parse_printer_error(output: &str) -> Option<String> {
     output.lines()
@@ -1901,6 +2283,95 @@ fn parse_printer_error(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A printer with a job on it must survive missed lookups for the whole
+    /// job, however long that is, and for the grace period afterwards.
+    #[test]
+    fn test_active_printers_protects_for_the_life_of_a_job() {
+        let active = Arc::new(ActivePrinters::default());
+        assert!(!active.protected("iw"), "unknown printers aren't protected");
+
+        let guard = active.begin("iw".to_string());
+        assert!(active.protected("iw"));
+        // A second job queued behind the first.
+        let queued = active.begin("iw".to_string());
+        drop(guard);
+        assert!(active.protected("iw"), "the queued job still holds it");
+
+        drop(queued);
+        assert!(active.protected("iw"), "grace period runs from the last job");
+
+        // Expire the grace period rather than sleeping through it.
+        {
+            let mut map = active.0.lock().unwrap();
+            map.get_mut("iw").unwrap().idle_since = Some(Instant::now() - PRUNE_GRACE);
+        }
+        assert!(!active.protected("iw"));
+        assert!(
+            active.0.lock().unwrap().is_empty(),
+            "expired entries are swept so the map doesn't grow per job"
+        );
+    }
+
+    #[test]
+    fn test_imagewriter_safe_page_clamps_and_floors() {
+        // Width above the physical 8.5in carriage gets clamped.
+        assert_eq!(imagewriter_safe_page(700.0, 792.0), (612.0, 792.0));
+        // Height not a multiple of 24pt gets floored to one, or the `iwhi`
+        // device's band-buffer sizing crashes.
+        assert_eq!(imagewriter_safe_page(612.0, 792.0), (612.0, 792.0)); // Letter, already exact
+        assert_eq!(imagewriter_safe_page(595.0, 842.0), (595.0, 840.0)); // A4
+        assert_eq!(imagewriter_safe_page(279.0, 540.0), (279.0, 528.0)); // Monarch
+    }
+
+    /// Picking the mono device for a colour job is silent: `iwhi` prints the
+    /// page in black and looks like a printer that just ignores colour.
+    #[test]
+    fn test_imagewriter_gs_device_picks_color_twin() {
+        assert_eq!(imagewriter_gs_device(false), "iwhi");
+        assert_eq!(imagewriter_gs_device(true), "iwhic");
+    }
+
+    /// Build a PrintJob request carrying one job attribute.
+    fn job_request_with(attr: IppAttribute) -> IppRequestResponse {
+        let mut req = IppRequestResponse::new(IppVersion::v2_0(), Operation::PrintJob, None).unwrap();
+        req.attributes_mut().add(DelimiterTag::JobAttributes, attr);
+        req
+    }
+
+    /// Clients send the page size either as the flat `media` keyword or inside
+    /// a `media-col` collection; the ImageWriter path has to honour both, since
+    /// missing it silently forces the default size onto every job.
+    #[test]
+    fn test_job_media_pts_reads_keyword_and_media_col() {
+        let by_keyword = job_request_with(IppAttribute::new(
+            "media".try_into().unwrap(),
+            IppValue::Keyword("iso_a4_210x297mm".try_into().unwrap()),
+        ));
+        assert_eq!(job_media_pts(&by_keyword, "na_letter_8.5x11in"), (595.0, 842.0));
+
+        let by_collection = job_request_with(IppAttribute::new(
+            "media-col".try_into().unwrap(),
+            IppValue::Collection(BTreeMap::from([(
+                "media-size".try_into().unwrap(),
+                media_size_collection(21000, 29700).unwrap(),
+            )])),
+        ));
+        assert_eq!(job_media_pts(&by_collection, "na_letter_8.5x11in"), (595.0, 842.0));
+
+        // Neither present: the printer's own default wins, not a hardcoded size.
+        let bare = IppRequestResponse::new(IppVersion::v2_0(), Operation::PrintJob, None).unwrap();
+        assert_eq!(job_media_pts(&bare, "iso_a4_210x297mm"), (595.0, 842.0));
+        assert_eq!(job_media_pts(&bare, "na_letter_8.5x11in"), (612.0, 792.0));
+    }
+
+    #[test]
+    fn test_media_to_pts_roundtrips_known_names() {
+        assert_eq!(media_to_pts("na_letter_8.5x11in"), (612.0, 792.0));
+        assert_eq!(media_to_pts("iso_a4_210x297mm"), (595.0, 842.0));
+        // Unknown name falls back to Letter rather than panicking.
+        assert_eq!(media_to_pts("bogus_media_name"), (612.0, 792.0));
+    }
 
     #[test]
     fn all_advertised_media_have_dimensions() {

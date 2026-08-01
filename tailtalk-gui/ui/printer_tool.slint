@@ -5,6 +5,7 @@ export struct PrinterRow {
     kind: string,
     address: string,
     is-stylewriter: bool,
+    is-imagewriter: bool,
 }
 
 /// One line of the queried information panel. A section row renders as a
@@ -35,13 +36,16 @@ export component PrinterToolWindow inherits Window {
     in property <bool> detail-loaded: false;
 
     // Editable fields. Which apply depends on the selected printer's kind.
-    in-out property <string> edit-name;                 // StyleWriter rename
+    in-out property <string> edit-name;                 // rename (all families)
+    in property <int> name-max: 31;                     // set per family from Rust
     in-out property <int> paper-index: 0;               // LaserWriter default paper
     in-out property <bool> startup-enabled: false;      // LaserWriter power-on test page
 
     property <bool> has-selection: root.selected >= 0 && root.selected < root.printers.length;
     property <bool> sel-is-sw: root.has-selection && root.printers[root.selected].is-stylewriter;
-    property <bool> sel-is-lw: root.has-selection && !root.sel-is-sw;
+    property <bool> sel-is-iw: root.has-selection && root.printers[root.selected].is-imagewriter;
+    // LaserWriter is the default family, so it is whatever is left over.
+    property <bool> sel-is-lw: root.has-selection && !root.sel-is-sw && !root.sel-is-iw;
 
     callback refresh();
     callback query(int);
@@ -232,12 +236,14 @@ export component PrinterToolWindow inherits Window {
                 // Editable settings
                 Text { text: "Settings"; font-weight: 700; }
 
-                if root.sel-is-sw : HorizontalBox {
+                // StyleWriter and ImageWriter both expose the name and nothing
+                // else, and both cap it at 31 characters.
+                if root.sel-is-sw || root.sel-is-iw : HorizontalBox {
                     padding: 0;
                     Text { text: "Name"; min-width: 120px; vertical-alignment: center; }
                     LineEdit {
                         text <=> root.edit-name;
-                        placeholder-text: "Printer name (1–31 characters)";
+                        placeholder-text: "Printer name (1–\{root.name-max} characters)";
                         enabled: root.detail-loaded && !root.busy;
                         horizontal-stretch: 1;
                     }
@@ -251,7 +257,7 @@ export component PrinterToolWindow inherits Window {
                         Text { text: "Name"; min-width: 120px; vertical-alignment: center; }
                         LineEdit {
                             text <=> root.edit-name;
-                            placeholder-text: "Printer name (1–32 characters)";
+                            placeholder-text: "Printer name (1–\{root.name-max} characters)";
                             enabled: root.detail-loaded && !root.busy;
                             horizontal-stretch: 1;
                         }

@@ -52,6 +52,12 @@ fn remember_reply(
     cache.push_back((seq, user_bytes, data));
 }
 
+/// [`PapClient::chunk_size`] for the ImageWriter II/LQ LocalTalk Option Card:
+/// one ATP packet's worth per SendData cycle. The card handles the full
+/// bitmap-derived capacity poorly, and this is the size verified against real
+/// hardware.
+pub const IMAGEWRITER_CHUNK_SIZE: usize = 512;
+
 #[derive(Debug)]
 pub struct PapClient {
     atp_requestor: AtpRequestor,
@@ -404,6 +410,18 @@ impl PapClient {
     }
 
     pub async fn get_status(atp: AtpRequestor, address: AtpAddress) -> Result<String> {
+        let buf = Self::get_status_bytes(atp, address).await?;
+        Ok(String::from_utf8_lossy(&buf).to_string())
+    }
+
+    /// The raw contents of the PAP status buffer, with the length byte already
+    /// consumed but no assumption that the payload is text.
+    ///
+    /// LaserWriters put a PostScript status comment here, which is what
+    /// [`get_status`](Self::get_status) returns. An ImageWriter II/LQ LocalTalk
+    /// Option Card instead answers with a two-byte packed `statusBits` word
+    /// that a lossy UTF-8 conversion would mangle (see [`crate::imagewriter`]).
+    pub async fn get_status_bytes(atp: AtpRequestor, address: AtpAddress) -> Result<Vec<u8>> {
         let pkt = PapPacket {
             connection_id: 0,
             function: PapFunction::SendStatus,
@@ -431,7 +449,52 @@ impl PapClient {
             ));
         };
         let end = (5 + len as usize).min(reply.data.len());
-        Ok(String::from_utf8_lossy(&reply.data[5..end]).to_string())
+        Ok(reply.data[5..end].to_vec())
+    }
+}
+
+/// A dedicated ATP socket for PAP `SendStatus` calls.
+///
+/// `SendStatus` is connectionless: it carries connection ID 0 to the printer's
+/// NBP-advertised socket rather than the per-connection socket a job streams
+/// over, so it needs no PAP connection and is answered even mid-job.
+///
+/// Giving it a socket of its own is what makes polling during a print safe. The
+/// poll shares no transaction state with the job, cannot interleave with the
+/// printer's `SendData` traffic, and the handle can outlive the session that
+/// created it. Reusing one handle also beats a socket per poll.
+///
+/// The reply's meaning is printer-specific: a LaserWriter puts a PostScript
+/// status comment here, so use [`read_text`](Self::read_text); an ImageWriter
+/// option card puts a packed status word, which [`crate::imagewriter`] decodes
+/// on top of [`read_bytes`](Self::read_bytes).
+#[derive(Clone)]
+pub struct PapStatusHandle {
+    atp: AtpRequestor,
+    address: AtpAddress,
+}
+
+impl PapStatusHandle {
+    /// Allocate a status socket for the printer at `address`. Opens no PAP
+    /// connection, so this works against a printer that is busy or printing.
+    pub async fn new(ddp: &DdpHandle, address: AtpAddress) -> Self {
+        let (_, atp, _) = Atp::spawn(ddp, None).await;
+        Self { atp, address }
+    }
+
+    /// The printer this handle reads from.
+    pub fn address(&self) -> AtpAddress {
+        self.address
+    }
+
+    /// The raw status buffer, for printers whose reply is not text.
+    pub async fn read_bytes(&self) -> Result<Vec<u8>> {
+        PapClient::get_status_bytes(self.atp.clone(), self.address).await
+    }
+
+    /// The status buffer as text, for PostScript printers.
+    pub async fn read_text(&self) -> Result<String> {
+        PapClient::get_status(self.atp.clone(), self.address).await
     }
 }
 

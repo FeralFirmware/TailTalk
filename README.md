@@ -13,7 +13,7 @@ drivers - All it needs is a raw socket and/or TashTalk compatible device (for Lo
 It provides a complete AppleTalk stack, with multiple copies of it able to run on the same machine
 at the same time.
 
-I started this project to be able to copy files to/from my old Macs, print to LaserWriters and networked StyleWriters, and be able
+I started this project to be able to copy files to/from my old Macs, print to LaserWriters, ImageWriters and networked StyleWriters, and be able
 to write modern async software to communicate with them. Currently TailTalk only works in a routerless setup - work is in progress
 to make it gracefully join router present networks but it is not yet in the mainline code.
 
@@ -28,7 +28,7 @@ This is the current user facing program for use with TashTalk USB. It includes a
 every Mac that shipped with a LocalTalk port. It also can import Stuff-It archives and floppy disk images and load them in to
 the share path preserving the resource forks and make them available to remote clients.
 
-It additionally supports sharing LocalTalk capable LaserWriters and StyleWriters to modern networks as AirPrint / IPP printers,
+It additionally supports sharing LocalTalk capable LaserWriters, ImageWriters and StyleWriters to modern networks as AirPrint / IPP printers,
 and sharing modern printers to classic Macs. The latest release can be found here:
 
 [https://github.com/FeralFirmware/TailTalk/releases/latest](https://github.com/FeralFirmware/TailTalk/releases/latest)
@@ -158,6 +158,7 @@ Beyond unit tests I have found the best way to test this software is with real h
 - PowerBook G3 running Mac OS 9.2 via Ethernet
 - LaserWriter 4/600 PS via AsanteTalk
 - Color StyleWriter 2200 via EtherTalk adapter
+- ImageWriter II with the LocalTalk Option Card
 - Macintosh SE/30 running System 7.1 via AsanteTalk
 - Macintosh Classic running System 6.0.8 via AsanteTalk
 

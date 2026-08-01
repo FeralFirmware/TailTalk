@@ -3373,6 +3373,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "iw-print-example"
+version = "0.9.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tailtalk",
+ "tailtalk-packets",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

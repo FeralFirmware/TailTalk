@@ -20,6 +20,10 @@ struct Args {
     /// Entity to look up in Object:Type@Zone format. Use = as wildcard.
     #[arg(default_value = "=:=@*")]
     entity: String,
+
+    /// If no results are found, retry up to this many additional times
+    #[arg(short, long, default_value_t = 0)]
+    retries: u32,
 }
 
 #[tokio::main]
@@ -63,12 +67,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("Looking up '{}'...", entity);
-    match stack.nbp.lookup(entity).await {
-        Ok(tuples) => {
-            if tuples.is_empty() {
-                println!("No results found.");
-            } else {
+    let mut attempt = 0;
+    loop {
+        println!("Looking up '{}'...", entity);
+        match stack.nbp.lookup(entity.clone()).await {
+            Ok(tuples) if !tuples.is_empty() => {
                 println!("Found {} result(s):", tuples.len());
                 for t in &tuples {
                     println!(
@@ -76,9 +79,31 @@ async fn main() -> anyhow::Result<()> {
                         t.entity_name, t.network_number, t.node_id, t.socket_number
                     );
                 }
+                break;
+            }
+            Ok(_) => {
+                if attempt >= args.retries {
+                    println!("No results found.");
+                    break;
+                }
+                attempt += 1;
+                println!(
+                    "No results found, retrying ({}/{})...",
+                    attempt, args.retries
+                );
+            }
+            Err(e) => {
+                if attempt >= args.retries {
+                    eprintln!("Lookup failed: {}", e);
+                    break;
+                }
+                attempt += 1;
+                eprintln!(
+                    "Lookup failed: {}, retrying ({}/{})...",
+                    e, attempt, args.retries
+                );
             }
         }
-        Err(e) => eprintln!("Lookup failed: {}", e),
     }
 
     // The pcap writer runs on its own thread and drains a channel; give it a
