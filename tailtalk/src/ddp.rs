@@ -233,6 +233,10 @@ impl DdpSocket {
 
 type SockNum = u8;
 
+/// Socket numbers available for dynamic assignment, 191 of them. Below 64 is
+/// reserved for statically assigned sockets, and 255 is the broadcast socket.
+pub const DYNAMIC_SOCKETS: std::ops::RangeInclusive<SockNum> = 64..=254;
+
 pub struct DdpProcessor {
     sockets: HashMap<SockNum, mpsc::Sender<Packet>>,
     command_rx: mpsc::Receiver<DdpCommand>,
@@ -308,9 +312,21 @@ impl DdpProcessor {
                     self.handle_outbound(pkt).await;
                 }
                 DdpCommand::Deregister(sock_num) => {
-                    self.sockets.remove(&sock_num);
+                    self.deregister(sock_num);
                 }
             }
+        }
+    }
+
+    /// Release a socket number on behalf of a dropped [`DdpSocket`].
+    ///
+    /// Ignored unless the registration is actually dead. Since `new_sock` reaps
+    /// closed sockets itself, the number may already have been reissued by the
+    /// time this is drained, and evicting that new owner would silently stop
+    /// delivering their traffic. A `Sender` still open belongs to someone else.
+    fn deregister(&mut self, sock_num: SockNum) {
+        if self.sockets.get(&sock_num).is_some_and(|tx| tx.is_closed()) {
+            self.sockets.remove(&sock_num);
         }
     }
 
@@ -319,6 +335,12 @@ impl DdpProcessor {
         protocol: DdpProtocolType,
         sock_num: Option<SockNum>,
     ) -> Result<DdpSocket, io::Error> {
+        // A socket whose owner is gone still holds its number until this runs:
+        // `DdpSocket::drop` publishes `Deregister` with `try_send`, which is
+        // dropped outright if the command channel is full. A closed `Sender`
+        // here means the `DdpSocket` holding the matching `Receiver` is gone.
+        self.sockets.retain(|_, tx| !tx.is_closed());
+
         let sock_num = if let Some(n) = sock_num {
             if self.sockets.contains_key(&n) {
                 return Err(io::Error::from(io::ErrorKind::AddrInUse));
@@ -326,18 +348,10 @@ impl DdpProcessor {
             n
         } else {
             let mut rng = rand::rng();
-            // 255 is the reserved broadcast socket, never dynamically assignable.
-            let mut candidate = rng.random_range(64u8..=254);
-            for _ in 0..192u16 {
-                if !self.sockets.contains_key(&candidate) {
-                    break;
-                }
-                candidate = rng.random_range(64..=254);
-            }
-            if self.sockets.contains_key(&candidate) {
-                return Err(io::Error::from(io::ErrorKind::AddrInUse));
-            }
-            candidate
+            (0..DYNAMIC_SOCKETS.count())
+                .map(|_| rng.random_range(DYNAMIC_SOCKETS))
+                .find(|n| !self.sockets.contains_key(n))
+                .ok_or_else(|| io::Error::from(io::ErrorKind::AddrInUse))?
         };
 
         let (tx, rx) = mpsc::channel(100);
@@ -814,5 +828,76 @@ impl DdpHandle {
                 source_mac,
             }));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::route_table::LearningMode;
+
+    /// A processor driven directly, so socket bookkeeping can be exercised
+    /// without a runtime or any interfaces.
+    fn processor() -> (DdpProcessor, mpsc::Receiver<DataLinkPacket>) {
+        let (out_tx, out_rx) = mpsc::channel(16);
+        let (command_tx, command_rx) = mpsc::channel(16);
+        let processor = DdpProcessor {
+            sockets: HashMap::new(),
+            command_rx,
+            command_tx,
+            ethertalk: OutboundHandle::new(out_tx),
+            et_addressing: None,
+            lt_addressing: None,
+            route_table: RouteTable::new(LearningMode::Static),
+        };
+        (processor, out_rx)
+    }
+
+    /// A dropped socket's number must come back even if its `Deregister` never
+    /// arrives, since `DdpSocket::drop` publishes that with `try_send` and the
+    /// command channel is shared with all packet traffic.
+    #[test]
+    fn a_dropped_socket_is_reaped_without_its_deregister() {
+        let (mut p, _out_rx) = processor();
+
+        let sock = p.new_sock(DdpProtocolType::Atp, Some(70)).unwrap();
+        assert!(p.new_sock(DdpProtocolType::Atp, Some(70)).is_err());
+
+        // Drop the socket but never deliver the Deregister it queued.
+        drop(sock);
+
+        assert!(
+            p.new_sock(DdpProtocolType::Atp, Some(70)).is_ok(),
+            "socket 70 was not reaped after its owner dropped"
+        );
+    }
+
+    /// The reaping above means a `Deregister` can arrive after its number has
+    /// already been reissued. Honouring it then would deregister an innocent
+    /// socket, which on a live stack means a printer or server silently
+    /// receiving nothing.
+    #[test]
+    fn a_stale_deregister_does_not_evict_the_new_owner() {
+        let (mut p, _out_rx) = processor();
+
+        let first = p.new_sock(DdpProtocolType::Atp, Some(70)).unwrap();
+        drop(first);
+
+        // Reissued to a new owner before the first owner's Deregister is drained.
+        let second = p.new_sock(DdpProtocolType::Atp, Some(70)).unwrap();
+
+        p.deregister(70);
+
+        assert!(
+            p.sockets.contains_key(&70),
+            "a stale Deregister evicted the socket's new owner"
+        );
+        // Still wired to the live socket, not a leftover entry.
+        assert!(!p.sockets.get(&70).unwrap().is_closed());
+        drop(second);
+
+        // And once that owner really is gone, the number is releasable again.
+        p.deregister(70);
+        assert!(!p.sockets.contains_key(&70));
     }
 }
