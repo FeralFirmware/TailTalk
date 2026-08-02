@@ -44,6 +44,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 tailtalk = { workspace = true, features = ["ethertalk"] }
 libc = "0.2"
+# Only to reach `Backend::builder()` and turn off the transparent window Slint
+# asks winit for by default. `default-features = false` so the renderer choice
+# stays whatever the `slint` dependency selects; Cargo unifies the two. Version
+# must track `slint` exactly, these crates ship in lockstep.
+i-slint-backend-winit = { version = "=1.17.1", default-features = false }
 
 [build-dependencies]
 slint-build = "1"
