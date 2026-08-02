@@ -8,8 +8,9 @@
 //! # use tailtalk::{TalkStack, imagewriter::ImageWriter};
 //! # async fn example(stack: &TalkStack, raster: Vec<u8>) -> anyhow::Result<()> {
 //! let mut printer = ImageWriter::connect_named(&stack.ddp, &stack.nbp, "=").await?;
-//! if printer.status().await?.out_of_paper() {
-//!     anyhow::bail!("load some paper first");
+//! let status = printer.status().await?;
+//! if !status.ready_to_print() {
+//!     anyhow::bail!("{}", status.error_text().unwrap_or_default());
 //! }
 //! printer.print_bytes(&raster).await?;
 //! printer.close().await?;
@@ -27,37 +28,40 @@
 //! Reading it therefore goes through [`PapClient::get_status_bytes`] rather than
 //! the text-oriented `get_status`.
 //!
-//! Bit assignments. The starting point was the "PAP Status Buffer from an
-//! ImageWriter II/LQ LocalTalk Option Card" figure in Apple's PAP
-//! documentation, but the hardware does not agree with it, so treat the figure
-//! as a hint rather than a specification:
+//! Bit assignments, from the "PAP Status Buffer from an ImageWriter II/LQ
+//! LocalTalk Option Card" figure in Apple's PAP documentation:
 //!
 //! ```text
-//!  15  14 13 12 11 10 9 8   7    6    5    4     3    2    1    0
-//! busy |<--- unused --->| ribbon feed  ?  cover paper jam fault active
+//!  15  14 13 12 11 10 9 8   7    6     5     4     3    2    1    0
+//! busy |<--- unused --->| ribbon feed paper cover  off  jam fault active
+//!                                      out         line
 //! ```
 //!
-//! Confirmed against a real ImageWriter II:
+//! Three readings from a real ImageWriter II, all with a colour ribbon fitted
+//! and no sheet feeder:
 //!
-//!   * Bit 3 is **paper present**, not the figure's "off line", and it is
-//!     asserted when paper is loaded. An empty printer read `0x0080`; loading
-//!     paper changed it to `0x0088` and nothing else moved. It therefore reads
-//!     the opposite way round to the error bits around it.
-//!   * Bit 7 is the colour ribbon, set in both of those readings on a printer
-//!     with a colour ribbon fitted.
-//!   * Bit 5, which the figure labels paper-out, stayed clear while the printer
-//!     was genuinely out of paper. Whatever it is, it is not that.
+//! | Paper  | Select light | Word     |
+//! |--------|--------------|----------|
+//! | loaded | on           | `0x0080` |
+//! | loaded | off          | `0x0088` |
+//! | empty  | off          | `0x00AA` |
 //!
-//! Everything else below is still only the figure's word. Bits 6, 4, 2, 1 and 0
-//! were clear in both confirmed readings, consistent with active-high
-//! conditions that never fired, but none has been deliberately triggered and
-//! checked. [`error_text`](ImageWriterStatus::error_text) reports the
-//! unconfirmed ones, so a surprising error there is as likely to be a wrong bit
-//! as a real fault.
+//! The first two differ only in the Select light, and only in bit 3, so bit 3
+//! is **off line** as the figure says. Emptying the printer then raised bit 5,
+//! **paper out**, and bit 1, the general fault, with it: those two move
+//! together. The printer was already off line for that third reading, so
+//! whether running out deselects it on its own is untested. Bit 7, the colour
+//! ribbon, is set throughout.
+//!
+//! Every bit confirmed that way is active-high, so a ready printer reads
+//! all-clear below bit 7. Bits 6, 4, 2 and 0 are still the figure's word alone,
+//! never having been deliberately triggered and checked, so a surprising error
+//! from [`error_text`](ImageWriterStatus::error_text) naming one of those is as
+//! likely to be a wrong bit as a real fault.
 //!
 //! The card sends the low byte first, so the word is assembled little-endian
-//! even though AppleTalk is otherwise big-endian. Both confirmed readings put
-//! the meaningful bits in the byte that arrives first, which is also why the
+//! even though AppleTalk is otherwise big-endian. All three readings put the
+//! meaningful bits in the byte that arrives first, which is also why the
 //! card's documented glitch reply is "all ones in the low byte".
 //!
 //! That glitch is occasional and not sticky: the card sometimes answers with
@@ -87,10 +91,11 @@ pub const MAX_NAME_LEN: usize = 31;
 const BUSY: u16 = 1 << 15;
 const COLOR_RIBBON: u16 = 1 << 7;
 const SHEET_FEEDER: u16 = 1 << 6;
+const PAPER_OUT: u16 = 1 << 5;
 const COVER_OPEN: u16 = 1 << 4;
-/// Set while paper is loaded, so this reads the opposite way round to the
-/// error bits. See the module note on which bits are confirmed.
-const PAPER_PRESENT: u16 = 1 << 3;
+/// Set while the Select light is off. See the module note on which bits are
+/// confirmed.
+const OFF_LINE: u16 = 1 << 3;
 const PAPER_JAM: u16 = 1 << 2;
 const FAULT: u16 = 1 << 1;
 const ACTIVE: u16 = 1 << 0;
@@ -163,10 +168,17 @@ impl ImageWriterStatus {
         self.raw & SHEET_FEEDER != 0
     }
 
-    /// Paper is loaded (bit 3). Confirmed on real hardware: loading paper is
-    /// what sets this bit. Note the sense, it is asserted when all is well.
-    pub fn paper_present(&self) -> bool {
-        self.raw & PAPER_PRESENT != 0
+    /// The printer is out of paper (bit 5). Confirmed on real hardware:
+    /// emptying the printer is what sets this bit, and it brings
+    /// [`fault`](Self::fault) up with it.
+    pub fn out_of_paper(&self) -> bool {
+        self.raw & PAPER_OUT != 0
+    }
+
+    /// The printer is off line (bit 3), i.e. its Select light is off, so it
+    /// will not print until someone presses Select. Confirmed on real hardware.
+    pub fn off_line(&self) -> bool {
+        self.raw & OFF_LINE != 0
     }
 
     /// Raw paper-jam bit (bit 2). Unconfirmed, see the module note.
@@ -179,8 +191,9 @@ impl ImageWriterStatus {
         self.raw & COVER_OPEN != 0
     }
 
-    /// A general printer fault is asserted (bit 1). Unconfirmed, see the module
-    /// note.
+    /// A general printer fault is asserted (bit 1). Seen on real hardware only
+    /// alongside [`out_of_paper`](Self::out_of_paper), so what else raises it
+    /// is unconfirmed.
     pub fn fault(&self) -> bool {
         self.raw & FAULT != 0
     }
@@ -190,11 +203,19 @@ impl ImageWriterStatus {
         self.raw & ACTIVE != 0
     }
 
-    /// Whether the printer is out of paper, i.e. [`paper_present`] is clear.
-    ///
-    /// [`paper_present`]: Self::paper_present
-    pub fn out_of_paper(&self) -> bool {
-        !self.paper_present()
+    /// The inverse of [`out_of_paper`](Self::out_of_paper), for readouts that
+    /// phrase it the positive way round. The card has no paper-present bit.
+    pub fn paper_present(&self) -> bool {
+        !self.out_of_paper()
+    }
+
+    /// Whether the printer will take a job: it needs paper, and it has to be on
+    /// line. The remaining error bits are deliberately left out, since none of
+    /// them is confirmed and one we have misread would refuse jobs a working
+    /// printer would have taken. [`error_text`](Self::error_text) still reports
+    /// them.
+    pub fn ready_to_print(&self) -> bool {
+        !self.out_of_paper() && !self.off_line()
     }
 
     /// Every error condition the card is reporting, or `None` when it reports
@@ -214,7 +235,11 @@ impl ImageWriterStatus {
         if self.cover_open() {
             errors.push("Cover open");
         }
-        if self.fault() {
+        if self.off_line() {
+            errors.push("Off line, press Select");
+        }
+        // Paper-out raises the fault bit too, and has already named the cause.
+        if self.fault() && !self.out_of_paper() {
             errors.push("Printer fault");
         }
         (!errors.is_empty()).then(|| errors.join(", "))
@@ -530,9 +555,7 @@ mod tests {
         assert!(rename_command(&"a".repeat(MAX_NAME_LEN + 1)).is_err());
     }
 
-    /// Pins each bit position we decode. Bit 5 is deliberately absent: the
-    /// figure calls it paper-out, but the hardware left it clear with the
-    /// printer empty, so nothing is decoded from it.
+    /// Pins each bit position we decode.
     #[test]
     fn decodes_each_documented_bit() {
         let s = ImageWriterStatus::parse(&wire(0x00, 0x80)).unwrap();
@@ -545,16 +568,13 @@ mod tests {
         assert!(s.sheet_feeder() && !s.color_ribbon());
 
         let s = ImageWriterStatus::parse(&wire(0x20, 0x00)).unwrap();
-        assert!(
-            s.out_of_paper(),
-            "bit 5 is not decoded, bit 3 is still clear"
-        );
+        assert!(s.out_of_paper());
 
         let s = ImageWriterStatus::parse(&wire(0x10, 0x00)).unwrap();
         assert!(s.cover_open());
 
         let s = ImageWriterStatus::parse(&wire(0x08, 0x00)).unwrap();
-        assert!(s.paper_present() && !s.out_of_paper());
+        assert!(s.off_line() && s.paper_present(), "bit 3 is not about paper");
 
         let s = ImageWriterStatus::parse(&wire(0x04, 0x00)).unwrap();
         assert!(s.paper_jam_bit());
@@ -566,31 +586,48 @@ mod tests {
         assert!(s.active());
     }
 
-    /// The pair of readings that pin bit 3, taken from a real ImageWriter II
-    /// with a colour ribbon and no sheet feeder. Only one thing changed between
-    /// them: paper was loaded. Only one bit moved with it.
+    /// The three readings that pin bits 5, 3 and 1, taken from a real
+    /// ImageWriter II with a colour ribbon and no sheet feeder. Between the
+    /// first two only the Select light changed, and only one bit moved with it.
     #[test]
     fn matches_observed_hardware_readings() {
-        // Empty printer.
-        let empty = ImageWriterStatus::parse(&[0x80, 0x00]).unwrap();
-        assert_eq!(empty.raw, 0x0080);
-        assert!(empty.out_of_paper(), "printer had no paper in it");
-        assert_eq!(empty.error_text().as_deref(), Some("Out of paper"));
+        // Paper loaded, Select light on: the fully ready printer.
+        let ready = ImageWriterStatus::parse(&[0x80, 0x00]).unwrap();
+        assert_eq!(ready.raw, 0x0080);
+        assert!(ready.ready_to_print());
+        assert_eq!(ready.error_text(), None, "a ready printer has no errors");
 
-        // Same printer, paper loaded.
-        let loaded = ImageWriterStatus::parse(&[0x88, 0x00]).unwrap();
-        assert_eq!(loaded.raw, 0x0088);
-        assert!(loaded.paper_present(), "printer had paper in it");
-        assert_eq!(loaded.error_text(), None, "a ready printer has no errors");
+        // Same printer, Select light off.
+        let deselected = ImageWriterStatus::parse(&[0x88, 0x00]).unwrap();
+        assert_eq!(deselected.raw, 0x0088);
+        assert!(deselected.paper_present(), "printer still had paper in it");
+        assert!(deselected.off_line() && !deselected.ready_to_print());
+        assert_eq!(
+            deselected.error_text().as_deref(),
+            Some("Off line, press Select")
+        );
 
-        // Loading paper moved bit 3 and nothing else.
-        assert_eq!(empty.raw ^ loaded.raw, PAPER_PRESENT);
+        // Pressing Select moved bit 3 and nothing else.
+        assert_eq!(ready.raw ^ deselected.raw, OFF_LINE);
 
-        // Both readings agree on the rest of the printer's state.
-        for s in [empty, loaded] {
+        // Paper removed, Select light still off. Paper-out brings the general
+        // fault up with it, so two bits move.
+        let empty = ImageWriterStatus::parse(&[0xAA, 0x00]).unwrap();
+        assert_eq!(empty.raw, 0x00AA);
+        assert!(empty.out_of_paper() && empty.off_line() && empty.fault());
+        assert_eq!(deselected.raw ^ empty.raw, PAPER_OUT | FAULT);
+        // The fault bit adds nothing once paper-out has named the cause.
+        assert_eq!(
+            empty.error_text().as_deref(),
+            Some("Out of paper, Off line, press Select")
+        );
+
+        // All three readings agree on the rest of the printer's state.
+        for s in [ready, deselected, empty] {
             assert!(s.color_ribbon(), "printer had a colour ribbon fitted");
             assert!(!s.sheet_feeder(), "printer had no sheet feeder");
             assert!(!s.busy(), "printer was idle");
+            assert!(!s.cover_open() && !s.paper_jam_bit() && !s.active());
             // Nothing lands in the unused 8..=14 range.
             assert_eq!(s.raw & 0x7F00, 0);
         }
@@ -630,22 +667,27 @@ mod tests {
 
     /// The jam bit's wording depends on whether a feeder is fitted, since with
     /// one an empty tray is said to raise it too. Both the bit and that
-    /// distinction come from the figure and neither is confirmed; paper is
-    /// present in each case here so the confirmed bit stays out of the way.
+    /// distinction come from the figure and neither is confirmed. Every other
+    /// bit is left clear so only the wording is under test.
     #[test]
     fn sheet_feeder_changes_the_jam_wording() {
-        let paper = PAPER_PRESENT as u8;
-
         let feeder =
-            ImageWriterStatus::parse(&wire(paper | SHEET_FEEDER as u8 | PAPER_JAM as u8, 0x00))
-                .unwrap();
+            ImageWriterStatus::parse(&wire(SHEET_FEEDER as u8 | PAPER_JAM as u8, 0x00)).unwrap();
         assert_eq!(
             feeder.error_text().as_deref(),
             Some("Paper jam or sheet feeder empty")
         );
 
-        let no_feeder = ImageWriterStatus::parse(&wire(paper | PAPER_JAM as u8, 0x00)).unwrap();
+        let no_feeder = ImageWriterStatus::parse(&wire(PAPER_JAM as u8, 0x00)).unwrap();
         assert_eq!(no_feeder.error_text().as_deref(), Some("Paper jam"));
+    }
+
+    /// Suppressing the fault bit is specific to the paper-out that raises it.
+    /// On its own it is still worth saying.
+    #[test]
+    fn fault_alone_is_still_reported() {
+        let s = ImageWriterStatus::parse(&wire(FAULT as u8, 0x00)).unwrap();
+        assert_eq!(s.error_text().as_deref(), Some("Printer fault"));
     }
 
     /// The glitch reply must be rejected rather than decoded as "every error at
@@ -673,19 +715,19 @@ mod tests {
         assert_eq!(s.raw, 0x0080);
     }
 
-    /// A ready printer has paper, so bit 3 is part of every no-error reading.
+    /// Every error bit is active-high, so a ready printer reads all-clear below
+    /// the ribbon bit.
     #[test]
     fn idle_printer_reports_no_error() {
-        let paper = PAPER_PRESENT as u8;
-
-        let s = ImageWriterStatus::parse(&wire(paper | 0x80, 0x00)).unwrap();
+        let s = ImageWriterStatus::parse(&wire(0x80, 0x00)).unwrap();
         assert_eq!(s.error_text(), None);
+        assert!(s.ready_to_print());
         assert_eq!(s.ribbon_text(), "Color");
 
         // Busy and actively printing is a state, not an error.
-        let s = ImageWriterStatus::parse(&wire(paper | 0x01, 0x80)).unwrap();
+        let s = ImageWriterStatus::parse(&wire(0x01, 0x80)).unwrap();
         assert_eq!(s.error_text(), None);
-        assert!(s.busy() && s.active());
+        assert!(s.busy() && s.active() && s.ready_to_print());
         assert_eq!(s.ribbon_text(), "Black only");
     }
 }

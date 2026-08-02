@@ -171,6 +171,18 @@ async fn main() -> anyhow::Result<()> {
             "not installed"
         }
     );
+    println!(
+        "  Paper:        {}",
+        if status.paper_present() {
+            "loaded"
+        } else {
+            "out of paper"
+        }
+    );
+    println!(
+        "  Select:       {}",
+        if status.off_line() { "off line" } else { "on line" }
+    );
     println!("  Busy:         {}", status.busy());
     println!("  Printing:     {}", status.active());
     match status.error_text() {
@@ -181,8 +193,11 @@ async fn main() -> anyhow::Result<()> {
     if args.status_only {
         return Ok(());
     }
-    if status.out_of_paper() {
-        anyhow::bail!("printer reports no paper loaded, refusing to print");
+    if !status.ready_to_print() {
+        anyhow::bail!(
+            "printer is not ready ({}), refusing to print",
+            status.error_text().unwrap_or_default()
+        );
     }
 
     let color = status.color_ribbon() && !args.mono;

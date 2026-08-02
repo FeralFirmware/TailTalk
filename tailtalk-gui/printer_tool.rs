@@ -391,6 +391,7 @@ fn imagewriter_lines(s: &ImageWriterStatus) -> Vec<Line> {
         Line::section("Status"),
         Line::field("Condition", imagewriter_condition(s)),
         Line::field("Paper", if s.paper_present() { "Loaded" } else { "Out of paper" }),
+        Line::field("Select", if s.off_line() { "Off line" } else { "On line" }),
         Line::field("Busy", yes_no(s.busy())),
         Line::field("Printing", yes_no(s.active())),
         Line::section("Hardware"),
