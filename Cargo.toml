@@ -28,13 +28,13 @@ futures = "^0.3.32" #unified
 hfs-reader = { path = "hfs-reader", version = "^0.1.1" } #unified
 prost = "^0.14" #unified
 tailtalk = { path = "tailtalk" } #unified
-tailtalk-packets = { path = "tailtalk-packets", version = "^0.9" } #unified
-tailtalk-proto = { path = "tailtalk-proto", version = "^0.9" } #unified
+tailtalk-packets = { path = "tailtalk-packets", version = "^0.10" } #unified
+tailtalk-proto = { path = "tailtalk-proto", version = "^0.10" } #unified
 tashtalk = { path = "tashtalk", version = "^0.3" } #unified
 thiserror = "^1.0.69" #unified
 tokio = { version = "^1.51.1", features = ["full", "io-util"] } #unified
 tracing = "^0.1.44" #unified
 
 [workspace.package]
-version = "0.9.1"
+version = "0.10.0"
 rust-version = "1.90.0"
