@@ -203,6 +203,28 @@ const IW_MAX_WIDTH_PT: f32 = 612.0;
 /// 144dpi). Anything else makes gdevadmp's internal band-buffer sizing return a
 /// negative "unexpected value" and abort the whole job.
 const IW_HEIGHT_GRANULARITY_PT: f32 = 24.0;
+/// Ceiling in bytes on the full-page bitmap Ghostscript keeps for the
+/// ImageWriter devices.
+///
+/// `iwhi`/`iwhic` render an entirely blank page whenever Ghostscript takes its
+/// banded (clist) path. That is specific to this device: `pbmraw`, `ppmraw` and
+/// `bitcmyk` all produce byte-identical output banded or not, while `iwhi` goes
+/// blank under `-dMaxBitmap=0` even for a page with no transparency on it.
+/// Ghostscript switches to banding the moment the page buffer would exceed
+/// `MaxBitmap`, which defaults to 10MB, so the device works until a document
+/// needs more than that and then silently prints nothing.
+///
+/// A transparent object is all it takes: the page then renders through the
+/// compositor at ~20 bytes per device pixel, measured as 43MB for Letter and
+/// 54MB for a 14in page at 160x144dpi. This is a threshold rather than an
+/// allocation, so the number only has to clear that with room to spare;
+/// Ghostscript still takes what the page needs and no more, which for the
+/// worst case here is a peak RSS of 48MB. A job somehow needing more than this
+/// bands, comes out blank, and is caught by `imagewriter_raster_has_ink`.
+///
+/// There is no switch for "never band": `-dBandingNever`, `-dNOBAND` and
+/// `-dBandingType=2` are all silently swallowed as user params and do nothing.
+const IW_MAX_BITMAP: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone)]
 struct PrinterCaps {
@@ -859,6 +881,19 @@ fn imagewriter_safe_page(w: f32, h: f32) -> (f32, f32) {
     (w, h)
 }
 
+/// Whether an ImageWriter raster carries any dots at all.
+///
+/// `iwhi`/`iwhic` introduce every run of graphics with `ESC G`, and emit
+/// nothing but carriage returns and line feeds for a row with no ink, so a job
+/// without a single `ESC G` is a page the printer will feed through and eject
+/// without ever moving the head. Ghostscript reaches that state without
+/// failing: given a damaged PDF it repairs what it can, renders whatever
+/// survived and exits 0, so the empty page is otherwise indistinguishable from
+/// a successful job until the paper comes out.
+fn imagewriter_raster_has_ink(raster: &[u8]) -> bool {
+    raster.windows(2).any(|w| w == [0x1B, b'G'])
+}
+
 /// `iwhic` is the colour twin of `iwhi`, driving the four-band colour ribbon.
 /// Mono jobs stay on `iwhi` even with a colour ribbon fitted, where they strike
 /// the ribbon's black band directly instead of laying down a composite.
@@ -1125,8 +1160,12 @@ async fn handle_ipp(
                         // the status call needs no connection, so ask again rather
                         // than rasterize for a ribbon that has since changed.
                         let color = match status.read().await {
-                            Ok(s) if s.out_of_paper() => {
-                                let msg = s.error_text().unwrap_or_else(|| "Out of paper".to_string());
+                            // Off line counts as well as out of paper. A
+                            // deselected printer will not print, so the job
+                            // would sit on the PAP connection blocking the
+                            // queue behind it with nothing said.
+                            Ok(s) if !s.ready_to_print() => {
+                                let msg = s.error_text().unwrap_or_else(|| "Printer not ready".to_string());
                                 tracing::error!("IPP: ImageWriter job {job_id} refused: {msg}");
                                 let mut j = job.lock().await;
                                 j.state = JobState::Aborted;
@@ -1153,17 +1192,31 @@ async fn handle_ipp(
                             }
                         };
                         tracing::info!("IPP: rasterized ImageWriter job {job_id} to {} bytes", raster.len());
+                        if !imagewriter_raster_has_ink(&raster) {
+                            let msg = format!(
+                                "Ghostscript rendered a blank page ({} bytes, no dot data)",
+                                raster.len()
+                            );
+                            tracing::error!(
+                                "IPP: ImageWriter job {job_id} refused: {msg}. \
+                                 Check the log for what gs made of the document."
+                            );
+                            let mut j = job.lock().await;
+                            j.state = JobState::Aborted;
+                            j.state_message = msg;
+                            return;
+                        }
                         job.lock().await.state_message = "Waiting for printer".to_string();
                         let _pap_guard = job_lock.lock().await;
 
                         // The check above can be minutes stale by now if this job
-                        // queued behind another, so confirm there is still paper
-                        // before feeding it. A failed read is not fatal here; the
-                        // print itself is the better error in that case.
+                        // queued behind another, so confirm the printer is still
+                        // ready before feeding it. A failed read is not fatal
+                        // here; the print itself is the better error in that case.
                         if let Ok(s) = status.read().await
-                            && s.out_of_paper()
+                            && !s.ready_to_print()
                         {
-                            let msg = s.error_text().unwrap_or_else(|| "Out of paper".to_string());
+                            let msg = s.error_text().unwrap_or_else(|| "Printer not ready".to_string());
                             tracing::error!("IPP: ImageWriter job {job_id} refused at print time: {msg}");
                             let mut j = job.lock().await;
                             j.state = JobState::Aborted;
@@ -1785,7 +1838,22 @@ async fn gs_device_run(
             stdout.trim(),
         );
     }
-    let _ = tokio::fs::remove_file(&input_path).await;
+
+    // A damaged document is not a failed run: gs repairs what it can, renders
+    // whatever survived (often nothing at all) and still exits 0. Its progress
+    // chatter goes to stdout, so anything on stderr is a genuine complaint and
+    // is the only account we get of why a page came out empty. Keep the input
+    // alongside it so the document itself can be examined.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.trim().is_empty() {
+        let _ = tokio::fs::remove_file(&input_path).await;
+    } else {
+        tracing::warn!(
+            "gs {device} exited 0 but reported problems with the document (input kept at {}): {}",
+            input_path.display(),
+            stderr.trim(),
+        );
+    }
 
     let raster = tokio::fs::read(&out_path).await;
     let _ = tokio::fs::remove_file(&out_path).await;
@@ -1827,13 +1895,21 @@ async fn rasterize_for_imagewriter(
     color: bool,
     job_token: u32,
 ) -> anyhow::Result<Vec<u8>> {
+    let args = imagewriter_gs_args(media_pts);
+    gs_device_run(data, fmt, imagewriter_gs_device(color), &args, job_token).await
+}
+
+/// Ghostscript switches for an ImageWriter job: the page geometry the printer
+/// has to be told about, and the `MaxBitmap` ceiling that keeps the render out
+/// of the banded path (see [`IW_MAX_BITMAP`]).
+fn imagewriter_gs_args(media_pts: (f32, f32)) -> Vec<String> {
     let (w, h) = imagewriter_safe_page(media_pts.0, media_pts.1);
-    let args = [
+    vec![
         format!("-dDEVICEWIDTHPOINTS={w}"),
         format!("-dDEVICEHEIGHTPOINTS={h}"),
         "-dFIXEDMEDIA".to_string(),
-    ];
-    gs_device_run(data, fmt, imagewriter_gs_device(color), &args, job_token).await
+        format!("-dMaxBitmap={IW_MAX_BITMAP}"),
+    ]
 }
 
 /// One page of raw planar StyleWriter scanlines: rows → planes (1 for mono,
@@ -2330,6 +2406,39 @@ mod tests {
     fn test_imagewriter_gs_device_picks_color_twin() {
         assert_eq!(imagewriter_gs_device(false), "iwhi");
         assert_eq!(imagewriter_gs_device(true), "iwhic");
+    }
+
+    /// Losing the `MaxBitmap` ceiling costs nothing visible until someone
+    /// prints a page with transparency on it, which then comes out blank.
+    #[test]
+    fn test_imagewriter_gs_args_force_page_and_lift_max_bitmap() {
+        let args = imagewriter_gs_args((595.0, 842.0));
+        assert!(args.contains(&"-dDEVICEWIDTHPOINTS=595".to_string()));
+        assert!(args.contains(&"-dDEVICEHEIGHTPOINTS=840".to_string())); // floored to 24pt
+        assert!(args.contains(&"-dFIXEDMEDIA".to_string()));
+
+        let max_bitmap = args
+            .iter()
+            .find_map(|a| a.strip_prefix("-dMaxBitmap="))
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("MaxBitmap is set");
+        // A Letter page at 160x144dpi needs ~45MB to stay out of banded mode,
+        // and legal is half again as tall.
+        assert!(max_bitmap >= 64 * 1024 * 1024, "{max_bitmap} leaves no headroom");
+    }
+
+    /// A page gs rendered blank is otherwise a successful job: it streams,
+    /// completes, and ejects paper the head never touched.
+    #[test]
+    fn test_imagewriter_raster_has_ink_spots_a_blank_page() {
+        // Line spacing and feeds only, as `iwhi` emits for a page with no ink.
+        let blank = b"\x1b<\x1bT16\x1bP\x1bT01\n\x1bT15\r\n\x1bT01\n\x0c";
+        assert!(!imagewriter_raster_has_ink(blank));
+
+        // The same, with one row of dots: `ESC G`, a four-digit byte count,
+        // then the column data.
+        let inked = b"\x1b<\x1bT16\x1bP\x1bT01\n\x1bG0003\xff\xff\xff\r\n\x0c";
+        assert!(imagewriter_raster_has_ink(inked));
     }
 
     /// Build a PrintJob request carrying one job attribute.
