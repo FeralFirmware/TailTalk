@@ -264,7 +264,29 @@ fn open_in_file_manager(path: &Path) {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// Slint asks winit for a transparent window unconditionally (it only backs that
+/// out on Windows), and winit turns `transparent` into `NSWindow.setOpaque(false)`
+/// plus a clear background colour. Through macOS 26 AppKit drew the title bar
+/// material regardless; on macOS 27 the bar follows the window background, so it
+/// disappears and the traffic lights are left floating over our content. Nothing
+/// here wants a see-through window, so ask for an opaque one.
+#[cfg(target_os = "macos")]
+fn install_opaque_backend() -> anyhow::Result<()> {
+    let backend = i_slint_backend_winit::Backend::builder()
+        .with_window_attributes_hook(|attributes| attributes.with_transparent(false))
+        .build()
+        .map_err(|e| anyhow::anyhow!("winit backend: {e}"))?;
+    slint::platform::set_platform(Box::new(backend))
+        .map_err(|e| anyhow::anyhow!("setting the Slint platform: {e}"))?;
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
+    // Before any window exists, or the platform is already fixed.
+    #[cfg(target_os = "macos")]
+    install_opaque_backend()?;
+
+
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ServerCommand>(4);
     // Shared handle used to shut the stack down when the window closes.
     let active_handle: Arc<tokio::sync::Mutex<Option<ShutdownHandle>>> =

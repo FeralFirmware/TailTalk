@@ -6723,6 +6723,7 @@ dependencies = [
  "binhex-rs",
  "dirs",
  "hfs-reader",
+ "i-slint-backend-winit",
  "if-addrs",
  "ipp",
  "keepawake",
