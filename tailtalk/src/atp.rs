@@ -108,10 +108,13 @@ pub struct AtpSendResponse {
     pub packets: Vec<AtpResponse>,
 }
 
+/// Internal only. A TRelease closes out one of our own XO transactions, which
+/// the actor decides on its own in `complete_transaction`, so this never
+/// crosses the command channel.
 #[derive(Debug)]
-pub struct AtpSendRelease {
-    pub destination: AtpAddress,
-    pub tid: u16,
+struct AtpSendRelease {
+    destination: AtpAddress,
+    tid: u16,
 }
 
 /// A fire-and-forget ALO (at-least-once) packet — no pending transaction is registered
@@ -126,7 +129,6 @@ pub struct AtpSendAlo {
 pub enum AtpCommand {
     SendRequest(AtpSendRequest),
     SendResponse(AtpSendResponse),
-    SendRelease(AtpSendRelease),
     SendAlo(AtpSendAlo),
 }
 
@@ -295,12 +297,23 @@ impl AtpRequestor {
 
 #[derive(Debug)]
 pub struct AtpResponder {
-    pub incoming_rx: mpsc::Receiver<AtpReceivedRequest>,
+    incoming_rx: mpsc::Receiver<AtpReceivedRequest>,
+    /// The requesting half of the same socket. ATP sockets are symmetric: ASP
+    /// serves commands on its socket while sending tickles from it. Bundling it
+    /// here also means a server handed only a responder still owns the socket,
+    /// which is what keeps `PapServer` alive.
+    requestor: AtpRequestor,
 }
 
 impl AtpResponder {
     pub async fn next(&mut self) -> Option<AtpReceivedRequest> {
         self.incoming_rx.recv().await
+    }
+
+    /// The requesting half of this socket, for sending requests from the same
+    /// socket number that serves them.
+    pub fn requestor(&self) -> &AtpRequestor {
+        &self.requestor
     }
 }
 
@@ -308,7 +321,16 @@ pub struct Atp {
     sock: DdpSocket,
     request_recv: mpsc::Receiver<AtpCommand>,
     incoming_req_tx: mpsc::Sender<AtpReceivedRequest>,
-    cmd_tx: mpsc::Sender<AtpCommand>,
+    /// Weak on purpose: a strong clone here would keep the command channel's
+    /// sender count above zero forever, so `run` could never return and the
+    /// [`DdpSocket`] it owns would never be dropped, leaking its socket number.
+    /// Liveness comes from the [`AtpRequestor`]s held outside the actor,
+    /// including the one inside [`AtpResponder`].
+    ///
+    /// Upgraded only to stamp a reply channel onto an inbound request. That
+    /// gives the resulting [`AtpReceivedRequest`] a strong sender, so a socket
+    /// cannot be recycled while a reply on it is still owed.
+    cmd_tx: mpsc::WeakSender<AtpCommand>,
     // Map Transaction ID to pending request channel and XO status
     pending_transactions: AtpTransactionMap,
     next_tid: u16,
@@ -333,7 +355,7 @@ impl Atp {
             sock,
             request_recv,
             incoming_req_tx,
-            cmd_tx: request_send.clone(),
+            cmd_tx: request_send.downgrade(),
             pending_transactions: HashMap::new(),
             next_tid: 1, // Start TID at 1
         };
@@ -344,14 +366,17 @@ impl Atp {
             tracing::debug!("ATP actor stopped");
         });
 
+        let requestor = AtpRequestor {
+            cmd_tx: request_send,
+            socket_number: actual_socket,
+        };
+
         (
             actual_socket,
-            AtpRequestor {
-                cmd_tx: request_send,
-                socket_number: actual_socket,
-            },
+            requestor.clone(),
             AtpResponder {
                 incoming_rx: incoming_req_rx,
+                requestor,
             },
         )
     }
@@ -382,11 +407,12 @@ impl Atp {
                         match command {
                             AtpCommand::SendRequest(req) => self.handle_send_request(req).await,
                             AtpCommand::SendResponse(resp) => self.handle_send_response(resp).await,
-                            AtpCommand::SendRelease(rel) => self.handle_send_release(rel).await,
                             AtpCommand::SendAlo(alo) => self.handle_send_alo(alo).await,
                         }
                     } else {
-                        tracing::info!("ATP command channel closed");
+                        // Returning drops `self.sock`, which deregisters the
+                        // socket number for reuse.
+                        tracing::debug!("ATP: all handles dropped, releasing socket");
                         break;
                     }
                 }
@@ -684,12 +710,19 @@ impl Atp {
                     Vec::new()
                 };
 
+                // Fails only once every handle is gone, i.e. nothing is left
+                // to answer with.
+                let Some(response_sender) = self.cmd_tx.upgrade() else {
+                    tracing::debug!("Dropping incoming ATP request, ATP actor is shutting down");
+                    return;
+                };
+
                 let req = AtpReceivedRequest {
                     transaction_id: packet.tid,
                     source: AtpAddress::from_ddp_source(&ddp),
                     user_bytes: packet.user_bytes,
                     data: request_data,
-                    response_sender: self.cmd_tx.clone(),
+                    response_sender,
                     bitmap: packet.bitmap_seq_num,
                 };
 

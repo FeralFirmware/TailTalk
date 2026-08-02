@@ -815,7 +815,8 @@ impl TalkStack {
         attributes: pap::PrinterAttributes,
         sink: impl pap::PrintSink + 'static,
     ) -> pap::PapServer {
-        let (socket_num, _requestor, responder) = atp::Atp::spawn(&self.ddp, None).await;
+        // The responder owns the socket, so dropping the requestor is free.
+        let (socket_num, _, responder) = atp::Atp::spawn(&self.ddp, None).await;
         pap::PapServer::new(responder, self.ddp.clone(), socket_num, attributes, Box::new(sink))
     }
 

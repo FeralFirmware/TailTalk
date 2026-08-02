@@ -45,3 +45,6 @@ ethertalk = ["dep:pcap", "dep:mac_address"]
 
 [dev-dependencies]
 tempfile = "3.13"
+# `test-util` is not part of tokio's `full`, and gives tests `start_paused` so
+# they can wait on timers without spending real wall clock.
+tokio = { workspace = true, features = ["test-util"] }

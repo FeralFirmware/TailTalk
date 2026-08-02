@@ -435,3 +435,123 @@ async fn test_pap_server_query_session() {
 
     hub_task.abort();
 }
+
+/// A printer emulator built the way the real callers build it: handed only a
+/// responder, with the requesting half dropped.
+///
+/// `TalkStack::pap_server` and the GUI's LaserWriter bridge both do that, so
+/// the responder alone has to hold the ATP socket open. Not covered by the test
+/// above, which only partially moves its `TestClient` and so keeps `atp_req`
+/// alive throughout. The failure guarded against is silent: the socket is
+/// released as the server is built, leaving a printer that answers NBP lookups
+/// but never a PAP packet.
+#[tokio::test]
+async fn test_pap_server_survives_requestor_drop() {
+    let _ = tracing_subscriber::fmt().try_init();
+
+    let hub = TestHub::new();
+    let (hub_in_tx, hub_in_rx) = mpsc::channel(100);
+    let hub_ref = Arc::new(hub);
+    let hub_runner = hub_ref.clone();
+    let hub_task = tokio::spawn(async move {
+        hub_runner.run(hub_in_rx).await;
+    });
+
+    let workstation = TestClient::new(
+        [0x00, 0x01, 0x02, 0x03, 0x04, 0xDD],
+        hub_in_tx.clone(),
+        hub_ref.subscribe(),
+        None,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    const PRINTER_SOCKET: u8 = 132;
+    let printer = TestClient::new(
+        [0x00, 0x01, 0x02, 0x03, 0x04, 0xCC],
+        hub_in_tx.clone(),
+        hub_ref.subscribe(),
+        Some(PRINTER_SOCKET),
+    )
+    .await;
+    printer
+        .nbp
+        .register(RegisteredName {
+            name: "DropPrinter:LaserWriter@*".try_into().unwrap(),
+            sock_num: PRINTER_SOCKET,
+        })
+        .await
+        .expect("Printer registration failed");
+
+    // Underscore bindings still own their values to the end of the test, so
+    // every other handle stays up exactly as a real stack would keep it.
+    let TestClient {
+        mac: _mac,
+        addressing: _addressing,
+        ddp,
+        nbp: _nbp,
+        echo: _echo,
+        atp_req,
+        atp_resp,
+    } = printer;
+
+    // The point of the test: the responder is now the only thing holding the
+    // socket. Wait out the actor's 250 ms retransmit tick so one that was going
+    // to shut down has had the chance.
+    drop(atp_req);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let jobs = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let mut server = tailtalk::pap::PapServer::new(
+        atp_resp,
+        ddp.clone(),
+        PRINTER_SOCKET,
+        tailtalk::pap::PrinterAttributes::default(),
+        Box::new(CollectSink(jobs.clone())),
+    );
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // NBP lives on its own socket, so discovery still works even with the ATP
+    // socket gone. It is the PAP exchange below that actually proves anything.
+    let results = workstation
+        .nbp
+        .lookup("DropPrinter:LaserWriter@*".try_into().unwrap())
+        .await
+        .expect("Lookup failed");
+    assert!(!results.is_empty(), "printer did not answer NBP");
+    let target = &results[0];
+    let printer_addr = tailtalk::atp::AtpAddress {
+        network_number: target.network_number,
+        node_number: target.node_id,
+        socket_number: target.socket_number,
+    };
+
+    let mut pap = workstation.into_pap_client();
+    // A released socket means DDP drops OpenConn with nothing to answer it, so
+    // this burns the ATP retry budget rather than failing fast. Bound it.
+    pap.connect_with_timeout(printer_addr, Duration::from_secs(10))
+        .await
+        .expect("PAP connect failed: the server's socket was released when its requestor dropped");
+
+    let ps_job = b"%!PS-Adobe-3.0\rshowpage\r%%EOF\r".to_vec();
+    pap.print(&ps_job).await.expect("Print job failed");
+    let stdout = pap.read_response().await.expect("Job stdout read failed");
+    assert!(stdout.is_empty(), "print job should produce no stdout");
+
+    tokio::time::timeout(Duration::from_secs(10), pap.close())
+        .await
+        .expect("Close timed out")
+        .expect("Close failed");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let jobs = jobs.lock().await;
+    assert_eq!(jobs.len(), 1, "sink must receive the print job");
+    assert_eq!(jobs[0], ps_job);
+
+    println!("✓ PAP server survived its requestor being dropped!");
+
+    hub_task.abort();
+}

@@ -227,7 +227,7 @@ pub async fn run(
                                 counter: std::sync::atomic::AtomicU32::new(0),
                             };
 
-                            let (socket_num, _requestor, responder) = Atp::spawn(&ddp, None).await;
+                            let (socket_num, _, responder) = Atp::spawn(&ddp, None).await;
                             let mut server = PapServer::new(
                                 responder,
                                 ddp,
