@@ -25,13 +25,13 @@ hfs-reader = { workspace = true } #unified
 if-addrs = "0.15"
 ipp = "6.0.1"
 keepawake = "0.6"
-mdns-sd = "0.20.0"
+mdns-sd = "0.20.3"
 rfd = "0.17"
 shellexpand = "3"
 serde = { version = "1", features = ["derive"] }
 serialport = { version = "4", optional = true }
 slint = "1"
-stuffit = "^0.1"
+stuffit = "^0.2"
 tailtalk = { workspace = true } #unified
 tailtalk-packets = { workspace = true } #unified
 tokio = { workspace = true, features = ["io-util"] } #unified

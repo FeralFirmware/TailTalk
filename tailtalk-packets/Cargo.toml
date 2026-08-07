@@ -10,7 +10,7 @@ repository = "https://github.com/feralfirmware/tailtalk"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bitflags = "2.6"
+bitflags = "2.13"
 byteorder = { workspace = true } #unified
 bytes = { workspace = true } #unified
 encoding_rs = { workspace = true } #unified
