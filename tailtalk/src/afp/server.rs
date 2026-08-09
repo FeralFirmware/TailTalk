@@ -233,7 +233,7 @@ impl AspSession {
                 tailtalk_packets::afp::AFP_CMD_GET_SRVR_PARMS => {
                     debug!("AFP FPGetSrvrParms req: (no params)");
                     let vol_response = FPGetSrvrParms {
-                        server_time: crate::time_to_afp_v1(std::time::SystemTime::now()),
+                        server_time: crate::time_to_afp(std::time::SystemTime::now()),
                         volumes: vec![our_volume.get_fp_volume()],
                     };
                     debug!(

@@ -1,6 +1,6 @@
 use anyhow::Error;
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tailtalk_packets::aarp;
 use tailtalk_packets::ddp::DdpPacket;
 use tailtalk_packets::llap::{LlapPacket, LlapType};
@@ -1196,34 +1196,72 @@ impl TalkStackBuilder {
 
 // ── AFP time helpers ──────────────────────────────────────────────────────────
 
-/// Converts a SystemTime to a 32-bit AFP date for **AFP 2.x** (seconds since Jan 1, 2000).
+/// The AFP date-time meaning "never", used for the backup date of a file or
+/// directory that has never been backed up. It is the earliest representable
+/// time, i.e. the most negative signed 32-bit value.
+pub const AFP_DATE_NEVER: u32 = 0x8000_0000;
+
+/// Seconds from the Unix epoch (Jan 1, 1970) to the AFP epoch (Jan 1, 2000).
+const AFP_EPOCH_OFFSET: i64 = 946_684_800;
+
+/// Converts a SystemTime to a 32-bit AFP date-time.
 ///
-/// AFP 2.0 and later use midnight, January 1, 2000 as the epoch. Times before the
-/// epoch are clamped to 0.
+/// AFP date-times are signed 4-byte counts of seconds from 12:00 A.M. on
+/// January 1, 2000, so anything before then is negative (Inside AppleTalk,
+/// 2nd ed., chapter 13, "Date-time values"). Note this is *not* the classic
+/// Mac OS 1904 epoch, which AFP does not use at any version.
 pub fn time_to_afp(time: SystemTime) -> u32 {
-    // Seconds from Unix epoch (Jan 1, 1970) to AFP 2.x epoch (Jan 1, 2000)
-    const AFP2_EPOCH_OFFSET: u64 = 946_684_800;
+    let unix_secs = match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(after) => after.as_secs() as i64,
+        Err(before) => -(before.duration().as_secs() as i64),
+    };
 
-    let unix_secs = time
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    unix_secs.saturating_sub(AFP2_EPOCH_OFFSET) as u32
+    unix_secs
+        .saturating_sub(AFP_EPOCH_OFFSET)
+        .clamp(i32::MIN as i64, i32::MAX as i64) as i32 as u32
 }
 
-/// Converts a SystemTime to a 32-bit AFP date for **AFP 1.x** (seconds since Jan 1, 1904).
-///
-/// AFP 1.x (and classic Mac OS) use midnight, January 1, 1904 as the epoch —
-/// 2,082,844,800 seconds before the Unix epoch.
-pub fn time_to_afp_v1(time: SystemTime) -> u32 {
-    // Seconds from Jan 1, 1904 (Mac OS classic epoch) to Jan 1, 1970 (Unix epoch)
-    const MAC_TO_UNIX_EPOCH_OFFSET: u64 = 2_082_844_800;
+/// Converts a 32-bit AFP date-time back to a SystemTime. See [`time_to_afp`].
+pub fn afp_to_time(date: u32) -> SystemTime {
+    let unix_secs = date as i32 as i64 + AFP_EPOCH_OFFSET;
+    if unix_secs >= 0 {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(unix_secs as u64)
+    } else {
+        SystemTime::UNIX_EPOCH - Duration::from_secs(unix_secs.unsigned_abs())
+    }
+}
 
-    let unix_secs = time
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+#[cfg(test)]
+mod afp_time_tests {
+    use super::*;
 
-    (unix_secs + MAC_TO_UNIX_EPOCH_OFFSET) as u32
+    /// Midnight, Jan 1 2000 UTC as a Unix timestamp.
+    const AFP_EPOCH_UNIX: u64 = AFP_EPOCH_OFFSET as u64;
+
+    #[test]
+    fn epoch_is_january_1_2000() {
+        let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(AFP_EPOCH_UNIX);
+        assert_eq!(time_to_afp(epoch), 0);
+    }
+
+    #[test]
+    fn times_before_the_epoch_are_negative() {
+        // Jan 1 1999, one non-leap year before the epoch.
+        let before = SystemTime::UNIX_EPOCH + Duration::from_secs(AFP_EPOCH_UNIX - 365 * 86_400);
+        assert_eq!(time_to_afp(before) as i32, -365 * 86_400);
+    }
+
+    #[test]
+    fn round_trips_either_side_of_the_epoch() {
+        // Well before the epoch (1936), just before, the epoch itself, and after.
+        for offset in [-2_000_000_000i64, -86_400, 0, 86_400, 2_000_000_000] {
+            let time = if offset.is_negative() {
+                SystemTime::UNIX_EPOCH + Duration::from_secs(AFP_EPOCH_UNIX)
+                    - Duration::from_secs(offset.unsigned_abs())
+            } else {
+                SystemTime::UNIX_EPOCH + Duration::from_secs(AFP_EPOCH_UNIX + offset as u64)
+            };
+            assert_eq!(afp_to_time(time_to_afp(time)), time, "offset {offset}");
+        }
+    }
 }

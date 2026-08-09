@@ -15,11 +15,11 @@ bitflags! {
         const ATTRIBUTES = 0x0001;
         /// Request for volume signature, i.e a flat without directories, fixed directory ID, or variable directory IDs.
         const SIGNATURE = 0x0002;
-        /// Request for creation date of this volume (In 32-bit Macintosh time)
+        /// Request for creation date of this volume (32-bit AFP date-time: signed seconds from Jan 1, 2000)
         const CREATION_DATE = 0x0004;
-        /// Request for last modified date of this volume (In 32-bit Macintosh time)
+        /// Request for last modified date of this volume (32-bit AFP date-time: signed seconds from Jan 1, 2000)
         const MODIFICATION_DATE = 0x0008;
-        /// Request for the last time this volume was backed up (In 32-bit Macintosh time)
+        /// Request for the last time this volume was backed up (32-bit AFP date-time: signed seconds from Jan 1, 2000)
         const BACKUP_DATE = 0x0010;
         /// Request for the volume's 16-bit ID assigned by the server.
         const VOLUME_ID = 0x0020;
@@ -59,13 +59,13 @@ bitflags! {
         /// Response: 32-bit directory ID
         const PARENT_DIR_ID = 1 << 1;
         /// Request for the creation date of this directory.
-        /// Response: 32-bit Macintosh time
+        /// Response: 32-bit AFP date-time (signed seconds from Jan 1, 2000)
         const CREATE_DATE = 1 << 2;
         /// Request for the last modification date of ths directory.
-        /// Response: 32-bit Macintosh time
+        /// Response: 32-bit AFP date-time (signed seconds from Jan 1, 2000)
         const MODIFICATION_DATE = 1 << 3;
         /// Request for the last backup date of this directory.
-        /// Response: 32-bit Macintosh time
+        /// Response: 32-bit AFP date-time (signed seconds from Jan 1, 2000)
         const BACKUP_DATE = 1 << 4;
         /// Request for the Finder information of this directory.
         /// Response: 32-byte Finder information
