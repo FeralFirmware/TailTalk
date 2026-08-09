@@ -1,5 +1,6 @@
 use bitflags::bitflags;
 
+use crate::afp::prodos::PRODOS_INFO_LEN;
 use crate::afp::util::mangle_name;
 
 bitflags! {
@@ -90,7 +91,8 @@ bitflags! {
         /// Request for the access rights of this directory.
         /// Response: 4-byte value in the order of owner, group, and world followed by a User Access Rights summary byte
         const ACCESS_RIGHTS = 1 << 12;
-        /// TODO: What is this?
+        /// Request for the ProDOS Info of this directory, used by ProDOS workstations.
+        /// Response: 6 bytes, always file type $0F and aux type $0200. See [`crate::afp::ProdosInfo`].
         const PRODOS_INFO = 1 << 13;
     }
 }
@@ -155,14 +157,20 @@ impl FPDirectoryBitmap {
             offset += 4;
         }
         if self.contains(FPDirectoryBitmap::PRODOS_INFO) {
-            offset += 6;
+            offset += PRODOS_INFO_LEN;
         }
         offset
     }
 
     pub fn response_len(&self, name: &str) -> usize {
-        let mac_name_len = mangle_name(name).len();
-        self.long_name_offset() + mac_name_len + 1
+        let mut len = self.long_name_offset();
+        // The name itself is the only variable-length part, and it is only
+        // present when the client asked for it. Adding it unconditionally would
+        // over-report the response for a bitmap without LONG_NAME.
+        if self.contains(FPDirectoryBitmap::LONG_NAME) {
+            len += mangle_name(name).len() + 1;
+        }
+        len
     }
 }
 
@@ -181,6 +189,8 @@ bitflags! {
         const DATA_FORK_LENGTH = 1 << 9;
         const RESOURCE_FORK_LENGTH = 1 << 10;
         const ACCESS_RIGHTS = 1 << 12;
+        /// Request for the ProDOS Info of this file, used by ProDOS workstations.
+        /// Response: 6 bytes derived from the Finder type and creator. See [`crate::afp::ProdosInfo`].
         const PRODOS_INFO = 1 << 13;
     }
 }
@@ -239,14 +249,18 @@ impl FPFileBitmap {
             offset += 4;
         }
         if self.contains(FPFileBitmap::PRODOS_INFO) {
-            offset += 6;
+            offset += PRODOS_INFO_LEN;
         }
         offset
     }
 
     pub fn response_len(&self, name: &str) -> usize {
-        let mac_name_len = mangle_name(name).len();
-        self.long_name_offset() + mac_name_len + 1
+        let mut len = self.long_name_offset();
+        // As in `FPDirectoryBitmap::response_len`: only counted when requested.
+        if self.contains(FPFileBitmap::LONG_NAME) {
+            len += mangle_name(name).len() + 1;
+        }
+        len
     }
 }
 
