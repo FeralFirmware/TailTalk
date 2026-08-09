@@ -1,11 +1,13 @@
 mod bitmap;
 mod commands;
+mod prodos;
 mod types;
 mod util;
 
 // Re-export all public items
 pub use bitmap::*;
 pub use commands::*;
+pub use prodos::*;
 pub use types::*;
 pub use util::*;
 

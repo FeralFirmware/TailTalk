@@ -5,7 +5,8 @@ use std::time::SystemTime;
 use tailtalk_packets::afp::{
     mangle_name, AFP2_MAX_NAME_LEN, AfpError, CreateFlag, FPByteRangeLockFlags, FPDelete,
     FPDirectoryBitmap, FPEnumerate, FPFileBitmap, FPRead, FPSetForkParms, FPVolume,
-    FPVolumeBitmap, FileType, FinderFlags, FinderInfo, ForkType, VolumeSignature,
+    FPVolumeBitmap, FileType, FinderFlags, FinderInfo, ForkType, PRODOS_INFO_LEN, ProdosInfo,
+    VolumeSignature,
 };
 use encoding_rs::MACINTOSH;
 
@@ -271,11 +272,12 @@ impl Node {
             .await
             .map_err(|_| AfpError::ObjectNotFound)?;
 
-        // ATTRIBUTES and FINDER_INFO both come from the same Finder Info blob, and
-        // reading it can fall back to content-based type inference, so fetch it at
-        // most once and only when one of the two is actually asked for.
-        let finder_info = if bitmap.intersects(FPFileBitmap::ATTRIBUTES | FPFileBitmap::FINDER_INFO)
-        {
+        // ATTRIBUTES, FINDER_INFO and PRODOS_INFO all come from the same Finder Info
+        // blob, and reading it can fall back to content-based type inference, so
+        // fetch it at most once and only when one of the three is actually asked for.
+        let finder_info = if bitmap.intersects(
+            FPFileBitmap::ATTRIBUTES | FPFileBitmap::FINDER_INFO | FPFileBitmap::PRODOS_INFO,
+        ) {
             Some(self.get_finder_info(volume_root).await)
         } else {
             None
@@ -334,6 +336,13 @@ impl Node {
             variable_len_offset += name_len + 1;
         }
 
+        if bitmap.contains(FPFileBitmap::SHORT_NAME) {
+            // No short name to offer, and an offset of 0 is how a server says so.
+            // The two bytes still have to be here or the fields after them shift.
+            output[offset..offset + 2].fill(0);
+            offset += 2;
+        }
+
         if bitmap.contains(FPFileBitmap::FILE_NUMBER) {
             output[offset..offset + 4].copy_from_slice(&self.id.to_be_bytes());
             offset += 4;
@@ -352,8 +361,9 @@ impl Node {
         }
 
         if bitmap.contains(FPFileBitmap::PRODOS_INFO) {
-            output[offset..offset + 6].fill(0);
-            offset += 6;
+            let prodos = ProdosInfo::from_finder_info(&finder_info.unwrap_or_default());
+            output[offset..offset + PRODOS_INFO_LEN].copy_from_slice(&prodos.to_bytes());
+            offset += PRODOS_INFO_LEN;
         }
 
         Ok(offset + variable_len_offset)
@@ -412,6 +422,24 @@ fn clamp_len_u32(len: u64, what: &str, path: &Path) -> u32 {
     } else {
         len as u32
     }
+}
+
+/// Take the next `N` bytes of a packed parameter block and advance `offset`.
+///
+/// A client is free to send a bitmap describing more parameters than the block it
+/// actually sent, so this returns `ParamError` rather than indexing past the end
+/// and panicking the session.
+fn take_param<'a, const N: usize>(
+    data: &'a [u8],
+    offset: &mut usize,
+) -> Result<&'a [u8; N], AfpError> {
+    let end = offset.checked_add(N).ok_or(AfpError::ParamError)?;
+    let field = data
+        .get(*offset..end)
+        .and_then(|field| field.try_into().ok())
+        .ok_or(AfpError::ParamError)?;
+    *offset = end;
+    Ok(field)
 }
 
 /// Best-effort creation time: some filesystems/platforms don't record btime and
@@ -797,57 +825,78 @@ impl Volume {
         let is_dir = node.is_dir;
         let mut offset = 0;
 
-        // Handle Attributes (Bit 0) — same bit position in both bitmaps
-        let has_attributes = if is_dir {
-            dir_bitmap.contains(FPDirectoryBitmap::ATTRIBUTES)
-        } else {
-            file_bitmap.contains(FPFileBitmap::ATTRIBUTES)
+        // Parameters arrive packed in bit order, so every branch below has to
+        // advance the cursor by its parameter's width even when the value is
+        // ignored. One that doesn't leaves the fields after it misaligned.
+        //
+        // The parameters we apply sit at the same bit position in both bitmaps,
+        // so `wants` asks whichever one applies to this node.
+        let wants = |file: FPFileBitmap, dir: FPDirectoryBitmap| {
+            if is_dir {
+                dir_bitmap.contains(dir)
+            } else {
+                file_bitmap.contains(file)
+            }
         };
-        if has_attributes {
-            let attributes = u16::from_be_bytes([data[offset], data[offset + 1]]);
+
+        // Bit 0: Attributes (2 bytes)
+        if wants(FPFileBitmap::ATTRIBUTES, FPDirectoryBitmap::ATTRIBUTES) {
+            let attributes = u16::from_be_bytes(*take_param::<2>(data, &mut offset)?);
             node.set_attributes(&volume_root, attributes).await?;
-            offset += 2;
         }
 
-        // Bit 2: Create Date (4 bytes) — skip, not applied
-        let has_create_date = if is_dir {
-            dir_bitmap.contains(FPDirectoryBitmap::CREATE_DATE)
-        } else {
-            file_bitmap.contains(FPFileBitmap::CREATE_DATE)
-        };
-        if has_create_date {
-            offset += 4;
+        // Bits 2, 3 and 4: the create, modification and backup dates (4 bytes
+        // each). Stepped over, not applied.
+        for (file, dir) in [
+            (FPFileBitmap::CREATE_DATE, FPDirectoryBitmap::CREATE_DATE),
+            (FPFileBitmap::MODIFICATION_DATE, FPDirectoryBitmap::MODIFICATION_DATE),
+            (FPFileBitmap::BACKUP_DATE, FPDirectoryBitmap::BACKUP_DATE),
+        ] {
+            if wants(file, dir) {
+                take_param::<4>(data, &mut offset)?;
+            }
         }
 
-        // Bit 3: Modification Date (4 bytes) — skip, not applied
-        let has_mod_date = if is_dir {
-            dir_bitmap.contains(FPDirectoryBitmap::MODIFICATION_DATE)
-        } else {
-            file_bitmap.contains(FPFileBitmap::MODIFICATION_DATE)
-        };
-        if has_mod_date {
-            offset += 4;
-        }
-
-        // Bit 4: Backup Date (4 bytes) — skip, not applied
-        let has_backup_date = if is_dir {
-            dir_bitmap.contains(FPDirectoryBitmap::BACKUP_DATE)
-        } else {
-            file_bitmap.contains(FPFileBitmap::BACKUP_DATE)
-        };
-        if has_backup_date {
-            offset += 4;
-        }
-
-        // Handle Finder Info (Bit 5) — same bit position in both bitmaps
-        let has_finder_info = if is_dir {
-            dir_bitmap.contains(FPDirectoryBitmap::FINDER_INFO)
-        } else {
-            file_bitmap.contains(FPFileBitmap::FINDER_INFO)
-        };
-        if has_finder_info {
-            let raw: [u8; 32] = data[offset..offset + 32].try_into().unwrap();
+        // Bit 5: Finder Info (32 bytes)
+        if wants(FPFileBitmap::FINDER_INFO, FPDirectoryBitmap::FINDER_INFO) {
+            let raw = *take_param::<32>(data, &mut offset)?;
             node.set_finder_info(&volume_root, &FinderInfo::from(raw)).await?;
+        }
+
+        // Bits 10, 11 and 12: Owner ID, Group ID and Access Rights (4 bytes each).
+        // Directory-only, and we don't apply them, but they sit between Finder Info
+        // and ProDOS Info so they still have to be stepped over.
+        if is_dir {
+            for bit in [
+                FPDirectoryBitmap::OWNER_ID,
+                FPDirectoryBitmap::GROUP_ID,
+                FPDirectoryBitmap::ACCESS_RIGHTS,
+            ] {
+                if dir_bitmap.contains(bit) {
+                    take_param::<4>(data, &mut offset)?;
+                }
+            }
+        }
+
+        // Bit 13: ProDOS Info (6 bytes)
+        if wants(FPFileBitmap::PRODOS_INFO, FPDirectoryBitmap::PRODOS_INFO) {
+            let prodos = ProdosInfo::from_bytes(*take_param::<PRODOS_INFO_LEN>(data, &mut offset)?);
+
+            if is_dir {
+                // A directory's file type is always $0F, and chapter 13 asks for
+                // afpAccessDenied on any attempt to change it. The aux type is
+                // unrestricted, and we have nowhere to keep it, so it is dropped.
+                if prodos.file_type != ProdosInfo::DIRECTORY.file_type {
+                    return Err(AfpError::AccessDenied);
+                }
+            } else {
+                // Setting ProDOS Info without Finder Info has to derive the Finder
+                // side. This runs after the Finder Info branch, so a client sending
+                // both gets the ProDOS type and creator and keeps the flags.
+                let current = node.get_finder_info(&volume_root).await;
+                node.set_finder_info(&volume_root, &prodos.to_finder_info(&current))
+                    .await?;
+            }
         }
 
         Ok(())
@@ -1331,6 +1380,12 @@ impl Volume {
             variable_len_offset += name_len + 1;
         }
 
+        if bitmap.contains(FPDirectoryBitmap::SHORT_NAME) {
+            // As in `Node::get_file_parms_resp`: offset 0 means "no short name".
+            output[offset..offset + 2].fill(0);
+            offset += 2;
+        }
+
         if bitmap.contains(FPDirectoryBitmap::DIR_ID) {
             output[offset..offset + 4].copy_from_slice(&node.id.to_be_bytes());
             offset += 4;
@@ -1357,6 +1412,13 @@ impl Volume {
         if bitmap.contains(FPDirectoryBitmap::ACCESS_RIGHTS) {
             output[offset..offset + 4].copy_from_slice(&0x87070707u32.to_be_bytes());
             offset += 4;
+        }
+
+        if bitmap.contains(FPDirectoryBitmap::PRODOS_INFO) {
+            // Directories are always file type $0F with aux type $0200.
+            output[offset..offset + PRODOS_INFO_LEN]
+                .copy_from_slice(&ProdosInfo::DIRECTORY.to_bytes());
+            offset += PRODOS_INFO_LEN;
         }
 
         Ok(offset + variable_len_offset)
@@ -2548,6 +2610,17 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         panic!("sled lock at {path:?} still held 500ms after dropping the Volume");
+    }
+
+    /// The name is the one variable-length parameter, reached through an offset,
+    /// so it is where a length mismatch turns into lost bytes.
+    fn assert_name_fits(output: &[u8], name_offset: usize, written: usize, expected: &[u8]) {
+        let len = output[name_offset] as usize;
+        assert!(
+            name_offset + 1 + len <= written,
+            "name runs past the reported length"
+        );
+        assert_eq!(&output[name_offset + 1..name_offset + 1 + len], expected);
     }
 
 
@@ -3974,6 +4047,277 @@ mod tests {
             result.is_ok(),
             "resolve_node should find the file by mangled name after a simulated server restart: {:?}",
             result.err()
+        );
+    }
+
+    /// A parameter block is framed by the length its bitmap implies, so
+    /// `response_len()` and the writers have to agree bit for bit. A field the
+    /// writer forgets, or one it writes that the helper doesn't count, shifts
+    /// everything after it and the client sees a truncated name rather than an
+    /// error. Checking each bit on its own and then all of them together holds
+    /// that for every parameter, not just whichever one last went wrong.
+    #[tokio::test]
+    async fn parms_response_length_matches_the_bitmap() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        tokio::fs::create_dir(root_path.join("mydir")).await.unwrap();
+        File::create(root_path.join("myfile.txt")).await.unwrap();
+
+        let mut volume = make_test_volume("TestVol".to_string(), root_path).await;
+        let dir_id = volume.resolve_node_lazy(2, Path::new("mydir")).await.unwrap();
+        let file_id = volume.resolve_node_lazy(2, Path::new("myfile.txt")).await.unwrap();
+
+        for bitmap in FPDirectoryBitmap::all().iter().chain([FPDirectoryBitmap::all()]) {
+            let mut output = [0u8; 512];
+            let (is_dir, written) = volume
+                .get_node_parms(dir_id, FPFileBitmap::empty(), bitmap, &mut output)
+                .await
+                .unwrap();
+
+            assert!(is_dir);
+            assert_eq!(written, bitmap.response_len("mydir"), "directory {bitmap:?}");
+            if bitmap.contains(FPDirectoryBitmap::LONG_NAME) {
+                assert_name_fits(&output, bitmap.long_name_offset(), written, b"mydir");
+            }
+            // ProDOS Info is the last fixed field, and a directory's value is a
+            // known constant, so it also pins the packing order. Matching lengths
+            // alone would not notice two fields swapped.
+            if bitmap.contains(FPDirectoryBitmap::PRODOS_INFO) {
+                let at = bitmap.long_name_offset() - PRODOS_INFO_LEN;
+                assert_eq!(
+                    &output[at..at + PRODOS_INFO_LEN],
+                    &ProdosInfo::DIRECTORY.to_bytes(),
+                    "directory {bitmap:?}"
+                );
+            }
+        }
+
+        for bitmap in FPFileBitmap::all().iter().chain([FPFileBitmap::all()]) {
+            let mut output = [0u8; 512];
+            let (is_dir, written) = volume
+                .get_node_parms(file_id, bitmap, FPDirectoryBitmap::empty(), &mut output)
+                .await
+                .unwrap();
+
+            assert!(!is_dir);
+            assert_eq!(written, bitmap.response_len("myfile.txt"), "file {bitmap:?}");
+            if bitmap.contains(FPFileBitmap::LONG_NAME) {
+                assert_name_fits(&output, bitmap.long_name_offset(), written, b"myfile.txt");
+            }
+        }
+    }
+
+    /// The same agreement seen from FPEnumerate, where a short write does more
+    /// damage: entries are packed back to back, so one wrong length leaves every
+    /// entry after it overlapping the one before.
+    #[tokio::test]
+    async fn enumerate_entries_are_the_length_they_declare() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        tokio::fs::create_dir(root_path.join("subdir")).await.unwrap();
+        File::create(root_path.join("file1.txt")).await.unwrap();
+        File::create(root_path.join("file2.txt")).await.unwrap();
+
+        let mut volume = make_test_volume("TestVol".to_string(), root_path).await;
+
+        let enumerate_cmd = FPEnumerate {
+            volume_id: 1,
+            directory_id: 2,
+            file_bitmap: FPFileBitmap::all(),
+            directory_bitmap: FPDirectoryBitmap::all(),
+            req_count: 10,
+            start_index: 1,
+            max_reply_size: 1024,
+            path: "".into(),
+        };
+
+        let mut output = [0u8; 1024];
+        let total = volume.enumerate(enumerate_cmd, &mut output).await.unwrap();
+
+        let count = u16::from_be_bytes(output[0..2].try_into().unwrap());
+        assert_eq!(count, 3);
+
+        // Walk the reply the way a client does, by each entry's declared length.
+        let mut offset = 2usize;
+        let mut names = Vec::new();
+        for _ in 0..count {
+            let entry_len = output[offset] as usize;
+            let is_dir = output[offset + 1] == u8::from(FileType::Directory);
+            let parms = &output[offset + 2..offset + entry_len];
+
+            let name_offset = if is_dir {
+                FPDirectoryBitmap::all().long_name_offset()
+            } else {
+                FPFileBitmap::all().long_name_offset()
+            };
+            let name_len = parms[name_offset] as usize;
+            names.push(
+                String::from_utf8_lossy(&parms[name_offset + 1..name_offset + 1 + name_len])
+                    .into_owned(),
+            );
+
+            offset += entry_len;
+        }
+
+        assert_eq!(
+            offset, total,
+            "walking the declared entry lengths must land on the end of the reply"
+        );
+        names.sort();
+        assert_eq!(names, vec!["file1.txt", "file2.txt", "subdir"]);
+    }
+
+    /// Finder Info is the only place we keep a type, so a ProDOS client's file
+    /// type has to survive the trip out to the xattr store and back.
+    #[tokio::test]
+    async fn file_prodos_info_round_trips_through_finder_info() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        File::create(root_path.join("prog")).await.unwrap();
+
+        let mut volume = make_test_volume("TestVol".to_string(), root_path).await;
+        let node_id = volume.resolve_node_lazy(2, Path::new("prog")).await.unwrap();
+
+        for (prodos, fd_type) in [
+            // Has a Finder equivalent.
+            (ProdosInfo { file_type: 0xB3, aux_type: 0 }, *b"PS16"),
+            // Doesn't, so it packs into the type to keep the aux type.
+            (ProdosInfo { file_type: 0x32, aux_type: 0x5775 }, *b"p2Wu"),
+        ] {
+            volume
+                .set_node_parms(
+                    node_id,
+                    FPFileBitmap::PRODOS_INFO,
+                    FPDirectoryBitmap::empty(),
+                    &prodos.to_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let mut output = [0u8; 256];
+            volume
+                .get_node_parms(
+                    node_id,
+                    FPFileBitmap::FINDER_INFO | FPFileBitmap::PRODOS_INFO,
+                    FPDirectoryBitmap::empty(),
+                    &mut output,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(&output[0..4], &fd_type, "Finder type for {prodos:?}");
+            assert_eq!(&output[4..8], b"pdos");
+            assert_eq!(
+                ProdosInfo::from_bytes(output[32..38].try_into().unwrap()),
+                prodos
+            );
+        }
+    }
+
+    /// Directories carry a fixed ProDOS type, and the spec calls for
+    /// afpAccessDenied on any attempt to change it.
+    #[tokio::test]
+    async fn directory_prodos_type_is_fixed() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        tokio::fs::create_dir(root_path.join("mydir")).await.unwrap();
+
+        let mut volume = make_test_volume("TestVol".to_string(), root_path).await;
+        let node_id = volume.resolve_node_lazy(2, Path::new("mydir")).await.unwrap();
+
+        let mut output = [0u8; 256];
+        volume
+            .get_node_parms(
+                node_id,
+                FPFileBitmap::empty(),
+                FPDirectoryBitmap::PRODOS_INFO,
+                &mut output,
+            )
+            .await
+            .unwrap();
+        assert_eq!(&output[..6], &ProdosInfo::DIRECTORY.to_bytes());
+
+        let rejected = ProdosInfo { file_type: 0x04, aux_type: 0 }.to_bytes();
+        assert_eq!(
+            volume
+                .set_node_parms(
+                    node_id,
+                    FPFileBitmap::empty(),
+                    FPDirectoryBitmap::PRODOS_INFO,
+                    &rejected,
+                )
+                .await,
+            Err(AfpError::AccessDenied)
+        );
+
+        // $0F with any aux type is accepted; the aux type has nowhere to be kept.
+        let accepted = ProdosInfo { file_type: 0x0F, aux_type: 0x1234 }.to_bytes();
+        volume
+            .set_node_parms(
+                node_id,
+                FPFileBitmap::empty(),
+                FPDirectoryBitmap::PRODOS_INFO,
+                &accepted,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The mirror of the length invariant on the way in: parameters arrive packed
+    /// in bit order, so a field that doesn't advance the cursor by its own width
+    /// makes every field after it parse from the wrong offset.
+    #[tokio::test]
+    async fn set_parms_consumes_every_field_in_the_block() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        File::create(root_path.join("doc")).await.unwrap();
+
+        let mut volume = make_test_volume("TestVol".to_string(), root_path).await;
+        let node_id = volume.resolve_node_lazy(2, Path::new("doc")).await.unwrap();
+
+        let bitmap = FPFileBitmap::ATTRIBUTES
+            | FPFileBitmap::CREATE_DATE
+            | FPFileBitmap::MODIFICATION_DATE
+            | FPFileBitmap::BACKUP_DATE
+            | FPFileBitmap::FINDER_INFO
+            | FPFileBitmap::PRODOS_INFO;
+
+        let mut params = Vec::new();
+        params.extend_from_slice(&0u16.to_be_bytes());
+        params.extend_from_slice(&[0u8; 12]); // the three dates
+        let mut finder_info = [0u8; 32];
+        finder_info[0..4].copy_from_slice(b"BINA");
+        finder_info[4..8].copy_from_slice(b"pdos");
+        params.extend_from_slice(&finder_info);
+        params.extend_from_slice(&ProdosInfo { file_type: 0x04, aux_type: 0 }.to_bytes());
+
+        volume
+            .set_node_parms(node_id, bitmap, FPDirectoryBitmap::empty(), &params)
+            .await
+            .unwrap();
+
+        let mut output = [0u8; 256];
+        volume
+            .get_node_parms(
+                node_id,
+                FPFileBitmap::FINDER_INFO,
+                FPDirectoryBitmap::empty(),
+                &mut output,
+            )
+            .await
+            .unwrap();
+
+        // ProDOS Info is the last field, so it wins over the Finder Info in the
+        // same block. 'BINA' is what a drifting cursor leaves behind.
+        assert_eq!(&output[0..4], b"TEXT");
+
+        // A bitmap describing more than the client actually sent is an error, not
+        // a panic.
+        assert_eq!(
+            volume
+                .set_node_parms(node_id, bitmap, FPDirectoryBitmap::empty(), &params[..20])
+                .await,
+            Err(AfpError::ParamError)
         );
     }
 }
