@@ -10,7 +10,7 @@ use tailtalk_packets::afp::{
 };
 use encoding_rs::MACINTOSH;
 
-use crate::time_to_afp_v1;
+use crate::time_to_afp;
 use tracing::{error, info};
 #[cfg(unix)]
 use xattr;
@@ -298,20 +298,20 @@ impl Node {
         }
 
         if bitmap.contains(FPFileBitmap::CREATE_DATE) {
-            let created_at_bytes = time_to_afp_v1(creation_time(&metadata)).to_be_bytes();
+            let created_at_bytes = time_to_afp(creation_time(&metadata)).to_be_bytes();
             output[offset..offset + 4].copy_from_slice(&created_at_bytes);
             offset += 4;
         }
 
         if bitmap.contains(FPFileBitmap::MODIFICATION_DATE) {
             let modified = metadata.modified().unwrap_or_else(|_| creation_time(&metadata));
-            let modified_at_bytes = time_to_afp_v1(modified).to_be_bytes();
+            let modified_at_bytes = time_to_afp(modified).to_be_bytes();
             output[offset..offset + 4].copy_from_slice(&modified_at_bytes);
             offset += 4;
         }
 
         if bitmap.contains(FPFileBitmap::BACKUP_DATE) {
-            output[offset..offset + 4].copy_from_slice(&0u32.to_be_bytes());
+            output[offset..offset + 4].copy_from_slice(&crate::AFP_DATE_NEVER.to_be_bytes());
             offset += 4;
         }
 
@@ -602,7 +602,7 @@ fn afp_path_is_empty(path: &Path) -> bool {
 
 impl Volume {
     pub async fn new(name: String, path: PathBuf, volume_id: u16, db: sled::Db) -> Self {
-        let created_at = time_to_afp_v1(SystemTime::now());
+        let created_at = time_to_afp(SystemTime::now());
         let desktop_database = crate::afp::DesktopDatabase::from_db(db, 1)
             .expect("failed to open AFP desktop database");
         let mangle_tree = desktop_database.mangle_names.clone();
@@ -1161,22 +1161,24 @@ impl Volume {
         0
     }
 
-    /// Returns the creation time of the volume as a u32 in Macintosh time format.
+    /// Returns the creation time of the volume as a 32-bit AFP date-time.
     pub fn get_created_at(&self) -> u32 {
         self.created_at
     }
 
-    /// Returns the last modified time of the volume as a u32 in Macintosh time format.
+    /// Returns the last modified time of the volume as a 32-bit AFP date-time.
     pub async fn get_modified_at(&self) -> u32 {
         tokio::fs::metadata(&self.path)
             .await
             .and_then(|m| m.modified())
-            .map(time_to_afp_v1)
+            .map(time_to_afp)
             .unwrap_or(self.created_at)
     }
 
+    /// Returns the backup time of the volume as a 32-bit AFP date-time. We never
+    /// back anything up, so this is always the "never backed up" sentinel.
     pub fn get_backup_at(&self) -> u32 {
-        0
+        crate::AFP_DATE_NEVER
     }
 
     /// Returns the assigned volume ID. This ID is used for all AFP requests to identify this volume.
@@ -3460,7 +3462,11 @@ mod tests {
         assert!(!is_dir);
         assert_eq!(bytes_written, 4);
         let backup_date = u32::from_be_bytes(output[0..4].try_into().unwrap());
-        assert_eq!(backup_date, 0, "backup date should be zero (never backed up)");
+        assert_eq!(
+            backup_date,
+            crate::AFP_DATE_NEVER,
+            "backup date should be the earliest representable time (never backed up)"
+        );
     }
 
     #[tokio::test]
