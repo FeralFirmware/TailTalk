@@ -1,0 +1,4 @@
+(sym_lib_table
+	(version 7)
+	(lib (name "InkTalk_Parts") (type "KiCad") (uri "${KIPRJMOD}/InkTalk_Parts.kicad_sym") (options "") (descr ""))
+)
