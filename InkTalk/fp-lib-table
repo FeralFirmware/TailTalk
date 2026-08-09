@@ -1,0 +1,4 @@
+(fp_lib_table
+	(version 7)
+	(lib (name "tashtalk") (type "KiCad") (uri "/home/ravenminion/TailTalk/TashTalkUSB/TashTalk.pretty") (options "") (descr ""))
+)
