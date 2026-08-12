@@ -436,6 +436,355 @@ async fn test_pap_server_query_session() {
     hub_task.abort();
 }
 
+/// Stands in for a pre-3.0 LaserWriter driver, which `PapClient` cannot impersonate:
+/// it writes a job without ever setting the PAP eof flag, then blocks on the read
+/// waiting for the printer to speak first.
+struct LegacyDriver {
+    conn_id: u8,
+    conn_addr: tailtalk::atp::AtpAddress,
+    atp_req: tailtalk::atp::AtpRequestor,
+    /// The driver's own read sequence number, advanced once each read is answered.
+    read_seq: u16,
+    /// ATP bitmap on a read, i.e. how many response packets the driver will take.
+    read_bitmap: u8,
+    writer: tokio::task::JoinHandle<()>,
+}
+
+impl LegacyDriver {
+    /// OpenConn by hand, then answer the server's SendData polls out of `writes`,
+    /// one `(block, eof)` per poll, going quiet once they run out.
+    async fn connect(
+        client: TestClient,
+        listener_addr: tailtalk::atp::AtpAddress,
+        read_bitmap: u8,
+        writes: Vec<(Vec<u8>, bool)>,
+    ) -> Self {
+        let conn_id = client.atp_req.socket_number;
+        let open = PapPacket {
+            connection_id: conn_id,
+            function: PapFunction::OpenConn,
+            sequence_num: 0,
+            eof: false,
+            data: vec![client.atp_req.socket_number, 0x08, 0x00, 0x00],
+        };
+        let (ub, data) = open.to_atp_parts();
+        let (reply_data, reply_ub) = client
+            .atp_req
+            .send_request_with_bitmap(listener_addr, ub, data.to_vec(), 0x01)
+            .await
+            .expect("OpenConn failed");
+        let reply = PapPacket::parse_from_atp(reply_ub, &reply_data).expect("OpenConnReply parse");
+        assert_eq!(reply.function, PapFunction::OpenConnReply);
+        assert_eq!(&reply.data[2..4], &[0, 0], "OpenConn must succeed, not report busy");
+        let conn_addr = tailtalk::atp::AtpAddress {
+            socket_number: reply.data[0],
+            ..listener_addr
+        };
+
+        let mut atp_resp = client.atp_resp;
+        let writer = tokio::spawn(async move {
+            let mut writes = writes.into_iter();
+            while let Some(req) = atp_resp.next().await {
+                let Ok(pap) = PapPacket::parse_from_atp(req.user_bytes, &req.data) else {
+                    continue;
+                };
+                if pap.function != PapFunction::SendData {
+                    continue;
+                }
+                let Some((block, eof)) = writes.next() else {
+                    continue; // Nothing left to say until the printer answers.
+                };
+                let resp = PapPacket {
+                    connection_id: conn_id,
+                    function: PapFunction::Data,
+                    sequence_num: pap.sequence_num,
+                    eof,
+                    data: block,
+                };
+                let (ub, d) = resp.to_atp_parts();
+                let _ = req.send_response(d, ub).await;
+            }
+        });
+
+        Self { conn_id, conn_addr, atp_req: client.atp_req, read_seq: 1, read_bitmap, writer }
+    }
+
+    /// Post the read the driver blocks on and wait for the printer to speak. Before
+    /// the fix this waited forever, retransmitting with nothing ever coming back.
+    async fn read(&mut self) -> PapPacket {
+        let read = PapPacket {
+            connection_id: self.conn_id,
+            function: PapFunction::SendData,
+            sequence_num: self.read_seq,
+            eof: false,
+            data: vec![],
+        };
+        let (ub, d) = read.to_atp_parts();
+        let (data, user_bytes) = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.atp_req
+                .send_request_with_bitmap(self.conn_addr, ub, d.to_vec(), self.read_bitmap),
+        )
+        .await
+        .expect("no answer: the pre-3.0 query deadlock is back")
+        .expect("read failed");
+        self.read_seq += 1;
+        let answer = PapPacket::parse_from_atp(user_bytes, &data).expect("answer parse");
+        assert_eq!(answer.function, PapFunction::Data);
+        answer
+    }
+}
+
+/// Spin up a printer emulator and return the workstation, its address, and the
+/// jobs its sink collects.
+async fn legacy_printer(
+    name: &str,
+    socket: u8,
+    mac: u8,
+    attrs: tailtalk::pap::PrinterAttributes,
+) -> (
+    TestClient,
+    tailtalk::atp::AtpAddress,
+    Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let hub = TestHub::new();
+    let (hub_in_tx, hub_in_rx) = mpsc::channel(100);
+    let hub_ref = Arc::new(hub);
+    let hub_runner = hub_ref.clone();
+    let hub_task = tokio::spawn(async move {
+        hub_runner.run(hub_in_rx).await;
+    });
+
+    let workstation = TestClient::new(
+        [0x00, 0x01, 0x02, 0x03, mac, 0xDD],
+        hub_in_tx.clone(),
+        hub_ref.subscribe(),
+        None,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let printer = TestClient::new(
+        [0x00, 0x01, 0x02, 0x03, mac, 0xCC],
+        hub_in_tx.clone(),
+        hub_ref.subscribe(),
+        Some(socket),
+    )
+    .await;
+    printer
+        .nbp
+        .register(RegisteredName {
+            name: name.try_into().unwrap(),
+            sock_num: socket,
+        })
+        .await
+        .expect("Printer registration failed");
+
+    let jobs = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let mut server = tailtalk::pap::PapServer::new(
+        printer.atp_resp,
+        printer.ddp.clone(),
+        socket,
+        attrs,
+        Box::new(CollectSink(jobs.clone())),
+    );
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let found = workstation
+        .nbp
+        .lookup(name.try_into().unwrap())
+        .await
+        .expect("Lookup failed");
+    let target = found.first().expect("printer not found");
+    let addr = tailtalk::atp::AtpAddress {
+        network_number: target.network_number,
+        node_number: target.node_id,
+        socket_number: target.socket_number,
+    };
+    (workstation, addr, jobs, hub_task)
+}
+
+/// A pre-3.0 driver's query: written with no eof flag, then the driver blocks on
+/// the read waiting for the printer to speak first.
+///
+/// LaserWriter 8 ends a query job with the PAP eof flag, which is what tells the
+/// server the job is complete and can be answered. The LaserWriter 7.x-era drivers
+/// (this is a System 7 Mac talking to us as a "Color LaserWriter 12/600") never
+/// send it, so a server that waits for eof and a driver that waits for an answer
+/// sit staring at each other until the user gives up. Captured in the wild as an
+/// endless exchange of unanswered SendData polls in both directions.
+#[tokio::test]
+async fn test_pap_server_answers_query_without_eof() {
+    let _ = tracing_subscriber::fmt().try_init();
+
+    let (workstation, listener_addr, jobs, hub_task) = legacy_printer(
+        "OldPrinter:LaserWriter@*",
+        133,
+        0x04,
+        tailtalk::pap::PrinterAttributes::default(),
+    )
+    .await;
+
+    let query = b"%!PS-Adobe-2.0 Query\r\
+        %%Title: Query for PatchPrep\r\
+        %%?BeginProcSetQuery: \"(AppleDict md)\" 71 0\r\
+        userdict/PV known{userdict begin PV 1 ge{(1)}{(2)}ifelse end}\
+        {/md where{pop(2)}{(0)}ifelse}ifelse = flush\r\
+        %%?EndProcSetQuery: unknown\r"
+        .to_vec();
+    let mut driver = LegacyDriver::connect(workstation, listener_addr, 0x0f, vec![(query, false)]).await;
+
+    let answer = driver.read().await;
+    assert_eq!(
+        answer.data, b"0\r",
+        "the AppleDict ProcSet is not resident, so the answer is 0"
+    );
+    assert!(answer.eof, "eof ends the response so the driver stops reading");
+
+    assert!(
+        jobs.lock().await.is_empty(),
+        "a query must never be handed to the print sink"
+    );
+
+    println!("✓ PAP pre-3.0 query test passed!");
+
+    driver.writer.abort();
+    hub_task.abort();
+}
+
+/// The other pre-3.0 shape, captured from a IIgs-era driver over EtherTalk.
+///
+/// Three things here that the first capture did not have: a `statusdict/jobname`
+/// prologue arriving in its own packet ahead of the job, so the `%!PS-Adobe` header
+/// is not at the front of the buffer; two query blocks crammed into one PAP packet,
+/// which is off-spec but which Netatalk and Apple's spoolers accept; and a font list
+/// query, whose answer has to come back one write per PAP packet rather than all at
+/// once. The driver still never sets eof, and its reads take one packet each.
+#[tokio::test]
+async fn test_pap_server_answers_printer_and_font_list_query() {
+    let _ = tracing_subscriber::fmt().try_init();
+
+    let attrs = tailtalk::pap::PrinterAttributes {
+        product_name: "LaserWriter Plus".to_string(),
+        ps_version: "47.0".to_string(),
+        ps_revision: 1,
+        resident_fonts: vec!["Times-Roman".to_string(), "Helvetica".to_string()],
+        ..tailtalk::pap::PrinterAttributes::default()
+    };
+    let (workstation, listener_addr, jobs, hub_task) =
+        legacy_printer("OldGSPrinter:LaserWriter@*", 134, 0x05, attrs).await;
+
+    let prologue = b"statusdict/jobname(User - Byte Knight, Document - BK.Greet.f.IIgs)put\r".to_vec();
+    let query = b"%!PS-Adobe-2.0 Query\r\
+        %%?BeginPrinterQuery\r\
+        statusdict begin revision == version == product == end flush\r\
+        %%?EndPrinterQuery: Unknown\r\
+        %%?BeginFontListQuery\r\
+        FontDirectory{pop = flush}forall/* = flush\r\
+        %%?EndFontListQuery: /*\r\
+        %%EOF\r"
+        .to_vec();
+    let mut driver =
+        LegacyDriver::connect(workstation, listener_addr, 0x01, vec![(prologue, false), (query, false)]).await;
+
+    // The printer query flushes once, after all three `==`, so its three lines are
+    // one write. It is not the last one, so no eof yet.
+    let first = driver.read().await;
+    assert_eq!(first.data, b"1 \n(47.0)\n(LaserWriter Plus)\n");
+    assert!(!first.eof, "the font list still has to follow");
+
+    // The font list flushes per name, so each one has to come back in a packet of
+    // its own, and so does the `*` that terminates the list. Batching them into one
+    // response is what the driver will not accept.
+    for expected in [&b"Times-Roman\n"[..], b"Helvetica\n"] {
+        let write = driver.read().await;
+        assert_eq!(write.data, expected);
+        assert!(!write.eof, "the font list is not finished yet");
+    }
+    let last = driver.read().await;
+    assert_eq!(last.data, b"*\n");
+    assert!(last.eof, "the last write of the job's output ends it");
+
+    assert!(
+        jobs.lock().await.is_empty(),
+        "a query must never be handed to the print sink"
+    );
+
+    println!("✓ PAP printer/font-list query test passed!");
+
+    driver.writer.abort();
+    hub_task.abort();
+}
+
+/// What the pre-3.0 drivers actually do next: print, over the same connection.
+///
+/// Their query job ends with neither a PAP eof nor a `%%EOF`, so nothing in the
+/// stream says where it stopped. The print job that follows is what says so, by
+/// arriving with a header of its own. Get that wrong and the print job reads as
+/// more of the query, produces no answers, and is dropped without a trace, which
+/// is a worse bug than the deadlock it comes from: the Mac believes it printed.
+///
+/// The driver here also hands the print job over before collecting its query
+/// answer, so the answer has to survive being overtaken.
+#[tokio::test]
+async fn test_pap_server_prints_after_an_unterminated_query() {
+    let _ = tracing_subscriber::fmt().try_init();
+
+    let (workstation, listener_addr, jobs, hub_task) = legacy_printer(
+        "OldPrinter2:LaserWriter@*",
+        135,
+        0x06,
+        tailtalk::pap::PrinterAttributes::default(),
+    )
+    .await;
+
+    // No %%EOF, no eof flag: this query just stops.
+    let query = b"%!PS-Adobe-2.0 Query\r\
+        %%?BeginProcSetQuery: \"(AppleDict md)\" 71 0\r\
+        userdict/PV known{pop(2)}{(0)}ifelse = flush\r\
+        %%?EndProcSetQuery: unknown\r"
+        .to_vec();
+    let ps_job = b"%!PS-Adobe-3.0\r%%Title: (Greetings)\rshowpage\r%%EOF\r".to_vec();
+    let mut driver = LegacyDriver::connect(
+        workstation,
+        listener_addr,
+        0x0f,
+        vec![(query, false), (ps_job.clone(), true)],
+    )
+    .await;
+
+    // Both writes go over before anything is read back, so the query answer is
+    // still sitting unread when the print job completes.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while jobs.lock().await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the print job never reached the sink: it was swallowed by the query buffer"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        *jobs.lock().await,
+        vec![ps_job],
+        "the sink must get the print job alone, with no query text glued to the front"
+    );
+
+    let answer = driver.read().await;
+    assert_eq!(
+        answer.data, b"0\r",
+        "the query answer must outlive the print job that overtook it"
+    );
+
+    println!("✓ PAP print-after-query test passed!");
+
+    driver.writer.abort();
+    hub_task.abort();
+}
+
 /// A printer emulator built the way the real callers build it: handed only a
 /// responder, with the requesting half dropped.
 ///

@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
         color: true,
         resolutions_dpi: vec![600],
         paper_sizes: vec![PaperSize::Letter, PaperSize::A4],
+        ..PrinterAttributes::default()
     };
 
     let mut server = stack
