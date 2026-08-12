@@ -1895,6 +1895,7 @@ struct LaserWriterSink {
     dir: PathBuf,
     convert_to_pdf: bool,
     counter: std::sync::atomic::AtomicU32,
+    laser_prep: lw_bridge::LaserPrep,
 }
 
 impl LaserWriterSink {
@@ -1903,6 +1904,7 @@ impl LaserWriterSink {
             dir: dir.into(),
             convert_to_pdf,
             counter: std::sync::atomic::AtomicU32::new(0),
+            laser_prep: lw_bridge::LaserPrep::new(),
         }
     }
 }
@@ -1913,6 +1915,14 @@ impl tailtalk::pap::PrintSink for LaserWriterSink {
         job: tailtalk::pap::PrintJob,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
         let dir = self.dir.clone();
+        // These drivers download their PostScript dictionary as a job of its own
+        // ahead of the document. It prints nothing, so stash it for the documents
+        // that reference it rather than saving it as a job. Checked before the
+        // counter moves so job numbers still count documents.
+        if self.laser_prep.capture(job.connection, &job.data) {
+            return Box::pin(std::future::ready(Ok(())));
+        }
+        let prep = self.laser_prep.for_job(job.connection, &job.data);
         let n = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let convert_to_pdf = self.convert_to_pdf;
         Box::pin(async move {
@@ -1924,7 +1934,7 @@ impl tailtalk::pap::PrintSink for LaserWriterSink {
             tokio::fs::create_dir_all(&dir).await?;
 
             if convert_to_pdf {
-                match lw_bridge::gs_convert(&job.data, "pdfwrite", &[]).await {
+                match lw_bridge::gs_convert(&job.data, prep.as_deref(), "pdfwrite", &[]).await {
                     Ok(pdf) => {
                         let path = dir.join(format!("job_{n:04}_{ts}.pdf"));
                         tokio::fs::write(&path, &pdf).await?;
@@ -1950,6 +1960,23 @@ impl tailtalk::pap::PrintSink for LaserWriterSink {
                 job.data.len(),
                 path.display()
             );
+
+            // The document does not carry the dictionary it uses, so on its own this
+            // file renders as `/undefined in md`. Save the prologue beside it,
+            // as its own file rather than glued in front: the prologue ends by
+            // flushing the rest of its input when it decides it is not talking to a
+            // real LaserWriter, which on one combined file takes the document with it.
+            if let Some(prep) = &prep {
+                let prep_path = dir.join(format!("job_{n:04}_{ts}.prolog.ps"));
+                tokio::fs::write(&prep_path, prep).await?;
+                tracing::info!(
+                    "LaserWriter: job {n} needs its LaserPrep prologue, saved → {} \
+                     (render with: gs {} {})",
+                    prep_path.display(),
+                    prep_path.display(),
+                    path.display()
+                );
+            }
             Ok(())
         })
     }
