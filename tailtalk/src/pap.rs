@@ -31,6 +31,8 @@ fn next_pap_seq(seq: u16) -> u16 {
     if seq == u16::MAX { 1 } else { seq + 1 }
 }
 
+const PAP_READ_IDLE_ANSWER: Duration = Duration::from_secs(2);
+
 /// A reply we sent, kept so an identical retransmit gets the identical answer.
 type CachedReply = (u16, [u8; 4], Vec<u8>);
 
@@ -830,6 +832,10 @@ impl PapServer {
         let mut response_ready = false;
         // A client read waiting for job output, with its sequence number.
         let mut pending_read: Option<(crate::atp::AtpReceivedRequest, u16)> = None;
+        // When the client last wrote, which is what a waiting read is timed against.
+        // Starts at the connection, so a client that reads without ever writing is
+        // still answered.
+        let mut last_client_write = tokio::time::Instant::now();
         // Next expected client read sequence number, for spotting retransmits.
         let mut read_seq: u16 = 1;
         // Re-sent verbatim if the client retransmits a read (reply lost on the wire).
@@ -841,7 +847,24 @@ impl PapServer {
         tickle_interval.tick().await; // skip immediate tick
 
         loop {
+            // Only armed while a read is waiting, so an idle connection still sleeps
+            // until the next tickle. Absolute, and recomputed from the last write each
+            // pass, so a client that is still writing keeps pushing it out of reach.
+            let idle_read_at = pending_read
+                .as_ref()
+                .map(|_| last_client_write + PAP_READ_IDLE_ANSWER);
+
             tokio::select! {
+                _ = async move {
+                    match idle_read_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    // Nothing to do here: the read is served below, which is also
+                    // where a read that came good before the deadline is served.
+                }
+
                 res = &mut pull => {
                     match res {
                         Ok((resp_data, resp_ub)) => {
@@ -858,6 +881,7 @@ impl PapServer {
                                 tracing::warn!("PAP: expected Data, got {:?}; dropping connection", data_pkt.function);
                                 return Ok(());
                             }
+                            last_client_write = tokio::time::Instant::now();
 
                             tracing::debug!(
                                 "PAP: received Data len={} eof={}",
@@ -1095,9 +1119,24 @@ impl PapServer {
             // Answer a waiting client read once this job's output is ready. One printer
             // write per response, so a font list arrives one name at a time; eof on the
             // last one tells the driver we're done, then we reset for the next job.
-            if response_ready && let Some((req, this_seq)) = pending_read.take() {
-                let (chunk, eof) =
-                    stdout.next_chunk(req.max_packets() * PAP_MAX_DATA_PER_PACKET);
+            //
+            // A read left waiting by a client that has also stopped writing is answered
+            // empty instead. A real printer holds a read it has nothing to answer, and a
+            // driver that keeps writing while it waits never notices; one that blocks
+            // until the read completes deadlocks against us, since the output it waits
+            // for only exists once the job it has stopped sending arrives. Empty and not
+            // eof says "still here, nothing yet".
+            let idle_answer = pending_read.is_some()
+                && !response_ready
+                && tokio::time::Instant::now() >= last_client_write + PAP_READ_IDLE_ANSWER;
+            if (response_ready || idle_answer)
+                && let Some((req, this_seq)) = pending_read.take()
+            {
+                let (chunk, eof) = if idle_answer {
+                    (Vec::new(), false)
+                } else {
+                    stdout.next_chunk(req.max_packets() * PAP_MAX_DATA_PER_PACKET)
+                };
                 let reply = PapPacket {
                     connection_id: conn_id,
                     function: PapFunction::Data,
