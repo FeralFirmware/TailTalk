@@ -57,22 +57,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
     needs: build
     if: github.event_name == 'release'
     steps:
     - uses: actions/checkout@v4
-    - name: Install dependencies (Linux/macOS)
-      shell: bash
+    - name: Install dependencies (Linux)
+      if: matrix.os == 'ubuntu-latest'
       run: |
-        if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libfontconfig1-dev libudev-dev libpcap-dev \
-            libfuse2 squashfs-tools desktop-file-utils
-        elif [ "${{ matrix.os }}" = "macos-latest" ]; then
-          brew install pkg-config fontconfig
-          rustup target add x86_64-apple-darwin
-        fi
+        sudo apt-get update
+        sudo apt-get install -y pkg-config libfontconfig1-dev libudev-dev libpcap-dev \
+          libfuse2 squashfs-tools desktop-file-utils
     - name: Install Npcap SDK (Windows)
       if: matrix.os == 'windows-latest'
       shell: pwsh
@@ -97,21 +92,82 @@ jobs:
         files: dist/*.AppImage
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    - name: Build x86_64 (macOS)
-      if: matrix.os == 'macos-latest'
-      run: cargo build --release --target x86_64-apple-darwin -p tailtalk-gui
-    - name: Build aarch64 (macOS)
-      if: matrix.os == 'macos-latest'
-      run: cargo build --release --target aarch64-apple-darwin -p tailtalk-gui
-    - name: Create universal binary (macOS)
-      if: matrix.os == 'macos-latest'
+    - name: Build release (Windows)
+      if: matrix.os == 'windows-latest'
+      run: cargo build --release -p tailtalk-gui
+    - name: Build NSIS installer (Windows)
+      if: matrix.os == 'windows-latest'
+      run: cargo packager --release -f nsis -p tailtalk-gui
+    - name: Upload NSIS installer to release
+      if: matrix.os == 'windows-latest'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: dist/*.exe
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Each target gets its own runner. Building both on one runner overflowed the
+  # ~14 GB volume, and this halves the wall clock as a bonus.
+  macos-build:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    needs: build
+    if: github.event_name == 'release'
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install dependencies
       run: |
+        brew install pkg-config fontconfig
+        rustup target add ${{ matrix.target }}
+    - name: Build release
+      run: cargo build --release -p tailtalk-gui --target ${{ matrix.target }}
+    - name: Tar binary
+      # Artifact upload does not preserve the executable bit, so ship a tarball
+      # rather than the bare binary. codesign rejects a non-executable payload.
+      run: |
+        tar -cvf tailtalk-gui-${{ matrix.target }}.tar \
+          -C target/${{ matrix.target }}/release tailtalk-gui
+    - name: Upload binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: tailtalk-gui-${{ matrix.target }}
+        path: tailtalk-gui-${{ matrix.target }}.tar
+        if-no-files-found: error
+        retention-days: 1
+
+  macos-package:
+    runs-on: macos-latest
+    needs: macos-build
+    if: github.event_name == 'release'
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install dependencies
+      # No rustup target needed: nothing is compiled here. cargo-packager's
+      # --target only tells it where to look for an already-built binary.
+      run: brew install pkg-config fontconfig
+    - name: Install cargo-packager
+      run: cargo install cargo-packager --locked
+    - name: Download binaries
+      uses: actions/download-artifact@v4
+      with:
+        pattern: tailtalk-gui-*-apple-darwin
+        path: artifacts
+        merge-multiple: true
+    - name: Unpack binaries and create universal binary
+      run: |
+        for target in x86_64-apple-darwin aarch64-apple-darwin; do
+          mkdir -p "target/$target/release"
+          tar -xvf "artifacts/tailtalk-gui-$target.tar" -C "target/$target/release"
+          test -x "target/$target/release/tailtalk-gui"
+        done
         mkdir -p target/universal-apple-darwin/release
         lipo -create -output target/universal-apple-darwin/release/tailtalk-gui \
           target/x86_64-apple-darwin/release/tailtalk-gui \
           target/aarch64-apple-darwin/release/tailtalk-gui
-    - name: Import signing certificate (macOS)
-      if: matrix.os == 'macos-latest'
+        lipo -info target/universal-apple-darwin/release/tailtalk-gui
+    - name: Import signing certificate
       env:
         CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
         CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -130,117 +186,66 @@ jobs:
           -S apple-tool:,apple: \
           -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
         security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain
-    - name: Build app bundle (macOS)
-      if: matrix.os == 'macos-latest'
-      run: cargo packager --release -p tailtalk-gui --target universal-apple-darwin -f app
-    - name: Sign app bundle (macOS)
-      if: matrix.os == 'macos-latest'
+    - name: Build, sign, and package DMGs
+      # Both flavours go through the same steps, so loop rather than keeping two
+      # copies in sync. Each round overwrites dist/TailTalk.app; the DMG for the
+      # previous round is already written by then.
       env:
         APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
       run: |
-        codesign --force --deep --options runtime --timestamp \
-          -s "$APPLE_SIGNING_IDENTITY" \
-          dist/TailTalk.app
-    - name: Package DMG (macOS)
-      if: matrix.os == 'macos-latest'
-      run: |
-        mkdir -p /tmp/dmg_contents
-        cp -r dist/TailTalk.app /tmp/dmg_contents/
-        ln -s /Applications /tmp/dmg_contents/Applications
-        hdiutil create \
-          -volname TailTalk \
-          -srcfolder /tmp/dmg_contents \
-          -ov -format UDZO \
-          "dist/TailTalk_${{ github.ref_name }}_universal.dmg"
-    - name: Notarize and staple DMG (macOS)
-      if: matrix.os == 'macos-latest'
+        for target in universal-apple-darwin x86_64-apple-darwin; do
+          suffix="${target%-apple-darwin}"
+          df -h /
+          cargo packager --release -p tailtalk-gui --target "$target" -f app
+          codesign --force --deep --options runtime --timestamp \
+            -s "$APPLE_SIGNING_IDENTITY" \
+            dist/TailTalk.app
+          staging=$(mktemp -d)
+          cp -R dist/TailTalk.app "$staging/"
+          ln -s /Applications "$staging/Applications"
+          hdiutil create \
+            -volname TailTalk \
+            -srcfolder "$staging" \
+            -ov -format UDZO \
+            "dist/TailTalk_${{ github.ref_name }}_${suffix}.dmg"
+          rm -rf "$staging"
+          df -h /
+        done
+    - name: Notarize and staple DMGs
       env:
+        APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
         APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
       run: |
-        echo "${{ secrets.APPLE_API_KEY }}" | base64 --decode > $RUNNER_TEMP/api_key.p8
-        SUBMISSION=$(xcrun notarytool submit "dist/TailTalk_${{ github.ref_name }}_universal.dmg" \
-          --key $RUNNER_TEMP/api_key.p8 \
-          --key-id "$APPLE_API_KEY_ID" \
-          --issuer "$APPLE_API_ISSUER_ID" \
-          --wait \
-          --output-format json)
-        echo "$SUBMISSION"
-        STATUS=$(echo "$SUBMISSION" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
-        ID=$(echo "$SUBMISSION" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-        if [ "$STATUS" != "Accepted" ]; then
-          xcrun notarytool log "$ID" \
-            --key $RUNNER_TEMP/api_key.p8 \
+        echo "$APPLE_API_KEY" | base64 --decode > "$RUNNER_TEMP/api_key.p8"
+        for dmg in dist/*.dmg; do
+          echo "Notarizing $dmg"
+          SUBMISSION=$(xcrun notarytool submit "$dmg" \
+            --key "$RUNNER_TEMP/api_key.p8" \
             --key-id "$APPLE_API_KEY_ID" \
-            --issuer "$APPLE_API_ISSUER_ID"
-          exit 1
-        fi
-        xcrun stapler staple "dist/TailTalk_${{ github.ref_name }}_universal.dmg"
-    - name: Build x86_64 app bundle (macOS)
-      if: matrix.os == 'macos-latest'
-      run: cargo packager --release -p tailtalk-gui --target x86_64-apple-darwin -f app
-    - name: Sign x86_64 app bundle (macOS)
-      if: matrix.os == 'macos-latest'
-      env:
-        APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      run: |
-        codesign --force --deep --options runtime --timestamp \
-          -s "$APPLE_SIGNING_IDENTITY" \
-          dist/TailTalk.app
-    - name: Package x86_64 DMG (macOS)
-      if: matrix.os == 'macos-latest'
-      run: |
-        mkdir -p /tmp/dmg_x86_64
-        cp -r dist/TailTalk.app /tmp/dmg_x86_64/
-        ln -s /Applications /tmp/dmg_x86_64/Applications
-        hdiutil create \
-          -volname TailTalk \
-          -srcfolder /tmp/dmg_x86_64 \
-          -ov -format UDZO \
-          "dist/TailTalk_${{ github.ref_name }}_x86_64.dmg"
-    - name: Notarize and staple x86_64 DMG (macOS)
-      if: matrix.os == 'macos-latest'
-      env:
-        APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-        APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-      run: |
-        SUBMISSION=$(xcrun notarytool submit "dist/TailTalk_${{ github.ref_name }}_x86_64.dmg" \
-          --key $RUNNER_TEMP/api_key.p8 \
-          --key-id "$APPLE_API_KEY_ID" \
-          --issuer "$APPLE_API_ISSUER_ID" \
-          --wait \
-          --output-format json)
-        echo "$SUBMISSION"
-        STATUS=$(echo "$SUBMISSION" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
-        ID=$(echo "$SUBMISSION" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-        if [ "$STATUS" != "Accepted" ]; then
-          xcrun notarytool log "$ID" \
-            --key $RUNNER_TEMP/api_key.p8 \
-            --key-id "$APPLE_API_KEY_ID" \
-            --issuer "$APPLE_API_ISSUER_ID"
-          exit 1
-        fi
-        xcrun stapler staple "dist/TailTalk_${{ github.ref_name }}_x86_64.dmg"
-    - name: Clean up keychain (macOS)
-      if: matrix.os == 'macos-latest' && always()
-      run: security delete-keychain $RUNNER_TEMP/build.keychain
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait \
+            --output-format json)
+          echo "$SUBMISSION"
+          STATUS=$(echo "$SUBMISSION" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+          ID=$(echo "$SUBMISSION" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+          if [ "$STATUS" != "Accepted" ]; then
+            xcrun notarytool log "$ID" \
+              --key "$RUNNER_TEMP/api_key.p8" \
+              --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER_ID"
+            exit 1
+          fi
+          xcrun stapler staple "$dmg"
+        done
+    - name: Clean up keychain
+      # Tolerate failures before the cert import created the keychain, otherwise
+      # this step goes red and buries the error that actually failed the job.
+      if: always()
+      run: security delete-keychain "$RUNNER_TEMP/build.keychain" || true
     - name: Upload DMG to release
-      if: matrix.os == 'macos-latest'
       uses: softprops/action-gh-release@v1
       with:
         files: dist/*.dmg
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    - name: Build release (Windows)
-      if: matrix.os == 'windows-latest'
-      run: cargo build --release -p tailtalk-gui
-    - name: Build NSIS installer (Windows)
-      if: matrix.os == 'windows-latest'
-      run: cargo packager --release -f nsis -p tailtalk-gui
-    - name: Upload NSIS installer to release
-      if: matrix.os == 'windows-latest'
-      uses: softprops/action-gh-release@v1
-      with:
-        files: dist/*.exe
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
