@@ -543,9 +543,10 @@ pub struct PrinterAttributes {
     pub ps_version: String,
     /// statusdict `revision`, paired with [`ps_version`](Self::ps_version).
     pub ps_revision: u32,
-    /// Fonts resident in the printer, listed for `%%?BeginFontListQuery`. Empty by
-    /// default: we have no interpreter, and claiming a font we cannot render would
-    /// stop the driver from embedding it.
+    /// Fonts resident in the printer, listed for `%%?BeginFontListQuery`.
+    /// [`LASERWRITER_35`] by default; narrow it where the renderer lacks a face,
+    /// but do not empty it. A driver that cannot embed, like the Apple IIgs
+    /// LaserWriter one, abandons the job rather than print to a printer with none.
     pub resident_fonts: Vec<String>,
     /// Whether the printer supports color output.
     pub color: bool,
@@ -564,7 +565,7 @@ impl Default for PrinterAttributes {
             // A common PostScript Level 2 build, matching what we report for *PSVersion.
             ps_version: "2010.020".to_string(),
             ps_revision: 0,
-            resident_fonts: Vec::new(),
+            resident_fonts: LASERWRITER_35.iter().map(|f| (*f).to_string()).collect(),
             color: false,
             resolutions_dpi: vec![300],
             paper_sizes: vec![PaperSize::Letter],
@@ -1233,12 +1234,10 @@ impl PrinterStdout {
 /// The 35 fonts every PostScript printer has carried since the LaserWriter Plus,
 /// in the names a driver asks for them by.
 ///
-/// Worth claiming rather than leaving [`PrinterAttributes::resident_fonts`] empty:
-/// a driver told the printer has none embeds every one it uses, and over LocalTalk
-/// a few hundred KB of font program is minutes of transfer per job. Only claim
-/// these once the renderer is known to have them, which is what
-/// `lw_bridge::resident_fonts` checks. Ghostscript ships URW equivalents of all 35
-/// under exactly these names, and any real PostScript printer has them too.
+/// The default for [`PrinterAttributes::resident_fonts`]. Safe to claim wholesale:
+/// Ghostscript ships URW equivalents under exactly these names, and any real
+/// PostScript printer has them too, so it holds for a job we render and one we hand
+/// on. `lw_bridge::resident_fonts` trims it to what Ghostscript actually has.
 pub const LASERWRITER_35: [&str; 35] = [
     "AvantGarde-Book",
     "AvantGarde-BookOblique",
@@ -1486,7 +1485,7 @@ fn pqp_writes(attrs: &PrinterAttributes, job_data: &[u8]) -> Vec<Vec<u8>> {
                     out.push(b"*\n".to_vec());
                 }
                 Some(("Font", fonts)) => {
-                    out.push(format!("{}\r", pqp_font_answer(fonts)).into_bytes())
+                    out.push(format!("{}\r", pqp_font_answer(attrs, fonts)).into_bytes())
                 }
                 // 0 = not resident. We have no interpreter and keep no state between
                 // jobs, so the driver must download the ProcSet itself. Its End
@@ -1574,17 +1573,22 @@ fn pqp_answer(attrs: &PrinterAttributes, query: &str, default: &str) -> String {
 /// Return the answer to a font availability query.
 ///
 /// The query lists font names (space-separated) in the `%%?BeginFontQuery:` line.
-/// Since we're a spooler without a PS interpreter, we report all fonts as unavailable,
-/// which causes the Mac driver to embed fonts in the print job — the safest behaviour.
+/// Answered from [`PrinterAttributes::resident_fonts`], the same source as the font
+/// list query, so a driver that asks both ways is told the same thing twice.
+/// Anything not on the list is a `No`, and the driver embeds it.
 ///
 /// Response format (DSC 2.1+): `/FontName:Yes` or `/FontName:No` per line, then `*`.
-fn pqp_font_answer(font_list: &str) -> String {
+fn pqp_font_answer(attrs: &PrinterAttributes, font_list: &str) -> String {
     let mut lines: Vec<String> = font_list
         .split_whitespace()
         .filter(|f| !f.is_empty())
         .map(|f| {
             let name = f.trim_start_matches('/');
-            format!("/{name}:No")
+            let resident = attrs
+                .resident_fonts
+                .iter()
+                .any(|r| r.trim_start_matches('/') == name);
+            format!("/{name}:{}", if resident { "Yes" } else { "No" })
         })
         .collect();
     lines.push("*".to_string());
@@ -1757,11 +1761,30 @@ mod tests {
             ps_revision: 1,
             ..PrinterAttributes::default()
         };
-        // Two writes: one flush after the three `==`, then one for the `*` that
-        // terminates an empty font list. The space after the revision is deliberate.
+        // One flush after the three `==`, so the identity is a single write. The
+        // space after the revision is deliberate.
+        let writes = pqp_writes(&attrs, LW7_PRINTER_QUERY);
+        assert_eq!(writes[0], b"1 \n(47.0)\n(LaserWriter Plus)\n".to_vec());
+
+        // Then the default font list, one write per name and `*` to end it.
+        let mut expected: Vec<Vec<u8>> = LASERWRITER_35
+            .iter()
+            .map(|f| format!("{f}\n").into_bytes())
+            .collect();
+        expected.push(b"*\n".to_vec());
+        assert_eq!(&writes[1..], expected.as_slice());
+    }
+
+    #[test]
+    fn pqp_font_query_agrees_with_the_font_list() {
+        let attrs = PrinterAttributes {
+            resident_fonts: vec!["Times-Roman".to_string(), "/Helvetica".to_string()],
+            ..PrinterAttributes::default()
+        };
+        // Slash or no slash on either side, the names still have to match up.
         assert_eq!(
-            pqp_writes(&attrs, LW7_PRINTER_QUERY),
-            vec![b"1 \n(47.0)\n(LaserWriter Plus)\n".to_vec(), b"*\n".to_vec()],
+            pqp_font_answer(&attrs, "/Times-Roman Helvetica /Bookman-Light"),
+            "/Times-Roman:Yes\r/Helvetica:Yes\r/Bookman-Light:No\r*",
         );
     }
 

@@ -2130,12 +2130,22 @@ async fn run_server(
     if let Some(cfg) = laserwriter {
         use tailtalk::pap::{PaperSize, PrinterAttributes};
 
+        // Ghostscript renders what we convert, so narrow the default 35 to the faces
+        // it has. Without it we render nothing here (the job is archived as
+        // PostScript for something else to print), so the default stands.
+        let gs_fonts = lw_bridge::resident_fonts().await;
+
         let attrs = PrinterAttributes {
             product_name: cfg.name.clone(),
             color: true,
             resolutions_dpi: vec![600],
             paper_sizes: vec![PaperSize::Letter, PaperSize::A4],
             ..PrinterAttributes::default()
+        };
+        let attrs = if gs_fonts.is_empty() {
+            attrs
+        } else {
+            PrinterAttributes { resident_fonts: gs_fonts, ..attrs }
         };
 
         let sink = LaserWriterSink::new(&cfg.output_path, cfg.convert_to_pdf);
