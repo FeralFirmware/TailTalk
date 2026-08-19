@@ -214,8 +214,13 @@ pub async fn run(
                                 color: caps.color,
                                 resolutions_dpi: vec![caps.dpi],
                                 paper_sizes: caps.paper_sizes.clone(),
-                                resident_fonts: resident_fonts().await,
                                 ..PrinterAttributes::default()
+                            };
+                            let gs_fonts = resident_fonts().await;
+                            let attrs = if gs_fonts.is_empty() {
+                                attrs
+                            } else {
+                                PrinterAttributes { resident_fonts: gs_fonts, ..attrs }
                             };
 
                             let sink = IppForwardSink {
@@ -618,9 +623,9 @@ static RESIDENT_FONTS: tokio::sync::OnceCell<Vec<String>> = tokio::sync::OnceCel
 /// font program, which is the difference between a job that crawls over LocalTalk
 /// and one that doesn't. Claiming one we cannot render, though, means the page comes
 /// out in a substitute face, so every name is checked against Ghostscript's own
-/// font resources before we promise it. No Ghostscript, no promises: the driver
-/// embeds everything, which is slower but always right.
-async fn resident_fonts() -> Vec<String> {
+/// font resources before we promise it. No Ghostscript, no promises: an empty list
+/// comes back, and the caller decides what to do with it.
+pub(crate) async fn resident_fonts() -> Vec<String> {
     RESIDENT_FONTS
         .get_or_init(|| async {
             let available = match gs_font_names().await {
