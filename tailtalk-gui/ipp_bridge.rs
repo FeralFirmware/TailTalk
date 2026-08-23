@@ -128,6 +128,19 @@ fn stylewriter_margins_hmm(width_hmm: i32) -> (i32, i32, i32, i32) {
     )
 }
 
+/// ImageWriter margins for a given paper width, in hundredths of a mm
+/// (left, right, top, bottom).
+///
+/// Only the right margin is ever non-zero. The head starts at column 0 and
+/// `imagewriter_safe_page` clamps width to `IW_MAX_WIDTH_PT`, so paper wider
+/// than 8 inches carries an unprintable strip of exactly the excess, and
+/// narrower paper carries none. Vertically the printer feeds continuously and
+/// the bridge crops nothing, so top and bottom are 0.
+fn imagewriter_margins_hmm(width_hmm: i32) -> (i32, i32, i32, i32) {
+    let max_width_hmm = (IW_MAX_WIDTH_PT as f64 / 72.0 * 2540.0).round() as i32;
+    (0, (width_hmm - max_width_hmm).max(0), 0, 0)
+}
+
 /// Builds one `media-col-database` entry: the media-size collection plus,
 /// when known, the printer's unprintable margins (left, right, top, bottom).
 fn media_col_entry(w: i32, h: i32, margins: Option<(i32, i32, i32, i32)>) -> Option<IppValue> {
@@ -196,9 +209,18 @@ const SW_BOTTOM_MARGIN_ROWS: usize = 90;
 /// lower (vertical) figure for `printer-resolution-*` since IPP wants one
 /// symmetric value and this errs toward not overstating detail.
 const IW_DPI: u32 = 144;
-/// Physical carriage width. Ghostscript's `iwhi` device page geometry crashes
-/// if asked for anything wider.
-const IW_MAX_WIDTH_PT: f32 = 612.0;
+/// Printable width: 8 inches, the full travel of the print head.
+///
+/// This is a property of the printer, not of the paper. Appendix D allows
+/// paper up to 10 inches wide, but Table 8-2 caps every pitch at 8 inches of
+/// dots (1280 columns at the finest, 160dpi: 1280/160 = 8), and Chapter 8
+/// spells the arithmetic out. Letter paper therefore leaves half an inch down
+/// the right-hand side that the head simply cannot reach.
+///
+/// The left margin needs no counterpart: at power-on the ImageWriter II
+/// starts each line "as far left as the print head can travel" (position 0,
+/// ESC L default 000), so the whole unprintable strip is on the right.
+const IW_MAX_WIDTH_PT: f32 = 576.0;
 /// Page height must be an exact multiple of this many points (48 dots at
 /// 144dpi). Anything else makes gdevadmp's internal band-buffer sizing return a
 /// negative "unexpected value" and abort the whole job.
@@ -871,10 +893,10 @@ fn media_to_pts(name: &str) -> (f32, f32) {
         .unwrap_or((612.0, 792.0))
 }
 
-/// Clamp a requested page size to what Ghostscript's `iwhi` device can
-/// actually produce without crashing (see `IW_MAX_WIDTH_PT` /
-/// `IW_HEIGHT_GRANULARITY_PT`). Floors rather than rounds so the forced page
-/// is never taller/wider than the paper actually loaded.
+/// Clamp a requested page size to what the ImageWriter II can actually put on
+/// paper (see `IW_MAX_WIDTH_PT` / `IW_HEIGHT_GRANULARITY_PT`). Floors rather
+/// than rounds so the forced page is never taller/wider than the printable
+/// area.
 fn imagewriter_safe_page(w: f32, h: f32) -> (f32, f32) {
     let w = w.min(IW_MAX_WIDTH_PT);
     let h = (h / IW_HEIGHT_GRANULARITY_PT).floor().max(1.0) * IW_HEIGHT_GRANULARITY_PT;
@@ -1455,15 +1477,19 @@ fn printer_attributes(printer: &Printer, req_id: u32) -> axum::response::Respons
             .collect();
         add("media-supported", IppValue::Array(vals));
 
-        // LaserWriters aren't cropped by this bridge, so their margins aren't
-        // known here and are left unset.
         let dims: Vec<(i32, i32)> = media.iter().copied().filter_map(media_dimensions_hmm).collect();
         let size_vals: Vec<IppValue> = dims.iter().filter_map(|&(w, h)| media_size_collection(w, h)).collect();
         if !size_vals.is_empty() {
             add("media-size-supported", IppValue::Array(size_vals));
         }
         let col_vals: Vec<IppValue> = dims.iter().filter_map(|&(w, h)| {
-            let margins = (printer.kind == PrinterKind::StyleWriter).then(|| stylewriter_margins_hmm(w));
+            let margins = match printer.kind {
+                PrinterKind::StyleWriter => Some(stylewriter_margins_hmm(w)),
+                PrinterKind::ImageWriter => Some(imagewriter_margins_hmm(w)),
+                // LaserWriters aren't cropped by this bridge, so their margins
+                // aren't known here and are left unset.
+                _ => None,
+            };
             media_col_entry(w, h, margins)
         }).collect();
         if !col_vals.is_empty() {
@@ -2391,13 +2417,33 @@ mod tests {
 
     #[test]
     fn test_imagewriter_safe_page_clamps_and_floors() {
-        // Width above the physical 8.5in carriage gets clamped.
-        assert_eq!(imagewriter_safe_page(700.0, 792.0), (612.0, 792.0));
+        // Width is clamped to the 8in the head can reach, not to the width of
+        // the paper: Letter and A4 are both wider than the printable area, and
+        // rendering to the full sheet drops their right edge at the printer.
+        assert_eq!(imagewriter_safe_page(700.0, 792.0), (576.0, 792.0));
+        assert_eq!(imagewriter_safe_page(612.0, 792.0), (576.0, 792.0)); // Letter
+        assert_eq!(imagewriter_safe_page(595.0, 842.0), (576.0, 840.0)); // A4
+        // Paper narrower than the head's travel is left alone.
+        assert_eq!(imagewriter_safe_page(279.0, 540.0), (279.0, 528.0)); // Monarch
         // Height not a multiple of 24pt gets floored to one, or the `iwhi`
         // device's band-buffer sizing crashes.
-        assert_eq!(imagewriter_safe_page(612.0, 792.0), (612.0, 792.0)); // Letter, already exact
-        assert_eq!(imagewriter_safe_page(595.0, 842.0), (595.0, 840.0)); // A4
-        assert_eq!(imagewriter_safe_page(279.0, 540.0), (279.0, 528.0)); // Monarch
+        assert_eq!(imagewriter_safe_page(576.0, 792.0), (576.0, 792.0)); // already exact
+    }
+
+    /// Advertising zero margins makes the ImageWriter look borderless, so
+    /// clients lay content into the half-inch the head cannot reach.
+    #[test]
+    fn test_imagewriter_margins_cover_the_unreachable_right_strip() {
+        // Letter: 8.5in paper, 8in of travel, so 0.5in (1270 hmm) is unprintable.
+        assert_eq!(imagewriter_margins_hmm(21590), (0, 1270, 0, 0));
+        // A4 is narrower, so it loses less.
+        assert_eq!(imagewriter_margins_hmm(21000), (0, 680, 0, 0));
+        // Paper inside the head's travel has no unprintable strip at all.
+        assert_eq!(imagewriter_margins_hmm(13970), (0, 0, 0, 0));
+        // The left edge is always reachable: the head parks at column 0.
+        for w in [21590, 21000, 13970] {
+            assert_eq!(imagewriter_margins_hmm(w).0, 0, "left margin is always 0");
+        }
     }
 
     /// Picking the mono device for a colour job is silent: `iwhi` prints the
@@ -2413,7 +2459,7 @@ mod tests {
     #[test]
     fn test_imagewriter_gs_args_force_page_and_lift_max_bitmap() {
         let args = imagewriter_gs_args((595.0, 842.0));
-        assert!(args.contains(&"-dDEVICEWIDTHPOINTS=595".to_string()));
+        assert!(args.contains(&"-dDEVICEWIDTHPOINTS=576".to_string())); // clamped to 8in
         assert!(args.contains(&"-dDEVICEHEIGHTPOINTS=840".to_string())); // floored to 24pt
         assert!(args.contains(&"-dFIXEDMEDIA".to_string()));
 
