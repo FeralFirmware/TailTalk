@@ -20,30 +20,32 @@ slint::include_modules!();
 mod bpf;
 mod ipp_bridge;
 mod lw_bridge;
-mod printer_tool;
+mod network_explorer;
 
-/// The running stack's protocol handles, published for the Printer Tool window
-/// so it can talk to printers over the live stack rather than opening a second
-/// one (which would fail to reclaim an in-use TashTalk serial port). `None`
-/// whenever the server is stopped.
+/// The running stack's protocol handles, published for the Network Explorer
+/// window so it can talk to the network over the live stack rather than opening
+/// a second one (which would fail to reclaim an in-use TashTalk serial port).
+/// `None` whenever the server is stopped.
 #[derive(Clone)]
-pub struct PrinterHandles {
+pub struct ExplorerHandles {
     pub nbp: tailtalk::nbp::NbpHandle,
     pub ddp: tailtalk::ddp::DdpHandle,
+    /// AEP echo, for the explorer's latency readings and ping tests.
+    pub echo: tailtalk::echo::EchoHandle,
     /// Watches on this stack's own AppleTalk address, one per configured
-    /// transport. The Printer Tool uses these to drop NBP registrations that
-    /// point back at us — chiefly the built-in LaserWriter emulator, which
-    /// answers the same `=:LaserWriter@*` lookup real printers do. Matching on
-    /// address rather than name means a real printer sharing the emulator's
-    /// name is still listed, and any future self-advertised printer is caught
-    /// without extra bookkeeping. Watches (not plain values) because AARP can
-    /// renumber the node after a conflict.
+    /// transport. The explorer uses these to drop NBP registrations that
+    /// point back at us: our own AFP server and the built-in LaserWriter
+    /// emulator, which answers the same `=:LaserWriter@*` lookup real printers
+    /// do. Matching on address rather than name means a real device sharing one
+    /// of our names is still listed, and any future self-advertised service is
+    /// caught without extra bookkeeping. Watches (not plain values) because AARP
+    /// can renumber the node after a conflict.
     pub local_addrs: Vec<tokio::sync::watch::Receiver<Option<tailtalk_packets::aarp::AppleTalkAddress>>>,
 }
 
-/// Shared slot holding [`PrinterHandles`] while the stack is up. `std::sync::Mutex`
+/// Shared slot holding [`ExplorerHandles`] while the stack is up. `std::sync::Mutex`
 /// (not tokio's) because the Slint menu callback reads it on the UI thread.
-type PrinterHandleStore = Arc<std::sync::Mutex<Option<PrinterHandles>>>;
+type ExplorerHandleStore = Arc<std::sync::Mutex<Option<ExplorerHandles>>>;
 
 // ── Persisted user configuration ──────────────────────────────────────────────
 
@@ -297,7 +299,7 @@ fn main() -> anyhow::Result<()> {
     let keep_awake: Arc<std::sync::Mutex<Option<keepawake::KeepAwake>>> =
         Arc::new(std::sync::Mutex::new(None));
     // Live NBP/DDP handles for the Printer Tool; populated while the stack runs.
-    let printer_handles: PrinterHandleStore = Arc::new(std::sync::Mutex::new(None));
+    let explorer_handles: ExplorerHandleStore = Arc::new(std::sync::Mutex::new(None));
 
     let (_log_guard, log_dir) = init_logging();
 
@@ -426,18 +428,18 @@ fn main() -> anyhow::Result<()> {
         ui_handle,
         active_handle.clone(),
         keep_awake.clone(),
-        printer_handles.clone(),
+        explorer_handles.clone(),
     ));
 
-    // ── Printer Tool (File menu) ─────────────────────────────────────────────
+    // ── Network Explorer (File menu) ─────────────────────────────────────────────
     {
         // Holds the window alive past the callback that created it; also lets a
         // second invocation re-focus the existing window instead of opening another.
-        let window_slot: Rc<RefCell<Option<PrinterToolWindow>>> = Rc::new(RefCell::new(None));
+        let window_slot: Rc<RefCell<Option<NetworkExplorerWindow>>> = Rc::new(RefCell::new(None));
         let rt_handle = rt_handle.clone();
-        let printer_handles = printer_handles.clone();
-        ui.on_open_printer_tool(move || {
-            printer_tool::open(&rt_handle, printer_handles.clone(), window_slot.clone());
+        let explorer_handles = explorer_handles.clone();
+        ui.on_open_network_explorer(move || {
+            network_explorer::open(&rt_handle, explorer_handles.clone(), window_slot.clone());
         });
     }
 
@@ -984,7 +986,7 @@ async fn server_loop(
     ui_weak: slint::Weak<AppWindow>,
     active: Arc<tokio::sync::Mutex<Option<ShutdownHandle>>>,
     keep_awake: Arc<std::sync::Mutex<Option<keepawake::KeepAwake>>>,
-    printer_handles: PrinterHandleStore,
+    explorer_handles: ExplorerHandleStore,
 ) {
     let mut shutdown_handle: Option<ShutdownHandle> = None;
 
@@ -1005,7 +1007,7 @@ async fn server_loop(
             } => {
                 if let Some(h) = shutdown_handle.take() {
                     active.lock().await.take();
-                    printer_handles.lock().unwrap().take();
+                    explorer_handles.lock().unwrap().take();
                     h.graceful_shutdown().await;
                     keep_awake.lock().unwrap().take();
                 }
@@ -1026,7 +1028,7 @@ async fn server_loop(
                     *laserwriter,
                     ready_tx,
                     ui_w.clone(),
-                    printer_handles.clone(),
+                    explorer_handles.clone(),
                 ));
 
                 // Wait for the stack to finish initialising (AARP probe etc.)
@@ -1062,7 +1064,7 @@ async fn server_loop(
             ServerCommand::Stop => {
                 if let Some(h) = shutdown_handle.take() {
                     active.lock().await.take();
-                    printer_handles.lock().unwrap().take();
+                    explorer_handles.lock().unwrap().take();
                     h.graceful_shutdown().await;
                 }
                 keep_awake.lock().unwrap().take();
@@ -1997,7 +1999,7 @@ async fn run_server(
     laserwriter: Option<LaserWriterConfig>,
     ready_tx: tokio::sync::oneshot::Sender<(ShutdownHandle, ShutdownHandle)>,
     ui_weak: slint::Weak<AppWindow>,
-    printer_handles: PrinterHandleStore,
+    explorer_handles: ExplorerHandleStore,
 ) {
     use tailtalk::{
         TalkStack,
@@ -2191,12 +2193,13 @@ async fn run_server(
         tracing::info!("AFP server running on {transport_desc}");
     }
 
-    // Publish the live handles so the Printer Tool can drive printers over this
-    // stack. Cleared below so the tool reports the server as stopped rather than
-    // holding handles to a dead stack.
-    *printer_handles.lock().unwrap() = Some(PrinterHandles {
+    // Publish the live handles so the Network Explorer can drive the network
+    // over this stack. Cleared below so the tool reports the server as stopped
+    // rather than holding handles to a dead stack.
+    *explorer_handles.lock().unwrap() = Some(ExplorerHandles {
         nbp: stack.nbp.clone(),
         ddp: stack.ddp.clone(),
+        echo: stack.echo.clone(),
         local_addrs: [&stack.et_addressing, &stack.lt_addressing]
             .into_iter()
             .flatten()
@@ -2211,7 +2214,7 @@ async fn run_server(
     // Block until shutdown() is called (e.g. the user clicks Stop).
     stack.wait_for_shutdown().await;
 
-    printer_handles.lock().unwrap().take();
+    explorer_handles.lock().unwrap().take();
 
     set_stopped(ui_weak);
 }
