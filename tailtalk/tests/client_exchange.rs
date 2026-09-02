@@ -11,6 +11,7 @@ use tailtalk::{
     nbp::{Nbp, RegisteredName},
 };
 use tailtalk_packets::aarp::{AddressSource, AppleTalkAddress};
+use tailtalk_packets::ddp::DdpProtocolType;
 use tokio::sync::{broadcast, mpsc};
 
 #[derive(Clone, Debug)]
@@ -369,6 +370,239 @@ async fn test_atp_request_response() {
     );
 
     println!("✓ ATP test passed: Request/response exchange successful!");
+
+    hub_task.abort();
+}
+
+/// Several AEP requests to the same node at once must all be answered.
+///
+/// The echo actor tracks outstanding requests per destination, matching each
+/// reply to the request whose data it carries. Keying only on the address would
+/// let a second request displace the first, stranding its caller and, worse,
+/// crediting the first reply that lands to whichever request is outstanding by
+/// then - a ping test would report round-trip times it never measured.
+#[tokio::test]
+async fn test_concurrent_echoes_to_one_node() {
+    let _ = tracing_subscriber::fmt().try_init(); // Ignore error if already initialized
+
+    let hub = TestHub::new();
+    let (hub_in_tx, hub_in_rx) = mpsc::channel(100);
+
+    let hub_ref = Arc::new(hub);
+    let hub_runner = hub_ref.clone();
+    let hub_task = tokio::spawn(async move {
+        hub_runner.run(hub_in_rx).await;
+    });
+
+    let mac_a = [0x00, 0x01, 0x02, 0x03, 0x04, 0x11];
+    let client_a = TestClient::new(mac_a, hub_in_tx.clone(), hub_ref.subscribe(), None).await;
+
+    let mac_b = [0x00, 0x01, 0x02, 0x03, 0x04, 0x12];
+    let client_b = TestClient::new(mac_b, hub_in_tx.clone(), hub_ref.subscribe(), None).await;
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    client_a
+        .nbp
+        .register(RegisteredName {
+            name: "EchoTarget:Workstation@*".try_into().unwrap(),
+            sock_num: 123,
+        })
+        .await
+        .expect("Client A failed to register");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let results = client_b
+        .nbp
+        .lookup("EchoTarget:Workstation@*".try_into().unwrap())
+        .await
+        .expect("Client B lookup failed");
+    assert!(!results.is_empty(), "Client B found no results");
+
+    let target_addr = AppleTalkAddress {
+        network_number: results[0].network_number,
+        node_number: results[0].node_id,
+    };
+
+    // Distinct payloads, and distinct lengths, so a reply can only be matched to
+    // the request that produced it.
+    const PROBES: u32 = 5;
+    let sends = (0..PROBES).map(|seq| {
+        let echo = client_b.echo.clone();
+        async move {
+            let mut payload = seq.to_be_bytes().to_vec();
+            payload.extend(std::iter::repeat_n(seq as u8, seq as usize * 4));
+            echo.send(target_addr, &payload).await
+        }
+    });
+
+    let results = futures::future::join_all(sends).await;
+    for (seq, result) in results.iter().enumerate() {
+        assert!(
+            result.is_ok(),
+            "echo {seq} of {PROBES} was not answered: {:?}",
+            result.as_ref().err()
+        );
+    }
+
+    hub_task.abort();
+}
+
+/// A node that answers AEP with data other than what it was sent.
+///
+/// Stands in for the case the matching in `Echo` exists to handle: a reply whose
+/// data belongs to no outstanding request. The realistic source of one is a
+/// probe that timed out and whose answer turns up afterwards, which is awkward
+/// to stage; a peer that mangles the data reaches the same code path without
+/// depending on timing.
+async fn spawn_mangling_echoer(
+    mac: [u8; 6],
+    hub_tx: mpsc::Sender<WirePacket>,
+    hub_rx: broadcast::Receiver<WirePacket>,
+) -> AppleTalkAddress {
+    let (out_tx, mut out_rx) = mpsc::channel(100);
+    let outbound_handle = OutboundHandle::new(out_tx);
+
+    let hub_tx_clone = hub_tx.clone();
+    tokio::spawn(async move {
+        while let Some(pkt) = out_rx.recv().await {
+            let _ = hub_tx_clone
+                .send(WirePacket { packet: Arc::new(pkt), src_mac: mac })
+                .await;
+        }
+    });
+
+    let addressing = Addressing::spawn(
+        Some(mac),
+        outbound_handle.clone(),
+        None,
+        AddressSource::EtherTalkPhase2,
+    );
+    let ddp = DdpProcessor::spawn(
+        Some(addressing.clone()),
+        None,
+        outbound_handle.clone(),
+        RouteTable::new(LearningMode::Static),
+    );
+
+    // Feed the hub's traffic in, exactly as TestClient does.
+    let mut rx = hub_rx;
+    let ddp_handle = ddp.clone();
+    let addressing_handle = addressing.clone();
+    tokio::spawn(async move {
+        while let Ok(wire_pkt) = rx.recv().await {
+            if wire_pkt.src_mac == mac {
+                continue;
+            }
+            let pkt = &wire_pkt.packet;
+            let dest_mac = if let tailtalk::addressing::Node::EtherTalkPhase2(m) = pkt.dest_node {
+                m
+            } else {
+                [0; 6]
+            };
+            if dest_mac != mac
+                && !tailtalk::addressing::Addressing::is_broadcast_mac(
+                    dest_mac,
+                    AddressSource::EtherTalkPhase2,
+                )
+            {
+                continue;
+            }
+            match pkt.protocol {
+                DataLinkProtocol::Ddp => ddp_handle.received_pkt(
+                    &pkt.payload,
+                    AddressSource::EtherTalkPhase2,
+                    wire_pkt.src_mac,
+                ),
+                DataLinkProtocol::Aarp => {
+                    let _ = addressing_handle
+                        .received_pkt(&pkt.payload, AddressSource::EtherTalkPhase2);
+                }
+                DataLinkProtocol::LlapEnq | DataLinkProtocol::LlapAck => {}
+            }
+        }
+    });
+
+    // Socket 4 is the echoer socket; no `Echo` is spawned here, so it is free.
+    let mut sock = ddp
+        .new_sock(DdpProtocolType::Aep, Some(4))
+        .await
+        .expect("failed to open AEP socket");
+
+    tokio::spawn(async move {
+        while let Ok(mut pkt) = sock.recv().await {
+            if pkt.payload.first() != Some(&1) {
+                continue; // not an AEP Request
+            }
+            pkt.payload[0] = 2; // Reply
+            // Replace the data with something that is neither equal to nor a
+            // prefix of what was sent.
+            for b in pkt.payload[1..].iter_mut() {
+                *b = 0xEE;
+            }
+            let dst = AppleTalkAddress {
+                network_number: pkt.headers.src_network_num,
+                node_number: pkt.headers.src_node_id,
+            };
+            let _ = sock
+                .send_to(
+                    &pkt.payload,
+                    tailtalk::ddp::DdpAddress::new(dst, pkt.headers.src_sock_num),
+                )
+                .await;
+        }
+    });
+
+    addressing.addr().await.expect("echoer never got an address")
+}
+
+/// A reply carrying data we never sent must not resolve a pending request.
+///
+/// Crediting it to whichever request happens to be outstanding would report a
+/// round-trip time nobody measured and mark a still-unanswered probe as
+/// answered. Treating it as loss is the honest outcome.
+#[tokio::test]
+async fn test_unmatched_echo_reply_is_not_credited() {
+    let _ = tracing_subscriber::fmt().try_init(); // Ignore error if already initialized
+
+    let hub = TestHub::new();
+    let (hub_in_tx, hub_in_rx) = mpsc::channel(100);
+
+    let hub_ref = Arc::new(hub);
+    let hub_runner = hub_ref.clone();
+    let hub_task = tokio::spawn(async move {
+        hub_runner.run(hub_in_rx).await;
+    });
+
+    let echoer_addr = spawn_mangling_echoer(
+        [0x00, 0x01, 0x02, 0x03, 0x04, 0x21],
+        hub_in_tx.clone(),
+        hub_ref.subscribe(),
+    )
+    .await;
+
+    let client = TestClient::new(
+        [0x00, 0x01, 0x02, 0x03, 0x04, 0x22],
+        hub_in_tx.clone(),
+        hub_ref.subscribe(),
+        None,
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let result = client
+        .echo
+        .send_timeout(echoer_addr, b"probe-payload", Duration::from_millis(750))
+        .await;
+
+    let err = result.expect_err("a reply with data we never sent must not count as an answer");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::TimedOut,
+        "expected the probe to be reported as lost, got: {err}"
+    );
 
     hub_task.abort();
 }
