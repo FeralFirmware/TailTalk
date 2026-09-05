@@ -9,11 +9,18 @@ repository = "https://github.com/feralfirmware/tailtalk"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["std", "afp"]
+# Links the standard library. Disable for bare-metal targets.
+std = ["byteorder/std", "encoding_rs/alloc", "thiserror/std"]
+# AFP command parsing. Requires an allocator, so it is unavailable on no_std.
+afp = ["std"]
+
 [dependencies]
-bitflags = "2.13"
+bitflags = { version = "2.13", default-features = false }
 byteorder = { workspace = true } #unified
-bytes = { workspace = true } #unified
 encoding_rs = { workspace = true } #unified
+heapless = { version = "0.9.3", default-features = false }
 thiserror = { workspace = true } #unified
 
 [dev-dependencies]

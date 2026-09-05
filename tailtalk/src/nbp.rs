@@ -1,3 +1,4 @@
+use tailtalk_packets::limits::MAX_NAME_UTF8_LEN;
 use crate::{
     addressing::AddressingHandle,
     ddp::{DdpHandle, DdpSocket},
@@ -127,7 +128,9 @@ impl Nbp {
                                 // falling back to a local broadcast only when there is none.
                                 // That is exactly the "=" (all zones) dispatch; the two differ
                                 // only in the zone carried in the request, which stays intact.
-                                let dispatch = match lookup.request.zone.as_str() {
+                                let mut zone_buf = [0u8; MAX_NAME_UTF8_LEN];
+                                let zone = lookup.request.zone.decode(&mut zone_buf).unwrap_or("");
+                                let dispatch = match zone {
                                     "*" | "=" => self.route_table.nbp_dispatch(NbpZone::All),
                                     z => self.route_table.nbp_dispatch(NbpZone::Named(z)),
                                 };
@@ -166,7 +169,11 @@ impl Nbp {
                                             let packet = NbpPacket {
                                                 operation: NbpOperation::BroadcastRequest,
                                                 transaction_id: tid,
-                                                tuples: vec![make_tuple(our_addr)],
+                                                tuples: {
+                                                    let mut t = tailtalk_packets::heapless::Vec::new();
+                                                    let _ = t.push(make_tuple(our_addr));
+                                                    t
+                                                },
                                             };
                                             let size = packet.to_bytes(&mut buf).expect("failed to serialize");
 
@@ -207,7 +214,11 @@ impl Nbp {
                                             let packet = NbpPacket {
                                                 operation: NbpOperation::Lookup,
                                                 transaction_id: tid,
-                                                tuples: vec![make_tuple(our_addr)],
+                                                tuples: {
+                                                    let mut t = tailtalk_packets::heapless::Vec::new();
+                                                    let _ = t.push(make_tuple(our_addr));
+                                                    t
+                                                },
                                             };
                                             let size = packet.to_bytes(&mut buf).expect("failed to serialize");
 
@@ -429,22 +440,27 @@ impl Nbp {
     ) -> NbpPacket {
         let our_addr = self.addr_on(Some(Interface::from(source))).await;
 
-        let mut tuples = Vec::new();
+        let mut tuples = tailtalk_packets::heapless::Vec::new();
 
         for req_tuple in &nbp.tuples {
             for name in &self.registered_names {
                 if name.name.matches(&req_tuple.entity_name) {
-                    tuples.push(NbpTuple {
+                    let pushed = tuples.push(NbpTuple {
                         network_number: our_addr.network_number,
                         node_id: our_addr.node_number,
                         socket_number: name.sock_num,
                         enumerator: 0,
                         entity_name: EntityName {
-                            object: name.name.object.clone(),
-                            entity_type: name.name.entity_type.clone(),
-                            zone: "*".into(),
+                            object: name.name.object,
+                            entity_type: name.name.entity_type,
+                            zone: "*".try_into().expect("literal fits"),
                         },
                     });
+                    // NBP carries at most 15 tuples per reply; further matches
+                    // wait for the requester to look up again.
+                    if pushed.is_err() {
+                        break;
+                    }
                 }
             }
         }

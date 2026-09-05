@@ -553,12 +553,15 @@ async fn discover(
     // re-exporting them here would advertise a duplicate.
     {
         let bridged = bridged_names.lock().unwrap();
-        tuples.retain(|(_, t)| !bridged.contains(&(t.entity_name.object.clone(), t.socket_number)));
+        tuples.retain(|(_, t)| !bridged.contains(&(t.entity_name.object.to_utf8_string(), t.socket_number)));
     }
 
     let new_keys: HashSet<String> = tuples.iter()
-        .filter(|(_, t)| !make_key(&t.entity_name.object).is_empty())
-        .map(|(kind, t)| printer_key(*kind, &t.entity_name.object, t.service_address()))
+        .filter_map(|(kind, t)| {
+            let name = t.entity_name.object.to_utf8_string();
+            (!make_key(&name).is_empty())
+                .then(|| printer_key(*kind, &name, t.service_address()))
+        })
         .collect();
 
     // Prune vanished printers under a short-lived write lock, then release it:
@@ -584,14 +587,16 @@ async fn discover(
 
     // Names that appear on more than one device this cycle. The mDNS instance
     // name must be unique, so those get disambiguated by address below.
-    let mut name_counts: HashMap<&str, usize> = HashMap::new();
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
     for (_, t) in &tuples {
-        *name_counts.entry(t.entity_name.object.as_str()).or_default() += 1;
+        *name_counts
+            .entry(t.entity_name.object.to_utf8_string())
+            .or_default() += 1;
     }
 
     for (kind, tuple) in &tuples {
         let kind = *kind;
-        let name = tuple.entity_name.object.clone();
+        let name = tuple.entity_name.object.to_utf8_string();
         let addr = tuple.service_address();
         let key = printer_key(kind, &name, addr);
         if make_key(&name).is_empty() || current_keys.contains(&key) {
@@ -628,7 +633,7 @@ async fn discover(
 
         // When two devices share a name, the mDNS instance name (which must be
         // unique) gets an address tag so both show up; unique names stay clean.
-        let instance_name = if name_counts.get(name.as_str()).copied().unwrap_or(0) > 1 {
+        let instance_name = if name_counts.get(&name).copied().unwrap_or(0) > 1 {
             format!("{name} ({}-{})", addr.network_number, addr.node_number)
         } else {
             name.clone()

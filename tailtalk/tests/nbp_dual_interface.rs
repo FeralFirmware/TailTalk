@@ -103,9 +103,9 @@ async fn local_lookup_names_our_address_on_each_cable() {
     tokio::spawn(async move {
         let _ = nbp
             .lookup(EntityName {
-                object: "=".into(),
-                entity_type: "LaserWriter".into(),
-                zone: "*".into(),
+                object: "=".try_into().unwrap(),
+                entity_type: "LaserWriter".try_into().unwrap(),
+                zone: "*".try_into().unwrap(),
             })
             .await;
     });

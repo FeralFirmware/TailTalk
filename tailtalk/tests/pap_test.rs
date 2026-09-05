@@ -239,7 +239,7 @@ async fn test_pap_print_job() {
             function: PapFunction::OpenConnReply,
             sequence_num: 0,
             eof: false,
-            data: vec![130, 8, 0, 0], // Socket=130, Flow=8, Result=0
+            data: &[130, 8, 0, 0], // Socket=130, Flow=8, Result=0
         };
         let (ub, d) = reply.to_atp_parts();
         req.send_response(d.to_vec(), ub)
@@ -275,7 +275,7 @@ async fn test_pap_print_job() {
         function: PapFunction::SendData,
         sequence_num: 1,
         eof: false,
-        data: vec![],
+        data: &[],
     };
     let (ub, d) = send_data_pkt.to_atp_parts();
 
@@ -465,7 +465,7 @@ impl LegacyDriver {
             function: PapFunction::OpenConn,
             sequence_num: 0,
             eof: false,
-            data: vec![client.atp_req.socket_number, 0x08, 0x00, 0x00],
+            data: &[client.atp_req.socket_number, 0x08, 0x00, 0x00],
         };
         let (ub, data) = open.to_atp_parts();
         let (reply_data, reply_ub) = client
@@ -499,7 +499,7 @@ impl LegacyDriver {
                     function: PapFunction::Data,
                     sequence_num: pap.sequence_num,
                     eof,
-                    data: block,
+                    data: &block,
                 };
                 let (ub, d) = resp.to_atp_parts();
                 let _ = req.send_response(d, ub).await;
@@ -511,13 +511,13 @@ impl LegacyDriver {
 
     /// Post the read the driver blocks on and wait for the printer to speak. Before
     /// the fix this waited forever, retransmitting with nothing ever coming back.
-    async fn read(&mut self) -> PapPacket {
+    async fn read(&mut self) -> ReadAnswer {
         let read = PapPacket {
             connection_id: self.conn_id,
             function: PapFunction::SendData,
             sequence_num: self.read_seq,
             eof: false,
-            data: vec![],
+            data: &[],
         };
         let (ub, d) = read.to_atp_parts();
         let (data, user_bytes) = tokio::time::timeout(
@@ -531,8 +531,17 @@ impl LegacyDriver {
         self.read_seq += 1;
         let answer = PapPacket::parse_from_atp(user_bytes, &data).expect("answer parse");
         assert_eq!(answer.function, PapFunction::Data);
-        answer
+        ReadAnswer {
+            data: answer.data.to_vec(),
+            eof: answer.eof,
+        }
     }
+}
+
+/// What a `read` came back with, owned so it outlives the response buffer.
+struct ReadAnswer {
+    data: Vec<u8>,
+    eof: bool,
 }
 
 /// Spin up a printer emulator and return the workstation, its address, and the
@@ -694,7 +703,7 @@ async fn test_pap_server_answers_printer_and_font_list_query() {
     // The printer query flushes once, after all three `==`, so its three lines are
     // one write. It is not the last one, so no eof yet.
     let first = driver.read().await;
-    assert_eq!(first.data, b"1 \n(47.0)\n(LaserWriter Plus)\n");
+    assert_eq!(first.data, b"1 \n(47.0)\n(LaserWriter Plus)\n"[..]);
     assert!(!first.eof, "the font list still has to follow");
 
     // The font list flushes per name, so each one has to come back in a packet of
@@ -706,7 +715,7 @@ async fn test_pap_server_answers_printer_and_font_list_query() {
         assert!(!write.eof, "the font list is not finished yet");
     }
     let last = driver.read().await;
-    assert_eq!(last.data, b"*\n");
+    assert_eq!(last.data, b"*\n"[..]);
     assert!(last.eof, "the last write of the job's output ends it");
 
     assert!(

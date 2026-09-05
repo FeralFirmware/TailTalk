@@ -52,7 +52,7 @@ impl TryFrom<u8> for PapFunction {
 ///   high byte of sequence number (SendData only)
 /// - Byte 3: Low byte of sequence number (SendData only; always 0 for Data)
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PapPacket {
+pub struct PapPacket<'a> {
     pub connection_id: u8,
     pub function: PapFunction,
     /// Sequence number. Meaningful only for `SendData` (ATP user bytes 2-3, big-endian).
@@ -60,15 +60,15 @@ pub struct PapPacket {
     pub sequence_num: u16,
     /// End-of-file flag; only meaningful for `Data` packets.
     pub eof: bool,
-    pub data: Vec<u8>,
+    pub data: &'a [u8],
 }
 
-impl PapPacket {
+impl<'a> PapPacket<'a> {
     /// Minimum header length (connection_id + function)
     pub const MIN_HEADER_LEN: usize = 2;
 
     /// Parse a PAP packet from bytes
-    pub fn parse(buf: &[u8]) -> Result<Self, PapError> {
+    pub fn parse(buf: &'a [u8]) -> Result<Self, PapError> {
         if buf.len() < Self::MIN_HEADER_LEN {
             return Err(PapError::InvalidSize {
                 expected: Self::MIN_HEADER_LEN,
@@ -100,7 +100,7 @@ impl PapPacket {
             _ => (0, false, 2),
         };
 
-        let data = buf[data_start..].to_vec();
+        let data = &buf[data_start..];
 
         Ok(Self {
             connection_id,
@@ -138,9 +138,9 @@ impl PapPacket {
                 buf[2] = (self.sequence_num >> 8) as u8;
                 buf[3] = self.sequence_num as u8;
             }
-            buf[4..total_len].copy_from_slice(&self.data);
+            buf[4..total_len].copy_from_slice(self.data);
         } else {
-            buf[2..total_len].copy_from_slice(&self.data);
+            buf[2..total_len].copy_from_slice(self.data);
         }
 
         Ok(total_len)
@@ -184,11 +184,11 @@ impl PapPacket {
             _ => {}
         }
 
-        (user_bytes, &self.data)
+        (user_bytes, self.data)
     }
 
     /// Parse from ATP user bytes and data payload
-    pub fn parse_from_atp(user_bytes: [u8; 4], data: &[u8]) -> Result<Self, PapError> {
+    pub fn parse_from_atp(user_bytes: [u8; 4], data: &'a [u8]) -> Result<Self, PapError> {
         let connection_id = user_bytes[0];
         let function = PapFunction::try_from(user_bytes[1])?;
 
@@ -203,7 +203,7 @@ impl PapPacket {
             function,
             sequence_num,
             eof,
-            data: data.to_vec(),
+            data,
         })
     }
 }
@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(packet.connection_id, 0);
         assert_eq!(packet.function, PapFunction::OpenConn);
         assert_eq!(packet.sequence_num, 0);
-        assert_eq!(packet.data, vec![0x42, 0x00, 0x08]);
+        assert_eq!(packet.data, &[0x42, 0x00, 0x08]);
     }
 
     #[test]
@@ -245,7 +245,7 @@ mod tests {
             function: PapFunction::OpenConnReply,
             sequence_num: 0,
             eof: false,
-            data: vec![0x42, 0x00, 0x08, 0x00, 0x01], // socket, flow_quantum, result
+            data: &[0x42, 0x00, 0x08, 0x00, 0x01], // socket, flow_quantum, result
         };
 
         let mut buf = [0u8; 32];
@@ -262,7 +262,7 @@ mod tests {
             function: PapFunction::Data,
             sequence_num: 42,
             eof: false,
-            data: b"PostScript data".to_vec(),
+            data: b"PostScript data",
         };
 
         let mut buf = [0u8; 64];
@@ -283,7 +283,7 @@ mod tests {
             function: PapFunction::Tickle,
             sequence_num: 0,
             eof: false,
-            data: vec![],
+            data: &[],
         };
 
         let mut buf = [0u8; 32];
@@ -301,7 +301,7 @@ mod tests {
             function: PapFunction::SendData,
             sequence_num: 100,
             eof: false,
-            data: b"Test print job data".to_vec(),
+            data: b"Test print job data",
         };
 
         let mut buf = [0u8; 64];
@@ -330,7 +330,7 @@ mod tests {
             function: PapFunction::Status,
             sequence_num: 0,
             eof: false,
-            data: vec![1, 2, 3, 4, 5],
+            data: &[1, 2, 3, 4, 5],
         };
 
         let mut buf = [0u8; 4]; // Too small
@@ -347,7 +347,7 @@ mod tests {
             function: PapFunction::SendData,
             sequence_num: 0x0139, // 313
             eof: false,
-            data: b"Data Payload".to_vec(),
+            data: b"Data Payload",
         };
 
         let (user_bytes, data) = original.to_atp_parts();
@@ -370,7 +370,7 @@ mod tests {
             function: PapFunction::Data,
             sequence_num: 0,
             eof: true,
-            data: b"tail".to_vec(),
+            data: b"tail",
         };
 
         let (user_bytes, data) = original.to_atp_parts();

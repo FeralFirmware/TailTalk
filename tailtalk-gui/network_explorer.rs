@@ -563,9 +563,11 @@ async fn discover(handles: &ExplorerHandles) -> anyhow::Result<Vec<Device>> {
                 );
                 continue;
             }
+            let object = t.entity_name.object.to_utf8_string();
+            let entity_type = t.entity_name.entity_type.to_utf8_string();
             let key = (
-                t.entity_name.object.clone(),
-                t.entity_name.entity_type.clone(),
+                object.clone(),
+                entity_type.clone(),
                 t.network_number,
                 t.node_id,
                 t.socket_number,
@@ -574,10 +576,10 @@ async fn discover(handles: &ExplorerHandles) -> anyhow::Result<Vec<Device>> {
                 continue; // already listed from another pattern
             }
             found.push(Device {
-                kind: DeviceKind::from_nbp_type(&t.entity_name.entity_type),
-                name: t.entity_name.object,
-                nbp_type: t.entity_name.entity_type,
-                zone: t.entity_name.zone,
+                kind: DeviceKind::from_nbp_type(&entity_type),
+                name: object,
+                nbp_type: entity_type,
+                zone: t.entity_name.zone.to_utf8_string(),
                 net: t.network_number,
                 node: t.node_id,
                 socket: t.socket_number,

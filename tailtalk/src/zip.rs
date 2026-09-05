@@ -28,6 +28,7 @@
 //! [`RouteTable`] is the single source of truth; this actor's job is to keep
 //! it fresh.
 
+use tailtalk_packets::limits::MAX_NAME_UTF8_LEN;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -161,7 +162,11 @@ impl Zip {
     async fn send_request(&self) -> Result<(), io::Error> {
         let mut buf = [0u8; 64];
         let n = GetNetInfoRequest {
-            zone: self.remembered_zone.clone().unwrap_or_default(),
+            zone: self
+                .remembered_zone
+                .as_deref()
+                .and_then(|z| z.try_into().ok())
+                .unwrap_or_default(),
         }
         .to_bytes(&mut buf)
         .map_err(io::Error::other)?;
@@ -203,9 +208,13 @@ impl Zip {
             Some(reply.zone)
         };
 
+        let mut zone_buf = [0u8; MAX_NAME_UTF8_LEN];
+        let zone_text = zone
+            .as_ref()
+            .and_then(|z| z.decode(&mut zone_buf))
+            .unwrap_or("<none>");
         tracing::info!(
-            "ZIP GetNetInfo ({iface:?}): network range {lo}-{hi}, zone {}",
-            zone.as_deref().unwrap_or("<none>")
+            "ZIP GetNetInfo ({iface:?}): network range {lo}-{hi}, zone {zone_text}"
         );
 
         if lo != 0 {
@@ -230,11 +239,14 @@ impl Zip {
         }
 
         if let Some(zone) = zone {
-            self.route_table.insert_zone(&zone, &[(lo, hi)]);
-            if let Some(path) = &self.zone_cache {
-                save_zone(path, &zone);
+            let mut buf = [0u8; MAX_NAME_UTF8_LEN];
+            if let Some(name) = zone.decode(&mut buf) {
+                self.route_table.insert_zone(name, &[(lo, hi)]);
+                if let Some(path) = &self.zone_cache {
+                    save_zone(path, name);
+                }
+                self.remembered_zone = Some(name.to_string());
             }
-            self.remembered_zone = Some(zone);
         }
     }
 }

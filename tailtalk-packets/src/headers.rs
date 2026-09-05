@@ -20,11 +20,11 @@ pub enum TransportHeader {
 }
 
 #[derive(Debug)]
-pub struct AppleTalkHeaders {
+pub struct AppleTalkHeaders<'a> {
     pub link: EtherTalkPhase2Frame,
     pub net: NetHeader,
     pub transport: Option<TransportHeader>,
-    pub payload: Option<Box<[u8]>>,
+    pub payload: Option<&'a [u8]>,
 }
 
 #[derive(Error, Debug)]
@@ -45,7 +45,7 @@ pub enum AppleTalkError {
     AtpError(AtpError),
 }
 
-impl AppleTalkHeaders {
+impl<'a> AppleTalkHeaders<'a> {
     pub fn encode(mut self, buffer: &mut [u8]) -> Result<usize, AppleTalkError> {
         let net_size = match self.net {
             NetHeader::Ddp(_) => DdpPacket::LEN,
@@ -95,14 +95,14 @@ impl AppleTalkHeaders {
                     found: buffer.len(),
                 });
             }
-            buffer[pos..(pos + payload.len())].copy_from_slice(&payload);
+            buffer[pos..(pos + payload.len())].copy_from_slice(payload);
             pos += payload.len();
         }
 
         Ok(pos)
     }
 
-    pub fn decode(pkt: &[u8]) -> Result<AppleTalkHeaders, AppleTalkError> {
+    pub fn decode(pkt: &[u8]) -> Result<AppleTalkHeaders<'_>, AppleTalkError> {
         let link = EtherTalkPhase2Frame::parse(pkt).map_err(AppleTalkError::LinkHeaderError)?;
 
         let net = match link.protocol {
@@ -133,7 +133,7 @@ impl AppleTalkHeaders {
                         .map_err(AppleTalkError::AtpError)?;
                     let payload_offset = offset + AtpPacket::HEADER_LEN;
                     let payload = if payload_offset < pkt.len() {
-                        Some(pkt[payload_offset..].to_vec().into_boxed_slice())
+                        Some(&pkt[payload_offset..])
                     } else {
                         None
                     };
