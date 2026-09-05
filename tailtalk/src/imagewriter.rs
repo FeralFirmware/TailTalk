@@ -282,9 +282,11 @@ impl ImageWriter {
     /// for any, and the type is always [`NBP_TYPE`].
     pub async fn lookup(nbp: &NbpHandle, object: &str) -> Result<Vec<NbpTuple>> {
         let entity = EntityName {
-            object: object.to_string(),
-            entity_type: NBP_TYPE.to_string(),
-            zone: "*".to_string(),
+            object: object
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("object name is too long for NBP: {object}"))?,
+            entity_type: NBP_TYPE.try_into().expect("literal fits"),
+            zone: "*".try_into().expect("literal fits"),
         };
         Ok(nbp.lookup(entity).await?)
     }

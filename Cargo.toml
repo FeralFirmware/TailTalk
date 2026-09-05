@@ -20,10 +20,10 @@ resolver = "3"
 
 [workspace.dependencies]
 anyhow = "^1.0.104" #unified
-byteorder = "^1.5.0" #unified
-bytes = "^1.12.1" #unified
+byteorder = { version = "^1.5.0", default-features = false } #unified
+bytes = { version = "^1.12.1", default-features = false } #unified
 clap = { version = "^4.6.6", features = ["derive"] } #unified
-encoding_rs = "^0.8.35" #unified
+encoding_rs = { version = "^0.8.35", default-features = false } #unified
 futures = "^0.3.33" #unified
 hfs-reader = { path = "hfs-reader", version = "^0.1.1" } #unified
 prost = "^0.14" #unified
@@ -31,7 +31,7 @@ tailtalk = { path = "tailtalk" } #unified
 tailtalk-packets = { path = "tailtalk-packets", version = "^0.11" } #unified
 tailtalk-proto = { path = "tailtalk-proto", version = "^0.11" } #unified
 tashtalk = { path = "tashtalk", version = "^0.3" } #unified
-thiserror = "^2.0.19" #unified
+thiserror = { version = "^2.0.19", default-features = false } #unified
 tokio = { version = "^1.53.1", features = ["full", "io-util"] } #unified
 tracing = "^0.1.44" #unified
 

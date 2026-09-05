@@ -16,6 +16,7 @@
 //! Op codes, flag bits, and the wire layout mirror Netatalk's
 //! `include/atalk/zip.h` and `bin/getzones/getzones.c`.
 
+use crate::limits::{MAX_MULTICAST_LEN, MulticastAddr, ZoneName};
 use thiserror::Error;
 
 /// ZIP is carried on DDP socket 6 (the ZIP socket) on both ends.
@@ -48,6 +49,8 @@ pub enum ZipError {
     ZoneTooLong { length: usize },
     #[error("buffer too small: need {needed} bytes but only {available} available")]
     BufferTooSmall { needed: usize, available: usize },
+    #[error("multicast address is {length} bytes; the maximum is {MAX_MULTICAST_LEN}")]
+    MulticastTooLong { length: usize },
 }
 
 /// A ZIP GetNetInfo request (ZIP operation 5), sent node → routers.
@@ -57,7 +60,7 @@ pub enum ZipError {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GetNetInfoRequest {
     /// Zone name the node is asking the router to confirm; empty if it has none.
-    pub zone: String,
+    pub zone: ZoneName,
 }
 
 impl GetNetInfoRequest {
@@ -83,13 +86,8 @@ impl GetNetInfoRequest {
     }
 
     pub fn to_bytes(&self, buf: &mut [u8]) -> Result<usize, ZipError> {
-        let (zone_cow, _, _) = encoding_rs::MACINTOSH.encode(&self.zone);
-        if zone_cow.len() > MAX_ZONE_LENGTH {
-            return Err(ZipError::ZoneTooLong {
-                length: zone_cow.len(),
-            });
-        }
-        let needed = Self::MIN_LEN + zone_cow.len();
+        let zone_bytes = self.zone.as_wire();
+        let needed = Self::MIN_LEN + zone_bytes.len();
         if buf.len() < needed {
             return Err(ZipError::BufferTooSmall {
                 needed,
@@ -98,7 +96,7 @@ impl GetNetInfoRequest {
         }
         buf[0] = ZIPOP_GNI;
         buf[1..6].fill(0);
-        write_pbytes(buf, 6, &zone_cow);
+        write_pbytes(buf, 6, zone_bytes);
         Ok(needed)
     }
 }
@@ -119,13 +117,13 @@ pub struct GetNetInfoReply {
     /// Last network number of the cable range.
     pub range_end: u16,
     /// The zone name echoed back from the request.
-    pub zone: String,
+    pub zone: ZoneName,
     /// Multicast (hardware) address for the zone; empty when the reply sets
     /// [`ZIPGNI_USE_BROADCAST`] or the link has no multicast.
-    pub multicast: Vec<u8>,
+    pub multicast: MulticastAddr,
     /// Default zone name for the cable. Present (and adopted by the node) when
     /// the requested zone was invalid.
-    pub default_zone: Option<String>,
+    pub default_zone: Option<ZoneName>,
 }
 
 impl GetNetInfoReply {
@@ -170,7 +168,8 @@ impl GetNetInfoReply {
         let (zone, consumed) = read_pstring(buf, offset)?;
         offset += consumed;
         let (multicast, consumed) = read_pbytes(buf, offset)?;
-        let multicast = multicast.to_vec();
+        let multicast = MulticastAddr::from_slice(multicast)
+            .map_err(|_| ZipError::MulticastTooLong { length: multicast.len() })?;
         offset += consumed;
 
         // The default zone is only present when the router chose to send it
@@ -194,20 +193,8 @@ impl GetNetInfoReply {
     }
 
     pub fn to_bytes(&self, buf: &mut [u8]) -> Result<usize, ZipError> {
-        let (zone, _, _) = encoding_rs::MACINTOSH.encode(&self.zone);
-        if zone.len() > MAX_ZONE_LENGTH {
-            return Err(ZipError::ZoneTooLong { length: zone.len() });
-        }
-        let default_zone = self
-            .default_zone
-            .as_ref()
-            .map(|z| encoding_rs::MACINTOSH.encode(z).0);
-        if let Some(default_zone) = &default_zone
-            && default_zone.len() > MAX_ZONE_LENGTH {
-                return Err(ZipError::ZoneTooLong {
-                    length: default_zone.len(),
-                });
-            }
+        let zone = self.zone.as_wire();
+        let default_zone = self.default_zone.as_ref().map(|z| z.as_wire());
 
         let needed = 6
             + (1 + zone.len())
@@ -225,7 +212,7 @@ impl GetNetInfoReply {
         buf[2..4].copy_from_slice(&self.range_start.to_be_bytes());
         buf[4..6].copy_from_slice(&self.range_end.to_be_bytes());
         let mut offset = 6;
-        offset += write_pbytes(buf, offset, &zone);
+        offset += write_pbytes(buf, offset, zone);
         offset += write_pbytes(buf, offset, &self.multicast);
         if let Some(default_zone) = &default_zone {
             offset += write_pbytes(buf, offset, default_zone);
@@ -283,11 +270,14 @@ fn read_pbytes(buf: &[u8], offset: usize) -> Result<(&[u8], usize), ZipError> {
     Ok((slice, 1 + len))
 }
 
-/// Like [`read_pbytes`] but decodes the payload as a MacRoman zone name.
-fn read_pstring(buf: &[u8], offset: usize) -> Result<(String, usize), ZipError> {
+/// Like [`read_pbytes`] but reads the payload as a zone name, which stays in
+/// its on-the-wire MacRoman encoding.
+fn read_pstring(buf: &[u8], offset: usize) -> Result<(ZoneName, usize), ZipError> {
     let (bytes, consumed) = read_pbytes(buf, offset)?;
-    let (name, _, _) = encoding_rs::MACINTOSH.decode(bytes);
-    Ok((name.into_owned(), consumed))
+    let name = ZoneName::from_wire(bytes).ok_or(ZipError::ZoneTooLong {
+        length: bytes.len(),
+    })?;
+    Ok((name, consumed))
 }
 
 /// Writes `data` as a length-prefixed byte string at `offset`. The caller must
@@ -309,7 +299,7 @@ mod tests {
         const WIRE: &[u8] = &[0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 
         let req = GetNetInfoRequest::parse(WIRE).expect("failed to parse GNI request");
-        assert_eq!(req.zone, "");
+        assert_eq!(req.zone.as_wire(), b"");
 
         let mut buf = [0u8; WIRE.len()];
         let n = req.to_bytes(&mut buf).expect("failed to encode");
@@ -319,7 +309,7 @@ mod tests {
     #[test]
     fn test_getnetinfo_request_named_zone() {
         let req = GetNetInfoRequest {
-            zone: "Bandley3".into(),
+            zone: "Bandley3".try_into().unwrap(),
         };
         let mut buf = [0u8; 64];
         let n = req.to_bytes(&mut buf).expect("failed to encode");
@@ -353,7 +343,7 @@ mod tests {
         assert!(!reply.zone_invalid());
         assert_eq!(reply.range_start, 1);
         assert_eq!(reply.range_end, 1);
-        assert_eq!(reply.zone, "MyZone");
+        assert_eq!(reply.zone.as_wire(), b"MyZone");
         assert!(reply.multicast.is_empty());
         assert_eq!(reply.default_zone, None);
 
@@ -370,9 +360,9 @@ mod tests {
             flags: ZIPGNI_INVALID,
             range_start: 3,
             range_end: 5,
-            zone: "BogusZone".into(),
-            multicast: vec![0x09, 0x00, 0x07, 0xff, 0xff, 0xff],
-            default_zone: Some("Engineering".into()),
+            zone: "BogusZone".try_into().unwrap(),
+            multicast: MulticastAddr::from_slice(&[0x09, 0x00, 0x07, 0xff, 0xff, 0xff]).unwrap(),
+            default_zone: Some("Engineering".try_into().unwrap()),
         };
 
         let mut buf = [0u8; 128];
@@ -382,7 +372,10 @@ mod tests {
         assert_eq!(round, reply);
         assert!(round.zone_invalid());
         assert_eq!(round.multicast.len(), 6);
-        assert_eq!(round.default_zone.as_deref(), Some("Engineering"));
+        assert_eq!(
+            round.default_zone.map(|z| z.as_wire().to_vec()),
+            Some(b"Engineering".to_vec())
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::limits::MAX_RTMP_TUPLES;
 use thiserror::Error;
 
 /// Well-known DDP socket for both RTMP Data and RTMP Request packets.
@@ -11,6 +12,8 @@ pub enum RtmpError {
     UnsupportedIdLength { length: u8 },
     #[error("unknown RTMP function code {code}")]
     UnknownFunction { code: u8 },
+    #[error("more than {MAX_RTMP_TUPLES} routing tuples")]
+    TooManyTuples,
 }
 
 /// Function code carried in an RTMP Request or Route Data Request packet.
@@ -64,7 +67,7 @@ pub struct RtmpDataPacket {
     /// Node ID of the router port through which this packet was sent.
     pub node_id: u8,
     /// Routing tuples from the sending router's routing table.
-    pub tuples: Vec<RtmpTuple>,
+    pub tuples: heapless::Vec<RtmpTuple, MAX_RTMP_TUPLES>,
 }
 
 impl RtmpDataPacket {
@@ -91,24 +94,28 @@ impl RtmpDataPacket {
             rest = &rest[3..];
         }
 
-        let mut tuples = Vec::new();
+        let mut tuples = heapless::Vec::new();
         while !rest.is_empty() {
             match rest {
                 // Non-extended tuple: network (2B) + distance (1B, high bit clear).
                 [hi, lo, dist @ 0..=0x7F, tail @ ..] => {
-                    tuples.push(RtmpTuple::NonExtended {
-                        network: u16::from_be_bytes([*hi, *lo]),
-                        distance: *dist,
-                    });
+                    tuples
+                        .push(RtmpTuple::NonExtended {
+                            network: u16::from_be_bytes([*hi, *lo]),
+                            distance: *dist,
+                        })
+                        .map_err(|_| RtmpError::TooManyTuples)?;
                     rest = tail;
                 }
                 // Extended tuple: range_start (2B) + distance|0x80 (1B) + range_end (2B) + $82 (1B).
                 [s_hi, s_lo, dist, e_hi, e_lo, _unused, tail @ ..] => {
-                    tuples.push(RtmpTuple::Extended {
-                        range_start: u16::from_be_bytes([*s_hi, *s_lo]),
-                        distance: *dist & 0x7F,
-                        range_end: u16::from_be_bytes([*e_hi, *e_lo]),
-                    });
+                    tuples
+                        .push(RtmpTuple::Extended {
+                            range_start: u16::from_be_bytes([*s_hi, *s_lo]),
+                            distance: *dist & 0x7F,
+                            range_end: u16::from_be_bytes([*e_hi, *e_lo]),
+                        })
+                        .map_err(|_| RtmpError::TooManyTuples)?;
                     rest = tail;
                 }
                 _ => {

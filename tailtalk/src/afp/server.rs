@@ -126,9 +126,13 @@ impl AfpServer {
 
         // Create NBP entity name
         let entity_name = EntityName {
-            object: config.server_name.clone(),
-            entity_type: "AFPServer".to_string(),
-            zone: "*".to_string(),
+            object: config
+                .server_name
+                .as_str()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("server name is too long for NBP: {}", config.server_name))?,
+            entity_type: "AFPServer".try_into().expect("literal fits"),
+            zone: "*".try_into().expect("literal fits"),
         };
 
         // Bind ASP service

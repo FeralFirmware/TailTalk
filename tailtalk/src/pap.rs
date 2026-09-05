@@ -113,7 +113,7 @@ impl PapClient {
             function: PapFunction::OpenConn,
             sequence_num: 0,
             eof: false,
-            data: vec![self.atp_requestor.socket_number, 0x08, 0x00, 0x00],
+            data: &[self.atp_requestor.socket_number, 0x08, 0x00, 0x00],
         };
         let (user_bytes, data) = open_packet.to_atp_parts();
         let deadline = tokio::time::Instant::now() + timeout;
@@ -257,7 +257,7 @@ impl PapClient {
                                 function: PapFunction::Data,
                                 sequence_num: seq_num,
                                 eof,
-                                data: buf,
+                                data: &buf,
                             };
                             let (user_bytes, chunk_data) = pap_resp.to_atp_parts();
                             req.send_response_chunked(chunk_data, user_bytes, PAP_MAX_DATA_PER_PACKET).await?;
@@ -289,7 +289,7 @@ impl PapClient {
                                 function: PapFunction::CloseConnReply,
                                 sequence_num: 0,
                                 eof: false,
-                                data: vec![],
+                                data: &[],
                             };
                             let (ub, d) = reply.to_atp_parts();
                             let _ = req.send_response(d, ub).await;
@@ -312,7 +312,7 @@ impl PapClient {
                         function: PapFunction::Tickle,
                         sequence_num: 0,
                         eof: false,
-                        data: vec![],
+                        data: &[],
                     };
                     let (ub, _) = tickle.to_atp_parts();
                     let _ = self.atp_requestor.send_alo(self.server_addr, ub).await;
@@ -356,7 +356,7 @@ impl PapClient {
                 function: PapFunction::SendData,
                 sequence_num: self.read_seq,
                 eof: false,
-                data: vec![],
+                data: &[],
             };
             let (ub, d) = pkt.to_atp_parts();
             let (resp_data, resp_ub) = self.atp_requestor
@@ -370,7 +370,7 @@ impl PapClient {
 
             self.read_seq = next_pap_seq(self.read_seq);
 
-            response.extend_from_slice(&data_pkt.data);
+            response.extend_from_slice(data_pkt.data);
             if data_pkt.eof {
                 break;
             }
@@ -392,7 +392,7 @@ impl PapClient {
             function: PapFunction::CloseConn,
             sequence_num: 0,
             eof: false,
-            data: vec![],
+            data: &[],
         };
         let (ub, d) = close_pkt.to_atp_parts();
         // Must go to server_addr (per-connection socket), not remote_addr (NBP listening socket).
@@ -429,7 +429,7 @@ impl PapClient {
             function: PapFunction::SendStatus,
             sequence_num: 0,
             eof: false,
-            data: vec![],
+            data: &[],
         };
         let (ub, d) = pkt.to_atp_parts();
         let (resp_data, resp_ub) = atp
@@ -745,7 +745,7 @@ impl PapServer {
                         function: PapFunction::Status,
                         sequence_num: 0,
                         eof: false,
-                        data: status_payload,
+                        data: &status_payload,
                     };
                     let (ub, d) = reply.to_atp_parts();
                     let _ = req.send_response(d, ub).await;
@@ -794,7 +794,7 @@ impl PapServer {
             function: PapFunction::OpenConnReply,
             sequence_num: 0,
             eof: false,
-            data: reply_data,
+            data: &reply_data,
         };
         let (ub, d) = reply.to_atp_parts();
         if let Err(e) = open_req.send_response(d, ub).await {
@@ -815,7 +815,7 @@ impl PapServer {
                     function: PapFunction::SendData,
                     sequence_num: seq,
                     eof: false,
-                    data: vec![],
+                    data: &[],
                 };
                 let (ub, d) = send_data.to_atp_parts();
                 requestor.send_request(client_data_addr, ub, d.to_vec()).await
@@ -888,7 +888,7 @@ impl PapServer {
                                 data_pkt.data.len(),
                                 data_pkt.eof
                             );
-                            job.push(&data_pkt.data);
+                            job.push(data_pkt.data);
 
                             if data_pkt.eof && job.is_empty() {
                                 // A zero-byte job (PapClient's post-EOF drain sends one)
@@ -1014,7 +1014,7 @@ impl PapServer {
                                 function: PapFunction::CloseConnReply,
                                 sequence_num: 0,
                                 eof: false,
-                                data: vec![],
+                                data: &[],
                             };
                             let (ub, d) = reply.to_atp_parts();
                             let _ = req.send_response(d, ub).await;
@@ -1075,7 +1075,7 @@ impl PapServer {
                                 function: PapFunction::Status,
                                 sequence_num: 0,
                                 eof: false,
-                                data: status_payload,
+                                data: &status_payload,
                             };
                             let (ub, d) = reply.to_atp_parts();
                             let _ = req.send_response(d, ub).await;
@@ -1090,7 +1090,7 @@ impl PapServer {
                                 function: PapFunction::OpenConnReply,
                                 sequence_num: 0,
                                 eof: false,
-                                data: reply_data,
+                                data: &reply_data,
                             };
                             let (ub, d) = reply.to_atp_parts();
                             let _ = req.send_response(d, ub).await;
@@ -1109,7 +1109,7 @@ impl PapServer {
                         function: PapFunction::Tickle,
                         sequence_num: 0,
                         eof: false,
-                        data: vec![],
+                        data: &[],
                     };
                     let (tub, _) = tickle.to_atp_parts();
                     let _ = conn_requestor.send_alo(client_data_addr, tub).await;
@@ -1142,7 +1142,7 @@ impl PapServer {
                     function: PapFunction::Data,
                     sequence_num: 0,
                     eof,
-                    data: chunk,
+                    data: &chunk,
                 };
                 let (ub, d) = reply.to_atp_parts();
                 let _ = req

@@ -70,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
         "Found: {} — {}.{} socket {}",
         printer.entity_name, printer.network_number, printer.node_id, printer.socket_number
     );
-    let old_name = printer.entity_name.object.clone();
+    let old_name = printer.entity_name.object;
 
     // The management ADSP port is fixed at socket 129, independent of the PAP
     // socket that NBP advertises.

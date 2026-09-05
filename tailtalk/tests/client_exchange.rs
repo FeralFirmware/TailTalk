@@ -200,7 +200,7 @@ async fn test_client_exchange() {
 
     assert!(!results.is_empty(), "Client B found no results");
     let target = &results[0];
-    assert_eq!(target.entity_name.object, "ClientA");
+    assert_eq!(target.entity_name.object.as_wire(), b"ClientA");
 
     println!(
         "Client B resolved Client A to: {}.{}",
@@ -280,8 +280,8 @@ async fn test_nbp_lookup() {
         .expect("Lookup failed");
 
     assert_eq!(results.len(), 1, "Should find exactly one FileServer");
-    assert_eq!(results[0].entity_name.object, "FileServer");
-    assert_eq!(results[0].entity_name.entity_type, "AFPServer");
+    assert_eq!(results[0].entity_name.object.as_wire(), b"FileServer");
+    assert_eq!(results[0].entity_name.entity_type.as_wire(), b"AFPServer");
     assert_eq!(results[0].socket_number, 100);
 
     // 6. Client B looks up with wildcard

@@ -1,6 +1,4 @@
-use byteorder::{BigEndian, ReadBytesExt};
-use bytes::{BufMut, BytesMut};
-use std::io::{Cursor, Error, Read};
+use byteorder::{BigEndian, ByteOrder};
 
 pub type EthernetMac = [u8; 6];
 
@@ -9,13 +7,6 @@ pub enum AarpError {
     InvalidSize,
     UnknownOpcode(u16),
     UnsupportedHardwareSize(u8),
-    StdIoError(Error),
-}
-
-impl From<Error> for AarpError {
-    fn from(err: Error) -> AarpError {
-        AarpError::StdIoError(err)
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
@@ -86,12 +77,11 @@ impl AarpPacket {
             return Err(AarpError::InvalidSize);
         }
 
-        let mut cursor = Cursor::new(buf);
-        let hardware_type = cursor.read_u16::<BigEndian>()?;
-        let protocol_type = cursor.read_u16::<BigEndian>()?;
-        let hardware_size = cursor.read_u8()?;
-        let protocol_size = cursor.read_u8()?;
-        let opcode = match cursor.read_u16::<BigEndian>()? {
+        let hardware_type = BigEndian::read_u16(&buf[0..2]);
+        let protocol_type = BigEndian::read_u16(&buf[2..4]);
+        let hardware_size = buf[4];
+        let protocol_size = buf[5];
+        let opcode = match BigEndian::read_u16(&buf[6..8]) {
             1 => AarpOpcode::Request,
             2 => AarpOpcode::Response,
             3 => AarpOpcode::Probe,
@@ -105,13 +95,13 @@ impl AarpPacket {
         let mut proto_buf = [0u8; 4];
 
         let mut sender_mac = [0u8; 6];
-        cursor.read_exact(&mut sender_mac)?;
-        cursor.read_exact(&mut proto_buf)?;
+        sender_mac.copy_from_slice(&buf[8..14]);
+        proto_buf.copy_from_slice(&buf[14..18]);
         let sender_protocol = AppleTalkAddress::decode(proto_buf);
 
         let mut target_mac = [0u8; 6];
-        cursor.read_exact(&mut target_mac)?;
-        cursor.read_exact(&mut proto_buf)?;
+        target_mac.copy_from_slice(&buf[18..24]);
+        proto_buf.copy_from_slice(&buf[24..28]);
         let target_protocol = AppleTalkAddress::decode(proto_buf);
 
         Ok(Self {
@@ -128,27 +118,24 @@ impl AarpPacket {
     }
 
     pub fn to_bytes(&self, buffer: &mut [u8]) -> usize {
-        let mut buf = BytesMut::with_capacity(Self::LEN);
-        buf.put_u16(self.hardware_type);
-        buf.put_u16(self.protocol_type);
-        buf.put_u8(self.hardware_size);
-        buf.put_u8(self.protocol_size);
-        buf.put_u16(self.opcode as u16);
+        BigEndian::write_u16(&mut buffer[0..2], self.hardware_type);
+        BigEndian::write_u16(&mut buffer[2..4], self.protocol_type);
+        buffer[4] = self.hardware_size;
+        buffer[5] = self.protocol_size;
+        BigEndian::write_u16(&mut buffer[6..8], self.opcode as u16);
 
-        buf.put_slice(&self.sender_addr);
+        buffer[8..14].copy_from_slice(&self.sender_addr);
 
         let mut encoded = [0u8; 4];
         self.sender_protocol.encode(&mut encoded);
-        buf.put_slice(&encoded);
+        buffer[14..18].copy_from_slice(&encoded);
 
-        buf.put_slice(&self.target_addr);
+        buffer[18..24].copy_from_slice(&self.target_addr);
 
         self.target_protocol.encode(&mut encoded);
-        buf.put_slice(&encoded);
+        buffer[24..28].copy_from_slice(&encoded);
 
-        let used = buf.len();
-        buffer[..used].copy_from_slice(&buf);
-        used
+        Self::LEN
     }
 }
 

@@ -1,13 +1,40 @@
 #![allow(dead_code)]
 
-use std::fmt::Display;
+use crate::limits::{MAX_NBP_NAME, MAX_NBP_TUPLES, NbpName};
+use core::fmt::Display;
+use thiserror::Error;
+
+/// NBP wildcard matching any name, as it appears on the wire.
+const WILDCARD_STAR: u8 = b'*';
+/// NBP wildcard matching the current zone.
+const WILDCARD_EQUALS: u8 = b'=';
+/// The MacRoman encoding of the `≈` wildcard.
+const WILDCARD_APPROX: u8 = 0xC5;
+
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum NbpError {
+    #[error("packet too short to be valid")]
+    TooShort,
+    #[error("field exceeds packet bounds")]
+    OutOfBounds,
+    #[error("name component exceeds the {MAX_NBP_NAME}-byte NBP maximum")]
+    NameTooLong,
+    #[error("name component is not valid UTF-8")]
+    NameNotUtf8,
+    #[error("more than {MAX_NBP_TUPLES} tuples")]
+    TooManyTuples,
+    #[error("buffer too small: need {needed} bytes but only {available} available")]
+    BufferTooSmall { needed: usize, available: usize },
+    #[error("malformed entity name: {0}")]
+    MalformedEntityName(&'static str),
+}
 
 /// Represents an NBP packet for AppleTalk.
 #[derive(Debug)]
 pub struct NbpPacket {
     pub operation: NbpOperation, // NBP operation type
     pub transaction_id: u8,      // Transaction ID for matching requests and responses
-    pub tuples: Vec<NbpTuple>,   // List of NBP tuples
+    pub tuples: heapless::Vec<NbpTuple, MAX_NBP_TUPLES>, // List of NBP tuples
 }
 
 /// Enum for NBP operation types.
@@ -79,16 +106,16 @@ impl NbpTuple {
 /// Represents an entity name in NBP.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct EntityName {
-    pub object: String,      // Object name
-    pub entity_type: String, // Type of the entity (e.g., service type)
-    pub zone: String,        // Zone name
+    pub object: NbpName,      // Object name
+    pub entity_type: NbpName, // Type of the entity (e.g., service type)
+    pub zone: NbpName,        // Zone name
 }
 
 impl NbpPacket {
     /// Parses an NBP packet from raw bytes.
-    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(data: &[u8]) -> Result<Self, NbpError> {
         if data.len() < 2 {
-            return Err("Packet too short to be valid".to_string());
+            return Err(NbpError::TooShort);
         }
 
         let control_byte = data[0];
@@ -96,11 +123,11 @@ impl NbpPacket {
         let tuple_count = control_byte & 0x0F;
         let transaction_id = data[1];
         let mut offset = 2;
-        let mut tuples = Vec::new();
+        let mut tuples = heapless::Vec::new();
 
         for _ in 0..tuple_count {
             if offset + 5 > data.len() {
-                return Err("Packet too short for declared tuple count".to_string());
+                return Err(NbpError::TooShort);
             }
 
             let network_number = u16::from_be_bytes([data[offset], data[offset + 1]]);
@@ -112,13 +139,15 @@ impl NbpPacket {
             let (entity_name, name_length) = EntityName::from_bytes(&data[offset..])?;
             offset += name_length;
 
-            tuples.push(NbpTuple {
-                network_number,
-                node_id,
-                socket_number,
-                enumerator,
-                entity_name,
-            });
+            tuples
+                .push(NbpTuple {
+                    network_number,
+                    node_id,
+                    socket_number,
+                    enumerator,
+                    entity_name,
+                })
+                .map_err(|_| NbpError::TooManyTuples)?;
         }
 
         Ok(NbpPacket {
@@ -130,11 +159,11 @@ impl NbpPacket {
 
     /// Serializes the NBP packet into a byte slice.
     /// Returns the size of the serialized data.
-    pub fn to_bytes(&self, buffer: &mut [u8]) -> Result<usize, String> {
+    pub fn to_bytes(&self, buffer: &mut [u8]) -> Result<usize, NbpError> {
         let mut offset = 0;
 
         if buffer.len() < 2 {
-            return Err("Buffer too small to hold the header".to_string());
+            return Err(NbpError::BufferTooSmall { needed: 2, available: buffer.len() });
         }
 
         // Write control byte (operation and tuple count)
@@ -148,7 +177,10 @@ impl NbpPacket {
         // Write tuples
         for tuple in &self.tuples {
             if offset + 5 > buffer.len() {
-                return Err("Buffer too small to hold tuple data".to_string());
+                return Err(NbpError::BufferTooSmall {
+                    needed: offset + 5,
+                    available: buffer.len(),
+                });
             }
 
             buffer[offset..offset + 2].copy_from_slice(&tuple.network_number.to_be_bytes());
@@ -172,82 +204,78 @@ impl NbpPacket {
 }
 
 impl TryFrom<&str> for EntityName {
-    type Error = &'static str;
+    type Error = NbpError;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         let first_index = value
             .find(':')
-            .ok_or("malformed entity name - missing : separator")?;
+            .ok_or(NbpError::TooShort)?;
         let second_index = value
             .find('@')
-            .ok_or("malformed entity name - missing @ separator")?;
+            .ok_or(NbpError::TooShort)?;
 
         if first_index > second_index {
-            return Err("malformed entity name - : was found after @");
+            return Err(NbpError::MalformedEntityName("malformed entity name - : was found after @"));
         }
 
         let object = &value[..first_index];
         if object.is_empty() {
-            return Err("malformed entity name - object is empty");
+            return Err(NbpError::MalformedEntityName("malformed entity name - object is empty"));
         }
 
         let entity_type = &value[first_index + 1..second_index];
         if entity_type.is_empty() {
-            return Err("malformed entity name - type is empty");
+            return Err(NbpError::MalformedEntityName("malformed entity name - type is empty"));
         }
 
         let zone = &value[second_index + 1..];
         if zone.is_empty() {
-            return Err("malformed entity name - zone is empty");
+            return Err(NbpError::MalformedEntityName("malformed entity name - zone is empty"));
         }
 
         Ok(EntityName {
-            object: object.into(),
-            entity_type: entity_type.into(),
-            zone: zone.into(),
+            object: object.try_into().map_err(|_| NbpError::NameTooLong)?,
+            entity_type: entity_type.try_into().map_err(|_| NbpError::NameTooLong)?,
+            zone: zone.try_into().map_err(|_| NbpError::NameTooLong)?,
         })
     }
 }
 
 impl Display for EntityName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}:{}@{}", self.object, self.entity_type, self.zone)
     }
 }
 
 impl EntityName {
     /// Parses an entity name (object, type, zone) from raw bytes.
-    pub fn from_bytes(data: &[u8]) -> Result<(Self, usize), String> {
+    pub fn from_bytes(data: &[u8]) -> Result<(Self, usize), NbpError> {
         let mut offset = 0;
 
-        let object_length = *data.get(offset).ok_or("Missing object length")? as usize;
+        let object_length = *data.get(offset).ok_or(NbpError::TooShort)? as usize;
         offset += 1;
 
         if offset + object_length > data.len() {
-            return Err("Object name field exceeds packet bounds".to_string());
+            return Err(NbpError::OutOfBounds);
         }
-        let (object_cow, _, _) =
-            encoding_rs::MACINTOSH.decode(&data[offset..offset + object_length]);
-        let object = object_cow.into_owned();
+        let object = name_from_wire(&data[offset..offset + object_length])?;
         offset += object_length;
 
-        let type_length = *data.get(offset).ok_or("Missing type length")? as usize;
+        let type_length = *data.get(offset).ok_or(NbpError::TooShort)? as usize;
         offset += 1;
 
         if offset + type_length > data.len() {
-            return Err("Type name field exceeds packet bounds".to_string());
+            return Err(NbpError::OutOfBounds);
         }
-        let (type_cow, _, _) = encoding_rs::MACINTOSH.decode(&data[offset..offset + type_length]);
-        let entity_type = type_cow.into_owned();
+        let entity_type = name_from_wire(&data[offset..offset + type_length])?;
         offset += type_length;
 
-        let zone_length = *data.get(offset).ok_or("Missing zone length")? as usize;
+        let zone_length = *data.get(offset).ok_or(NbpError::TooShort)? as usize;
         offset += 1;
         if offset + zone_length > data.len() {
-            return Err("Zone name field exceeds packet bounds".to_string());
+            return Err(NbpError::OutOfBounds);
         }
-        let (zone_cow, _, _) = encoding_rs::MACINTOSH.decode(&data[offset..offset + zone_length]);
-        let zone = zone_cow.into_owned();
+        let zone = name_from_wire(&data[offset..offset + zone_length])?;
         offset += zone_length;
 
         Ok((
@@ -262,64 +290,66 @@ impl EntityName {
 
     /// Serializes the entity name into a byte slice.
     /// Returns the size of the serialized data.
-    pub fn to_bytes(&self, buffer: &mut [u8]) -> Result<usize, String> {
+    pub fn to_bytes(&self, buffer: &mut [u8]) -> Result<usize, NbpError> {
         let mut offset = 0;
 
-        let (object_cow, _, _) = encoding_rs::MACINTOSH.encode(self.object.as_str());
-        let object = object_cow.into_owned();
-        let (type_cow, _, _) = encoding_rs::MACINTOSH.encode(self.entity_type.as_str());
-        let entity_type = type_cow.into_owned();
-        let (zone_cow, _, _) = encoding_rs::MACINTOSH.encode(self.zone.as_str());
-        let zone = zone_cow.into_owned();
+        let object = self.object.as_wire();
+        let entity_type = self.entity_type.as_wire();
+        let zone = self.zone.as_wire();
 
         let calc_size = 1 + object.len() + 1 + entity_type.len() + 1 + zone.len();
         if buffer.len() < calc_size {
-            return Err(format!(
-                "Buffer too small to hold entity name. Buf is: {}, calc_size: {calc_size}",
-                buffer.len()
-            ));
+            return Err(NbpError::BufferTooSmall {
+                needed: calc_size,
+                available: buffer.len(),
+            });
         }
 
         buffer[offset] = object.len() as u8;
         offset += 1;
-        buffer[offset..offset + object.len()].copy_from_slice(&object);
+        buffer[offset..offset + object.len()].copy_from_slice(object);
         offset += object.len();
 
         buffer[offset] = entity_type.len() as u8;
         offset += 1;
-        buffer[offset..offset + entity_type.len()].copy_from_slice(&entity_type);
+        buffer[offset..offset + entity_type.len()].copy_from_slice(entity_type);
         offset += entity_type.len();
 
         buffer[offset] = zone.len() as u8;
         offset += 1;
-        buffer[offset..offset + zone.len()].copy_from_slice(&zone);
+        buffer[offset..offset + zone.len()].copy_from_slice(zone);
         offset += zone.len();
 
         Ok(offset)
     }
 
     pub fn matches(&self, pattern: &EntityName) -> bool {
-        let match_part = |concrete: &str, pattern: &str| -> bool {
-            if pattern == "=" || pattern == "≈" || pattern == "*" {
+        let match_part = |concrete: &[u8], pattern: &[u8]| -> bool {
+            if matches!(pattern, [WILDCARD_EQUALS] | [WILDCARD_APPROX] | [WILDCARD_STAR]) {
                 return true;
             }
             concrete.eq_ignore_ascii_case(pattern)
         };
 
-        match_part(&self.object, &pattern.object)
-            && match_part(&self.entity_type, &pattern.entity_type)
-            && match_part(&self.zone, &pattern.zone)
+        match_part(self.object.as_wire(), pattern.object.as_wire())
+            && match_part(self.entity_type.as_wire(), pattern.entity_type.as_wire())
+            && match_part(self.zone.as_wire(), pattern.zone.as_wire())
     }
 
     pub fn fully_qualified(&self) -> bool {
-        const LOOKUP_FLAGS: [char; 3] = ['*', '=', '≈'];
+        const LOOKUP_FLAGS: [u8; 3] = [WILDCARD_STAR, WILDCARD_EQUALS, WILDCARD_APPROX];
         // Object and type must not contain wildcard characters.
         // Zone is allowed to be "*" (meaning "my current zone") since that is the standard
         // AppleTalk convention for service registration; the router resolves the real zone.
-        !LOOKUP_FLAGS
-            .iter()
-            .any(|&f| self.object.contains(f) || self.entity_type.contains(f))
+        !LOOKUP_FLAGS.iter().any(|f| {
+            self.object.as_wire().contains(f) || self.entity_type.as_wire().contains(f)
+        })
     }
+}
+
+/// Builds an entity-name component from its on-the-wire MacRoman bytes.
+fn name_from_wire(bytes: &[u8]) -> Result<NbpName, NbpError> {
+    NbpName::from_wire(bytes).ok_or(NbpError::NameTooLong)
 }
 
 #[cfg(test)]
@@ -351,9 +381,9 @@ mod tests {
 
         let entity: EntityName = example_name.try_into().expect("failed to parse");
 
-        assert_eq!(entity.object, "Judy");
-        assert_eq!(entity.entity_type, "Mailbox");
-        assert_eq!(entity.zone, "Bandley3");
+        assert_eq!(entity.object.as_wire(), b"Judy");
+        assert_eq!(entity.entity_type.as_wire(), b"Mailbox");
+        assert_eq!(entity.zone.as_wire(), b"Bandley3");
     }
 
     #[test]
