@@ -534,3 +534,166 @@ async fn test_adsp_stylewriter_name_change() {
         .expect("server task timed out")
         .expect("server task panicked");
 }
+
+// ── Inbound attention delivery ────────────────────────────────────────────────
+//
+// The InkTalk adapter emulation is the receiving side of the StyleWriter
+// attention protocol (print request 0x000b, status 0x0010, buffer-ready
+// 0x0006, ...), so attention messages must reach the application rather than
+// only being acked by the actor.
+
+#[tokio::test]
+async fn test_adsp_attention_receive() {
+    let _ = tracing_subscriber::fmt().try_init();
+
+    let hub = TestHub::new();
+    let (hub_in_tx, hub_in_rx) = mpsc::channel(100);
+    let hub_ref = Arc::new(hub);
+    let hub_runner = hub_ref.clone();
+    let hub_task = tokio::spawn(async move {
+        hub_runner.run(hub_in_rx).await;
+    });
+
+    let client_a =
+        TestClient::new([0x00, 0x01, 0x02, 0x03, 0x04, 0x15], hub_in_tx.clone(), hub_ref.subscribe())
+            .await;
+    let client_b =
+        TestClient::new([0x00, 0x01, 0x02, 0x03, 0x04, 0x16], hub_in_tx.clone(), hub_ref.subscribe())
+            .await;
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let addr_a = client_a.addressing.addr().await.expect("failed to get addr");
+
+    let (socket_a, mut listener) = Adsp::bind(&client_a.ddp, Some(110))
+        .await
+        .expect("failed to bind listener");
+
+    let accept_task = tokio::spawn(async move { listener.accept().await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut stream_b = Adsp::connect(&client_b.ddp, AdspAddress {
+        network_number: addr_a.network_number,
+        node_number: addr_a.node_number,
+        socket_number: socket_a,
+    })
+    .await
+    .expect("failed to connect");
+
+    let mut stream_a = accept_task
+        .await
+        .expect("accept task failed")
+        .expect("failed to accept");
+
+    // A print request (0x000b) carries the client's data socket and username.
+    let mut print_request = vec![0u8; 70];
+    print_request[3] = 0x42;
+    print_request[4] = 4;
+    print_request[5..9].copy_from_slice(b"ruby");
+
+    stream_b
+        .send_attention(0x000b, &print_request)
+        .await
+        .expect("failed to send attention");
+
+    let (code, body) = tokio::time::timeout(Duration::from_secs(5), stream_a.attention())
+        .await
+        .expect("timed out waiting for attention")
+        .expect("attention channel closed");
+
+    assert_eq!(code, 0x000b, "attention code mismatch");
+    assert_eq!(body, print_request, "attention body mismatch");
+
+    // Data on the byte stream must stay separate from the attention queue.
+    stream_b.write_all(b"raster").await.expect("failed to write");
+    stream_b.flush().await.expect("failed to flush");
+
+    let mut buf = vec![0u8; 32];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream_a.read(&mut buf))
+        .await
+        .expect("timed out reading data")
+        .expect("failed to read");
+    assert_eq!(&buf[..n], b"raster", "attention leaked into the data stream");
+
+    // A second attention on the same connection uses the next sequence number;
+    // an off-by-one there would silently swallow every later message.
+    stream_b
+        .send_attention(0x0010, &[0x00, 0x00])
+        .await
+        .expect("failed to send second attention");
+
+    let (code2, body2) = tokio::time::timeout(Duration::from_secs(5), stream_a.attention())
+        .await
+        .expect("timed out waiting for second attention")
+        .expect("attention channel closed");
+    assert_eq!(code2, 0x0010);
+    assert_eq!(body2, vec![0x00, 0x00]);
+
+    // Two sends back to back: the spec allows only one attention outstanding at
+    // a time, so the second is queued until the first is acknowledged. Both
+    // must still arrive, in order, with neither lost to the interlock.
+    let send_both = async {
+        stream_b.send_attention(0x0011, &[0x01]).await?;
+        stream_b.send_attention(0x000e, &[0x02]).await?;
+        Ok::<_, std::io::Error>(())
+    };
+    tokio::time::timeout(Duration::from_secs(10), send_both)
+        .await
+        .expect("queued attention sends did not complete")
+        .expect("attention send failed");
+
+    let (q1, b1) = tokio::time::timeout(Duration::from_secs(5), stream_a.attention())
+        .await
+        .expect("timed out on the first queued attention")
+        .expect("attention channel closed");
+    let (q2, b2) = tokio::time::timeout(Duration::from_secs(5), stream_a.attention())
+        .await
+        .expect("timed out on the second queued attention")
+        .expect("attention channel closed");
+    assert_eq!((q1, b1), (0x0011, vec![0x01]));
+    assert_eq!((q2, b2), (0x000e, vec![0x02]), "queued attention arrived out of order");
+
+    // Nothing further should be queued: an attention ack must not be delivered
+    // to the application as if it were a message.
+    assert!(
+        stream_a.try_attention().is_none(),
+        "an attention acknowledgement was delivered as a message"
+    );
+
+    // The whole point of attention() taking &self: a single select! may await
+    // an attention message and a stream read at once. This is the shape a
+    // StyleWriter adapter needs, since a Mac interleaves both on one
+    // connection. If this stops compiling the API has regressed.
+    stream_b
+        .send_attention(0x0006, &[0x00])
+        .await
+        .expect("failed to send buffer-ready attention");
+
+    let mut select_buf = [0u8; 32];
+    let selected = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                read = stream_a.read_data(&mut select_buf) => {
+                    read.expect("read failed");
+                }
+                attn = stream_a.attention() => {
+                    break attn.expect("attention channel closed");
+                }
+            }
+        }
+    })
+    .await
+    .expect("timed out selecting over data and attention");
+
+    assert_eq!(selected.0, 0x0006, "select! delivered the wrong attention");
+
+    // Closing the peer must wake a blocked attention() rather than hang it.
+    stream_b.close().await.expect("failed to close stream B");
+    let closed = tokio::time::timeout(Duration::from_secs(5), stream_a.attention())
+        .await
+        .expect("attention() did not wake on close");
+    assert!(closed.is_none(), "expected None after the peer closed");
+
+    hub_task.abort();
+}
+
