@@ -852,6 +852,14 @@
       "version": 1
     },
     "net_format_name": "",
+    "ngspice": {
+      "fix_include_paths": true,
+      "meta": {
+        "version": 0
+      },
+      "model_mode": 4,
+      "workbook_filename": ""
+    },
     "page_layout_descr_file": "",
     "plot_directory": "",
     "reuse_designators": true,
@@ -871,7 +879,7 @@
         "uuid": "4a4a87b1-a8f1-4047-ae57-d70c75dbc629"
       }
     ],
-    "used_designators": "TX1,BOOTSEL1,SW1,X1,R1-20,L1,D1-7,C1-23,J1-4,#PWR1-43,P1,RX1,U1-5",
+    "used_designators": "X1,BOOTSEL1,TX1,V1,#PWR1-46,J1-4,C1-24,D1-7,U1-5,SW1,RX1,P1,L1,R1-22",
     "variants": []
   },
   "sheets": [
