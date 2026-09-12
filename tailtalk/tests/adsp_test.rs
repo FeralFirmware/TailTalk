@@ -444,6 +444,138 @@ async fn stylewriter_server(mut sock: tailtalk::ddp::DdpSocket) {
 
 // ── Test ──────────────────────────────────────────────────────────────────────
 
+/// Spin up a hub with two nodes and a raw DDP socket on the ADSP well-known
+/// socket, returning (client ddp, server socket, server address).
+async fn two_nodes(
+    server_mac: [u8; 6],
+    client_mac: [u8; 6],
+) -> (Arc<TestClient>, tailtalk::ddp::DdpSocket, AdspAddress) {
+    let hub = TestHub::new();
+    let (hub_in_tx, hub_in_rx) = mpsc::channel(100);
+    let hub_ref = Arc::new(hub);
+    let hub_clone = hub_ref.clone();
+    tokio::spawn(async move { hub_clone.run(hub_in_rx).await });
+
+    let server_node = TestClient::new(server_mac, hub_in_tx.clone(), hub_ref.subscribe()).await;
+    let client_node = TestClient::new(client_mac, hub_in_tx.clone(), hub_ref.subscribe()).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let server_at_addr = server_node.addressing.addr().await.expect("server addr");
+    let server_sock = server_node
+        .ddp
+        .new_sock(DdpProtocolType::Adsp, Some(129))
+        .await
+        .expect("bind server socket");
+
+    let remote = AdspAddress {
+        network_number: server_at_addr.network_number,
+        node_number: server_at_addr.node_number,
+        socket_number: 129,
+    };
+    // The server node must outlive the socket borrowed from it.
+    (Arc::new(client_node), server_sock, remote)
+}
+
+/// A lost OpenConnRequest is retried rather than hanging forever.
+///
+/// The retry lives in `tailtalk-core`, but it only fires if this crate's
+/// actor drives `poll` on the schedule `next_deadline` asks for. That wiring
+/// is what this checks.
+#[tokio::test]
+async fn test_adsp_retransmits_a_lost_open_request() {
+    let _ = tracing_subscriber::fmt().try_init();
+    let (client_node, mut server_sock, remote) = two_nodes(
+        [0x00, 0x00, 0xC5, 0x1C, 0x1F, 0x8C],
+        [0x00, 0x05, 0x02, 0x7C, 0x85, 0x95],
+    )
+    .await;
+
+    // Never answered, so every packet that arrives is a retry.
+    tokio::spawn(async move {
+        let _ = Adsp::connect(&client_node.ddp, remote).await;
+    });
+
+    let mut opens = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(2500);
+    while tokio::time::Instant::now() < deadline {
+        let left = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(left, server_sock.recv()).await {
+            Ok(Ok(pkt)) => {
+                let payload = pkt.payload.to_vec();
+                if payload.len() >= 13 && parse_adsp_hdr(&payload).4 == 0x81 {
+                    opens += 1;
+                    // One retry proves the timer fires; waiting out the rest
+                    // only makes the suite slower.
+                    if opens >= 2 {
+                        break;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        opens >= 2,
+        "OpenConnRequest must be retried when it goes unanswered, saw {opens} in 2.5s"
+    );
+}
+
+/// The advertised receive window reaches the wire.
+///
+/// It is a desktop-side setting layered on `tailtalk-core`, whose default is
+/// four times smaller. A missing `set_recv_window` call reads as working
+/// code and costs throughput silently, so assert the number a peer sees.
+#[tokio::test]
+async fn test_adsp_advertises_the_desktop_receive_window() {
+    let _ = tracing_subscriber::fmt().try_init();
+
+    let hub = TestHub::new();
+    let (hub_in_tx, hub_in_rx) = mpsc::channel(100);
+    let hub_ref = Arc::new(hub);
+    let hub_clone = hub_ref.clone();
+    tokio::spawn(async move { hub_clone.run(hub_in_rx).await });
+
+    let server_node =
+        TestClient::new([0x00, 0x00, 0xC5, 0x1C, 0x1F, 0x8B], hub_in_tx.clone(), hub_ref.subscribe())
+            .await;
+    let client_node =
+        TestClient::new([0x00, 0x05, 0x02, 0x7C, 0x85, 0x94], hub_in_tx.clone(), hub_ref.subscribe())
+            .await;
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let server_at_addr = server_node.addressing.addr().await.expect("server addr");
+
+    let mut server_sock = server_node
+        .ddp
+        .new_sock(DdpProtocolType::Adsp, Some(129))
+        .await
+        .expect("bind server socket");
+
+    let remote = AdspAddress {
+        network_number: server_at_addr.network_number,
+        node_number: server_at_addr.node_number,
+        socket_number: 129,
+    };
+
+    // Never answered: the OpenConnRequest alone carries the window.
+    tokio::spawn(async move {
+        let _ = Adsp::connect(&client_node.ddp, remote).await;
+    });
+
+    let (_client, payload) = tokio::time::timeout(
+        Duration::from_secs(5),
+        recv_until(&mut server_sock, 0x81),
+    )
+    .await
+    .expect("no OpenConnRequest arrived");
+
+    let (_, _, _, window, _) = parse_adsp_hdr(&payload);
+    assert_eq!(
+        window, 4096,
+        "desktop must ask for its own window, not tailtalk-core's embedded default"
+    );
+}
+
 #[tokio::test]
 async fn test_adsp_stylewriter_name_change() {
     let _ = tracing_subscriber::fmt().try_init();

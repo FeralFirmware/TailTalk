@@ -6705,6 +6705,7 @@ dependencies = [
  "pcap",
  "rand 0.10.2",
  "sled",
+ "tailtalk-core",
  "tailtalk-packets",
  "tailtalk-proto",
  "tashtalk",
@@ -6715,6 +6716,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "xattr",
+]
+
+[[package]]
+name = "tailtalk-core"
+version = "0.11.0"
+dependencies = [
+ "tailtalk-packets",
 ]
 
 [[package]]

@@ -1,0 +1,21 @@
+[package]
+name = "tailtalk-core"
+version.workspace = true
+edition = "2024"
+license-file = "../LICENSE"
+description = "Sans-io AppleTalk protocol state machines, shared by the desktop stack and embedded firmware"
+authors = ["FeralFirmware"]
+repository = "https://github.com/feralfirmware/tailtalk"
+
+[features]
+default = ["std"]
+# Host builds (tests, and anything linking the desktop crate) pull std in
+# through tailtalk-packets; the firmware builds without it.
+std = ["tailtalk-packets/std"]
+
+[dependencies]
+# Not inherited from the workspace: cargo forbids overriding an inherited
+# dependency's default-features, and this crate must be able to drop them.
+# Dropping them loses std (the firmware has none) and afp (a file-server
+# protocol with no place on a printer bridge).
+tailtalk-packets = { path = "../tailtalk-packets", version = "^0.11", default-features = false }

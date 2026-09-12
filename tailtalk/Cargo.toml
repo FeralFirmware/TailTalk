@@ -13,6 +13,7 @@ name = "tailtalk"
 path = "src/lib.rs"
 
 [dependencies]
+tailtalk-core = { workspace = true }
 anyhow = { workspace = true } #unified
 byteorder = { workspace = true } #unified
 bytes = { workspace = true } #unified
