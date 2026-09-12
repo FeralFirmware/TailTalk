@@ -25,6 +25,10 @@ const ADSP_MAX_CLIENT_ATTN_CODE: u16 = 0xEFFF;
 /// bounding it keeps a caller's `send_attention` from hanging forever on a
 /// peer that has silently gone away, and matches the data path's own cap.
 const ATTN_MAX_RETRIES: u8 = 5;
+
+/// Retransmissions of unacknowledged stream data before a connection is
+/// declared dead and torn down.
+const DATA_MAX_RETRIES: u8 = 5;
 const ADSP_RECV_WINDOW: u16 = 4096;
 
 /// ADSP network address
@@ -53,12 +57,6 @@ fn ddp_dest(addr: AdspAddress) -> DdpAddress {
         },
         addr.socket_number,
     )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConnectionState {
-    Open,
-    Closing,
 }
 
 /// One blocked `write_eom` / `write_all` + flush waiting for window space.
@@ -112,11 +110,21 @@ fn fail_pending_attentions(conn: &mut AdspConnection, reason: &str) {
     }
 }
 
+/// What the retransmit tick should do about one connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetransmitAction {
+    /// Nothing in flight, or not overdue yet.
+    Wait,
+    /// Overdue: resend the flight buffer. Carries the attempt number.
+    Resend(u8),
+    /// Out of retries: the connection has to go.
+    GiveUp,
+}
+
 struct AdspConnection {
     /// Our own ConnID — placed in every outgoing packet's connection_id field.
     /// The HashMap key is the peer's ConnID (what arrives in inbound packets).
     our_conn_id: u16,
-    state: ConnectionState,
     remote_addr: AdspAddress,
     send_seq: u32,
     oldest_unacked_seq: u32,
@@ -148,6 +156,54 @@ struct AdspConnection {
     pending_writes: std::collections::VecDeque<PendingWrite>,
     /// Deferred close: fires after all pending_writes have been sent.
     pending_close: Option<oneshot::Sender<io::Result<()>>>,
+}
+
+impl AdspConnection {
+    /// Decide what this connection needs from the retransmit tick,
+    /// recording the attempt.
+    ///
+    /// The counter saturates because it used to be a plain `+= 1` on a
+    /// `u8` that nothing reset once the give-up branch was reached - and
+    /// because that branch only set a flag, the tick re-entered it every
+    /// second until the counter wrapped and panicked the runtime.
+    fn retransmit_action(
+        &mut self,
+        now: std::time::Instant,
+        timeout: std::time::Duration,
+    ) -> RetransmitAction {
+        if self.flight_buffer.is_empty() || now.duration_since(self.last_tx) <= timeout {
+            return RetransmitAction::Wait;
+        }
+        self.retries = self.retries.saturating_add(1);
+        if self.retries > DATA_MAX_RETRIES {
+            RetransmitAction::GiveUp
+        } else {
+            RetransmitAction::Resend(self.retries)
+        }
+    }
+
+    /// Fail everything waiting on this connection and let its reader see
+    /// EOF. Used when we give up on a peer, as opposed to the peer closing
+    /// on us.
+    ///
+    /// Takes `self` by value: a torn-down connection must not be reachable
+    /// afterwards, and that is the type system's job rather than a caller's
+    /// discipline.
+    fn tear_down(mut self, why: &'static str) {
+        fail_pending_attentions(&mut self, why);
+        for pending in self.pending_writes.drain(..) {
+            let _ = pending
+                .reply
+                .send(Err(io::Error::new(io::ErrorKind::ConnectionAborted, why)));
+        }
+        if let Some(reply) = self.pending_close.take() {
+            let _ = reply.send(Ok(()));
+        }
+        // Dropping both senders unblocks a reader: data_tx gives AsyncRead
+        // its EOF, attn_tx makes a waiting attention() call return None.
+        drop(self.data_tx);
+        drop(self.attn_tx);
+    }
 }
 
 // ── Actor command channel ─────────────────────────────────────────────────────
@@ -272,7 +328,6 @@ impl Adsp {
         let (attn_tx, attn_rx) = mpsc::channel(8);
         self.connections.insert(map_key, AdspConnection {
             our_conn_id,
-            state: ConnectionState::Open,
             remote_addr,
             send_seq: 0,
             oldest_unacked_seq: 0,
@@ -380,28 +435,32 @@ impl Adsp {
                 }
             }
 
-            let Some(conn) = self.connections.get_mut(&conn_id) else { continue };
+            let action = {
+                let Some(conn) = self.connections.get_mut(&conn_id) else { continue };
+                conn.retransmit_action(now, timeout)
+            };
 
-            if conn.flight_buffer.is_empty()
-                || now.duration_since(conn.last_tx) <= timeout
-            {
-                continue;
+            match action {
+                RetransmitAction::Wait => continue,
+                RetransmitAction::GiveUp => {
+                    tracing::error!(
+                        "ADSP conn {} unacknowledged after {} retransmits, closing",
+                        conn_id,
+                        DATA_MAX_RETRIES
+                    );
+                    // Marking the connection Closing only stopped new
+                    // writes: the flight buffer stayed full and `last_tx`
+                    // stayed old, so this branch was re-entered on every
+                    // tick forever, logging once a second. Tear the
+                    // connection down for real, as a CloseAdvice would.
+                    self.drop_connection(conn_id, "peer stopped acknowledging data");
+                    continue;
+                }
+                RetransmitAction::Resend(attempt) => {
+                    tracing::warn!("ADSP retransmit on conn {}, attempt {}", conn_id, attempt);
+                    self.resend_unacked(conn_id).await;
+                }
             }
-
-            conn.retries += 1;
-            if conn.retries > 5 {
-                tracing::error!("ADSP conn {} max retries reached, closing", conn_id);
-                conn.state = ConnectionState::Closing;
-                continue;
-            }
-
-            tracing::warn!(
-                "ADSP retransmit on conn {}, attempt {}",
-                conn_id,
-                conn.retries
-            );
-
-            self.resend_unacked(conn_id).await;
         }
     }
 
@@ -657,18 +716,58 @@ impl Adsp {
         packet: AdspPacket,
     ) {
         let client_conn_id = packet.connection_id;
-        let our_conn_id: u16 = rand::random();
         let remote_addr = AdspAddress {
             network_number: ddp.src_network_num,
             node_number: ddp.src_node_id,
             socket_number: ddp.src_sock_num,
         };
 
+        // A peer whose OpenConnRequest went unanswered retransmits it, and
+        // the retransmission is indistinguishable from the original except
+        // that we have already opened the connection it names. Minting a
+        // fresh ConnID and a second connection for it is actively harmful:
+        // both sides key connections by the peer's ConnID, so the requester
+        // records the ConnID from whichever OpenConnReqAck reaches it first
+        // while we go on sending under the second, and every packet after
+        // the handshake is dropped by one side or the other. The connection
+        // opens and then silently carries nothing.
+        //
+        // So re-acknowledge the existing connection with its original
+        // ConnID and leave it otherwise untouched - no new stream, and
+        // nothing handed to `accept` a second time.
+        if let Some(existing) = self.connections.get(&client_conn_id) {
+            let our_conn_id = existing.our_conn_id;
+            tracing::debug!(
+                "ADSP re-acking retransmitted open for conn {} from {:?}",
+                client_conn_id,
+                remote_addr
+            );
+            self.send_open_req_ack(our_conn_id, client_conn_id, remote_addr).await;
+            return;
+        }
+
+        let our_conn_id: u16 = rand::random();
+
         tracing::info!("ADSP accepting conn {} from {:?}", client_conn_id, remote_addr);
 
         let stream = self.open_connection(client_conn_id, our_conn_id, remote_addr, packet.recv_window);
 
-        // OpenConnReqAck carries 8-byte open-conn params (spec §12, Figure 12-11).
+        self.send_open_req_ack(our_conn_id, client_conn_id, remote_addr).await;
+
+        if let Some(tx) = &self.accept_tx {
+            let _ = tx.send(stream).await;
+        }
+    }
+
+    /// Send an OpenConnReqAck, which carries the 8-byte open-conn params
+    /// (spec §12, Figure 12-11): version, then the requester's ConnID
+    /// echoed back so it can match the reply to its pending open.
+    async fn send_open_req_ack(
+        &self,
+        our_conn_id: u16,
+        client_conn_id: u16,
+        remote_addr: AdspAddress,
+    ) {
         let ack = AdspPacket {
             descriptor: AdspDescriptor::OpenConnReqAck,
             connection_id: our_conn_id,
@@ -682,10 +781,6 @@ impl Adsp {
             byteorder::BigEndian::write_u16(&mut buf[AdspPacket::HEADER_LEN..], 0x0100);
             byteorder::BigEndian::write_u16(&mut buf[AdspPacket::HEADER_LEN + 2..], client_conn_id);
             let _ = self.sock.send_to(&buf, ddp_dest(remote_addr)).await;
-        }
-
-        if let Some(tx) = &self.accept_tx {
-            let _ = tx.send(stream).await;
         }
     }
 
@@ -828,6 +923,15 @@ impl Adsp {
         self.drain_pending(conn_id).await;
     }
 
+    /// Tear a connection down locally: drop it from the map, fail anything
+    /// waiting on it, and let its reader see EOF. Used when we give up on a
+    /// peer, as opposed to the peer closing on us.
+    fn drop_connection(&mut self, conn_id: u16, why: &'static str) {
+        if let Some(conn) = self.connections.remove(&conn_id) {
+            conn.tear_down(why);
+        }
+    }
+
     async fn handle_close(&mut self, packet: AdspPacket) {
         if let Some(mut conn) = self.connections.remove(&packet.connection_id) {
             tracing::info!("ADSP conn {} closed by peer", packet.connection_id);
@@ -877,11 +981,6 @@ impl Adsp {
             let _ = reply.send(Err(io::Error::new(io::ErrorKind::NotConnected, "no such connection")));
             return;
         };
-
-        if conn.state != ConnectionState::Open {
-            let _ = reply.send(Err(io::Error::new(io::ErrorKind::NotConnected, "connection closing")));
-            return;
-        }
 
         // If earlier writes are still queued, preserve order by appending.
         if !conn.pending_writes.is_empty() {
@@ -1617,6 +1716,149 @@ mod tests {
             pending_flush: None,
         };
         (stream, data_tx)
+    }
+
+    /// A connection with unacknowledged data and a stale `last_tx`, so the
+    /// retransmit tick considers it overdue. Returns the reader, a waiter
+    /// blocked on a write, and a waiter blocked on an attention, so a
+    /// teardown has something to fail.
+    #[allow(clippy::type_complexity)]
+    fn stalled_connection() -> (
+        AdspConnection,
+        mpsc::Receiver<Vec<u8>>,
+        oneshot::Receiver<io::Result<()>>,
+        oneshot::Receiver<io::Result<()>>,
+    ) {
+        let (data_tx, data_rx) = mpsc::channel(8);
+        let (attn_tx, _attn_rx) = mpsc::channel(8);
+        let (write_reply, write_waiter) = oneshot::channel();
+        let (attn_reply, attn_waiter) = oneshot::channel();
+
+        let mut pending_writes = std::collections::VecDeque::new();
+        pending_writes.push_back(PendingWrite {
+            data: b"queued".to_vec(),
+            offset: 0,
+            eom: false,
+            reply: write_reply,
+        });
+
+        let conn = AdspConnection {
+            our_conn_id: 7,
+            remote_addr: AdspAddress { network_number: 1, node_number: 2, socket_number: 3 },
+            send_seq: 4,
+            oldest_unacked_seq: 0,
+            recv_seq: 0,
+            send_window: 1024,
+            flight_buffer: b"data".to_vec(),
+            last_tx: std::time::Instant::now() - std::time::Duration::from_secs(60),
+            retries: 0,
+            attn_send_seq: 0,
+            attn_in_flight: Some(AttnInFlight {
+                seq: 0,
+                code: 0x0006,
+                data: Vec::new(),
+                sent_at: std::time::Instant::now(),
+                retries: 0,
+                reply: Some(attn_reply),
+                queued: std::collections::VecDeque::new(),
+            }),
+            attn_recv_seq: 0,
+            data_tx,
+            attn_tx,
+            pending_writes,
+            pending_close: None,
+        };
+        (conn, data_rx, write_waiter, attn_waiter)
+    }
+
+    /// Giving up on an unresponsive peer has to actually tear the
+    /// connection down, not just flag it.
+    ///
+    /// It used to only set a `Closing` flag that nothing acted on, leaving
+    /// the flight buffer full and `last_tx` stale, so the retransmit tick
+    /// re-entered the give-up branch every second: an endless error log,
+    /// and after 250 more ticks `retries: u8` overflowed and panicked the
+    /// runtime. Observed on real hardware as exactly that.
+    #[test]
+    fn giving_up_on_a_peer_tears_the_connection_down() {
+        let (conn, mut data_rx, mut write_waiter, mut attn_waiter) = stalled_connection();
+        let mut conns: HashMap<u16, AdspConnection> = HashMap::new();
+        conns.insert(9, conn);
+
+        // `tear_down` consumes the connection, so "it must not survive"
+        // is enforced by the type system rather than asserted here.
+        conns.remove(&9).expect("present").tear_down("peer stopped acknowledging data");
+
+        assert!(
+            matches!(data_rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)),
+            "reader must see EOF"
+        );
+        let write_err = write_waiter
+            .try_recv()
+            .expect("blocked write must be answered")
+            .expect_err("and answered with an error");
+        assert_eq!(write_err.kind(), io::ErrorKind::ConnectionAborted);
+        let attn_err = attn_waiter
+            .try_recv()
+            .expect("blocked attention must be answered")
+            .expect_err("and answered with an error");
+        assert_eq!(attn_err.kind(), io::ErrorKind::NotConnected);
+    }
+
+    /// The tick retransmits up to the limit and then gives up exactly once.
+    #[test]
+    fn retransmits_are_bounded_then_the_connection_is_given_up() {
+        let (mut conn, _rx, _w, _a) = stalled_connection();
+        let now = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(1);
+
+        for attempt in 1..=DATA_MAX_RETRIES {
+            assert_eq!(
+                conn.retransmit_action(now, timeout),
+                RetransmitAction::Resend(attempt),
+            );
+        }
+        assert_eq!(
+            conn.retransmit_action(now, timeout),
+            RetransmitAction::GiveUp,
+        );
+    }
+
+    /// A connection with nothing in flight, or one whose last send is still
+    /// recent, must not be counted as a retry - otherwise an idle
+    /// connection would march toward the give-up branch on its own.
+    #[test]
+    fn nothing_overdue_is_not_a_retry() {
+        let now = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(1);
+
+        let (mut idle, _rx, _w, _a) = stalled_connection();
+        idle.flight_buffer.clear();
+        assert_eq!(idle.retransmit_action(now, timeout), RetransmitAction::Wait);
+        assert_eq!(idle.retries, 0, "an idle connection must not accrue retries");
+
+        let (mut fresh, _rx2, _w2, _a2) = stalled_connection();
+        fresh.last_tx = now;
+        assert_eq!(fresh.retransmit_action(now, timeout), RetransmitAction::Wait);
+        assert_eq!(fresh.retries, 0);
+    }
+
+    /// The counter must not be able to wrap even if the give-up branch is
+    /// somehow re-entered, which is how the original overflow panicked.
+    #[test]
+    fn the_retry_counter_cannot_wrap() {
+        let (mut conn, _rx, _w, _a) = stalled_connection();
+        let now = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(1);
+
+        conn.retries = u8::MAX - 1;
+        for _ in 0..4 {
+            assert_eq!(
+                conn.retransmit_action(now, timeout),
+                RetransmitAction::GiveUp,
+            );
+        }
+        assert_eq!(conn.retries, u8::MAX);
     }
 
     /// A read whose buffer is smaller than the arriving chunk must keep the
