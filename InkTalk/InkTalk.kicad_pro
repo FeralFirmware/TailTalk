@@ -879,7 +879,7 @@
         "uuid": "4a4a87b1-a8f1-4047-ae57-d70c75dbc629"
       }
     ],
-    "used_designators": "X1,BOOTSEL1,TX1,V1,#PWR1-46,J1-4,C1-24,D1-7,U1-5,SW1,RX1,P1,L1,R1-22",
+    "used_designators": "R1-23,X1,BOOTSEL1,TX1,V1,#PWR1-46,J1-4,C1-24,D1-7,U1-5,SW1,RX1,L1,P1",
     "variants": []
   },
   "sheets": [
