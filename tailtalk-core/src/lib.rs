@@ -31,6 +31,7 @@ pub mod atp;
 pub mod ddp;
 pub mod link;
 pub mod nbp;
+pub mod pap;
 pub mod rtmp;
 pub mod stack;
 pub mod stylewriter;
