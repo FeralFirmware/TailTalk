@@ -24,8 +24,15 @@
 
 extern crate alloc;
 
+pub mod addressing;
 pub mod adsp;
+pub mod aep;
 pub mod atp;
+pub mod ddp;
+pub mod link;
+pub mod nbp;
+pub mod rtmp;
+pub mod stack;
 
 /// Monotonic time in microseconds, supplied by the caller on every input.
 /// The zero point is arbitrary; only differences are used.
