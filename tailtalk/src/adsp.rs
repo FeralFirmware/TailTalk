@@ -1,5 +1,4 @@
 use crate::ddp::{DdpAddress, DdpHandle, DdpSocket};
-use byteorder::ByteOrder;
 use bytes::{Buf, BytesMut};
 use std::collections::HashMap;
 use std::future::Future;
@@ -7,29 +6,18 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tailtalk_packets::{
-    adsp::{AdspDescriptor, AdspPacket},
     ddp::DdpProtocolType,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tailtalk_core::Micros;
+use tailtalk_core::adsp::{AdspEndpoint, AdspEvent};
+
+/// Advertised receive window. `tailtalk-core`'s default is deliberately
+/// small; a desktop has memory to spare and asks for more.
+const ADSP_RECV_WINDOW: u16 = 4096;
 use tokio::sync::{mpsc, oneshot};
 
-const ADSP_MAX_DATA: usize = 572;
-/// Largest client attention payload, excluding the 2-byte code (spec §12).
-const ADSP_MAX_ATTN_DATA: usize = 570;
-/// Highest attention code available to clients; $F000 and above are reserved
-/// for future expansion of ADSP itself (spec §12).
-const ADSP_MAX_CLIENT_ATTN_CODE: u16 = 0xEFFF;
-/// Attention retransmissions before the send is failed.
-///
-/// The spec retransmits until acknowledged or the connection is torn down;
-/// bounding it keeps a caller's `send_attention` from hanging forever on a
-/// peer that has silently gone away, and matches the data path's own cap.
-const ATTN_MAX_RETRIES: u8 = 5;
 
-/// Retransmissions of unacknowledged stream data before a connection is
-/// declared dead and torn down.
-const DATA_MAX_RETRIES: u8 = 5;
-const ADSP_RECV_WINDOW: u16 = 4096;
 
 /// ADSP network address
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,6 +37,14 @@ impl From<tailtalk_packets::nbp::ServiceAddress> for AdspAddress {
     }
 }
 
+fn service_addr(addr: AdspAddress) -> tailtalk_packets::nbp::ServiceAddress {
+    tailtalk_packets::nbp::ServiceAddress {
+        network_number: addr.network_number,
+        node_number: addr.node_number,
+        socket_number: addr.socket_number,
+    }
+}
+
 fn ddp_dest(addr: AdspAddress) -> DdpAddress {
     DdpAddress::new(
         tailtalk_packets::aarp::AppleTalkAddress {
@@ -59,150 +55,40 @@ fn ddp_dest(addr: AdspAddress) -> DdpAddress {
     )
 }
 
-/// One blocked `write_eom` / `write_all` + flush waiting for window space.
-struct PendingWrite {
-    data: Vec<u8>,
-    /// Bytes of `data` already transmitted.
-    offset: usize,
-    eom: bool,
-    reply: oneshot::Sender<io::Result<()>>,
-}
-
-/// An attention message sent but not yet acknowledged.
+/// The host-side half of one connection: the channels feeding its
+/// [`AdspStream`], and the callers waiting on operations the state machine
+/// has not finished yet.
 ///
-/// Spec §12: "When sending an attention message, the end starts a timer. If
-/// the timer expires, the end retransmits the attention message and restarts
-/// the timer", continuing "until it receives the appropriate attention-message
-/// acknowledgment or until the connection is torn down". The payload is kept
-/// so the retransmit tick can resend it verbatim.
-struct AttnInFlight {
-    /// Sequence number this message was sent with (its PktAttnSendSeq).
-    seq: u32,
-    code: u16,
-    data: Vec<u8>,
-    sent_at: std::time::Instant,
-    retries: u8,
-    /// Completes the caller's `send_attention` once the peer acknowledges.
-    reply: Option<oneshot::Sender<io::Result<()>>>,
-    /// Sends queued behind this one, oldest first.
-    queued: std::collections::VecDeque<QueuedAttn>,
-}
-
-/// An attention message waiting for the in-flight one to be acknowledged.
-struct QueuedAttn {
-    code: u16,
-    data: Vec<u8>,
-    reply: oneshot::Sender<io::Result<()>>,
-}
-
-/// Fail the connection's in-flight attention and everything queued behind it.
-///
-/// Called when a connection goes away: those callers are waiting on an
-/// acknowledgement that can no longer arrive.
-fn fail_pending_attentions(conn: &mut AdspConnection, reason: &str) {
-    let Some(mut in_flight) = conn.attn_in_flight.take() else { return };
-    let err = || io::Error::new(io::ErrorKind::NotConnected, reason.to_string());
-    if let Some(reply) = in_flight.reply.take() {
-        let _ = reply.send(Err(err()));
-    }
-    for queued in in_flight.queued.drain(..) {
-        let _ = queued.reply.send(Err(err()));
-    }
-}
-
-/// What the retransmit tick should do about one connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetransmitAction {
-    /// Nothing in flight, or not overdue yet.
-    Wait,
-    /// Overdue: resend the flight buffer. Carries the attempt number.
-    Resend(u8),
-    /// Out of retries: the connection has to go.
-    GiveUp,
-}
-
-struct AdspConnection {
-    /// Our own ConnID — placed in every outgoing packet's connection_id field.
-    /// The HashMap key is the peer's ConnID (what arrives in inbound packets).
-    our_conn_id: u16,
-    remote_addr: AdspAddress,
-    send_seq: u32,
-    oldest_unacked_seq: u32,
-    recv_seq: u32,
-    send_window: u16,
-    /// Bytes sent but not yet ACKed by the peer.
-    flight_buffer: Vec<u8>,
-    last_tx: std::time::Instant,
-    retries: u8,
-    /// Sequence number of the next attention message to send.
-    attn_send_seq: u32,
-    /// The attention message awaiting acknowledgement, if any.
-    ///
-    /// The spec allows only one outstanding at a time, so this doubles as the
-    /// interlock: while it is `Some`, a further send must wait.
-    attn_in_flight: Option<AttnInFlight>,
-    /// Sequence number expected on the next inbound attention message.
-    ///
-    /// Attention messages carry their own sequence space, independent of the
-    /// data stream's. Peers retransmit an unacked attention on their own
-    /// timer, so without this the same message would be delivered twice and
-    /// desynchronise request/reply pairing.
-    attn_recv_seq: u32,
-    /// Delivers received attention messages to the AdspStream reader.
-    attn_tx: mpsc::Sender<(u16, Vec<u8>)>,
-    /// Delivers received data to the AdspStream reader.
+/// Everything protocol-shaped - sequence numbers, windows, flight buffers,
+/// retransmission - lives in [`AdspEndpoint`] and is shared with the
+/// embedded firmware. What is left here is strictly the tokio adaptation.
+struct StreamPlumbing {
     data_tx: mpsc::Sender<Vec<u8>>,
-    /// Writes blocked on the peer's receive window.
-    pending_writes: std::collections::VecDeque<PendingWrite>,
-    /// Deferred close: fires after all pending_writes have been sent.
-    pending_close: Option<oneshot::Sender<io::Result<()>>>,
+    attn_tx: mpsc::Sender<(u16, Vec<u8>)>,
+    /// Writes handed to the endpoint, oldest first. Each caller's flush
+    /// completes when the endpoint reports that write fully cut into
+    /// packets, which is when the peer's window has admitted every byte.
+    writes: std::collections::VecDeque<(u64, oneshot::Sender<io::Result<()>>)>,
+    /// ADSP permits one attention in flight per connection (spec 12), and
+    /// the endpoint enforces that. This crate's API queues rather than
+    /// rejects, so the queue lives here.
+    attn_inflight: Option<oneshot::Sender<io::Result<()>>>,
+    attn_queue: std::collections::VecDeque<(u16, Vec<u8>, oneshot::Sender<io::Result<()>>)>,
 }
 
-impl AdspConnection {
-    /// Decide what this connection needs from the retransmit tick,
-    /// recording the attempt.
-    ///
-    /// The counter saturates because it used to be a plain `+= 1` on a
-    /// `u8` that nothing reset once the give-up branch was reached - and
-    /// because that branch only set a flag, the tick re-entered it every
-    /// second until the counter wrapped and panicked the runtime.
-    fn retransmit_action(
-        &mut self,
-        now: std::time::Instant,
-        timeout: std::time::Duration,
-    ) -> RetransmitAction {
-        if self.flight_buffer.is_empty() || now.duration_since(self.last_tx) <= timeout {
-            return RetransmitAction::Wait;
+impl StreamPlumbing {
+    /// Fail every caller still waiting on this connection. Dropping the
+    /// senders afterwards is what gives a blocked reader its EOF.
+    fn fail_all(&mut self, why: &'static str) {
+        for (_, reply) in self.writes.drain(..) {
+            let _ = reply.send(Err(io::Error::new(io::ErrorKind::ConnectionAborted, why)));
         }
-        self.retries = self.retries.saturating_add(1);
-        if self.retries > DATA_MAX_RETRIES {
-            RetransmitAction::GiveUp
-        } else {
-            RetransmitAction::Resend(self.retries)
+        if let Some(reply) = self.attn_inflight.take() {
+            let _ = reply.send(Err(io::Error::new(io::ErrorKind::NotConnected, why)));
         }
-    }
-
-    /// Fail everything waiting on this connection and let its reader see
-    /// EOF. Used when we give up on a peer, as opposed to the peer closing
-    /// on us.
-    ///
-    /// Takes `self` by value: a torn-down connection must not be reachable
-    /// afterwards, and that is the type system's job rather than a caller's
-    /// discipline.
-    fn tear_down(mut self, why: &'static str) {
-        fail_pending_attentions(&mut self, why);
-        for pending in self.pending_writes.drain(..) {
-            let _ = pending
-                .reply
-                .send(Err(io::Error::new(io::ErrorKind::ConnectionAborted, why)));
+        for (_, _, reply) in self.attn_queue.drain(..) {
+            let _ = reply.send(Err(io::Error::new(io::ErrorKind::NotConnected, why)));
         }
-        if let Some(reply) = self.pending_close.take() {
-            let _ = reply.send(Ok(()));
-        }
-        // Dropping both senders unblocks a reader: data_tx gives AsyncRead
-        // its EOF, attn_tx makes a waiting attention() call return None.
-        drop(self.data_tx);
-        drop(self.attn_tx);
     }
 }
 
@@ -235,12 +121,25 @@ enum ActorCmd {
 
 pub struct Adsp {
     sock: DdpSocket,
-    connections: HashMap<u16, AdspConnection>,
+    /// The protocol state machine, shared with the embedded firmware.
+    endpoint: AdspEndpoint,
+    /// Per-connection host plumbing, keyed the same way the endpoint keys
+    /// connections (by the peer's ConnID).
+    streams: HashMap<u16, StreamPlumbing>,
     accept_tx: Option<mpsc::Sender<AdspStream>>,
+    /// Outbound connects awaiting their `Opened`, keyed by the handle
+    /// [`AdspEndpoint::connect`] returned.
     pending_opens: HashMap<u16, oneshot::Sender<io::Result<AdspStream>>>,
+    /// Outbound connect handle -> the key its connection currently has. The
+    /// endpoint re-keys a connection if a peer answers a retransmitted open
+    /// with a second ConnID and then uses it; this is how the plumbing
+    /// follows it.
+    outbound_key: HashMap<u16, u16>,
     cmd_rx: mpsc::Receiver<ActorCmd>,
     /// Cloned into each AdspStream so they can send commands back.
     cmd_tx: mpsc::Sender<ActorCmd>,
+    /// The endpoint takes monotonic microseconds; this is their zero point.
+    epoch: std::time::Instant,
 }
 
 impl Adsp {
@@ -253,13 +152,20 @@ impl Adsp {
         let (accept_tx, accept_rx) = mpsc::channel(10);
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
 
+        let mut endpoint = AdspEndpoint::new(actual_socket, rand::random());
+        endpoint.set_recv_window(ADSP_RECV_WINDOW);
+        endpoint.set_listening(true);
+
         let adsp = Adsp {
             sock,
-            connections: HashMap::new(),
+            endpoint,
+            streams: HashMap::new(),
             accept_tx: Some(accept_tx),
             pending_opens: HashMap::new(),
+            outbound_key: HashMap::new(),
             cmd_rx,
             cmd_tx,
+            epoch: std::time::Instant::now(),
         };
 
         tokio::spawn(async move { adsp.run().await });
@@ -272,26 +178,38 @@ impl Adsp {
             .new_sock(DdpProtocolType::Adsp, None)
             .await
             .map_err(io::Error::other)?;
+        let local_socket = sock.socket_num();
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (ready_tx, ready_rx) = oneshot::channel();
-        let conn_id: u16 = rand::random();
+
+        let mut endpoint = AdspEndpoint::new(local_socket, rand::random());
+        endpoint.set_recv_window(ADSP_RECV_WINDOW);
 
         let mut adsp = Adsp {
             sock,
-            connections: HashMap::new(),
+            endpoint,
+            streams: HashMap::new(),
             accept_tx: None,
-            pending_opens: [(conn_id, ready_tx)].into(),
+            pending_opens: HashMap::new(),
+            outbound_key: HashMap::new(),
             cmd_rx,
             cmd_tx,
+            epoch: std::time::Instant::now(),
         };
 
-        adsp.send_open_request(conn_id, remote_addr).await;
+        let now = adsp.now();
+        let handle = adsp.endpoint.connect(service_addr(remote_addr), now);
+        adsp.pending_opens.insert(handle, ready_tx);
         tokio::spawn(async move { adsp.run().await });
 
         ready_rx.await.map_err(io::Error::other)?
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn now(&self) -> Micros {
+        self.epoch.elapsed().as_micros() as Micros
+    }
 
     fn make_stream(
         &self,
@@ -314,50 +232,45 @@ impl Adsp {
         }
     }
 
-    // Connections are always keyed by the peer's ConnID: that is the value carried in the
-    // connection_id field of every inbound packet, so it is what we must dispatch on.
-    // `our_conn_id` (placed in every outbound packet) is stored separately per connection.
-    fn open_connection(
-        &mut self,
-        map_key: u16,
-        our_conn_id: u16,
-        remote_addr: AdspAddress,
-        peer_window: u16,
-    ) -> AdspStream {
+    /// Build the host plumbing for a newly opened connection and hand back
+    /// the stream its owner will hold.
+    fn attach_stream(&mut self, conn: u16, remote: AdspAddress) -> AdspStream {
         let (data_tx, data_rx) = mpsc::channel(32);
         let (attn_tx, attn_rx) = mpsc::channel(8);
-        self.connections.insert(map_key, AdspConnection {
-            our_conn_id,
-            remote_addr,
-            send_seq: 0,
-            oldest_unacked_seq: 0,
-            recv_seq: 0,
-            send_window: peer_window,
-            flight_buffer: Vec::new(),
-            last_tx: std::time::Instant::now(),
-            retries: 0,
-            attn_send_seq: 0,
-            attn_in_flight: None,
-            attn_recv_seq: 0,
-            attn_tx,
+        self.streams.insert(conn, StreamPlumbing {
             data_tx,
-            pending_writes: std::collections::VecDeque::new(),
-            pending_close: None,
+            attn_tx,
+            writes: std::collections::VecDeque::new(),
+            attn_inflight: None,
+            attn_queue: std::collections::VecDeque::new(),
         });
-        self.make_stream(map_key, remote_addr, data_rx, attn_rx)
+        self.make_stream(conn, remote, data_rx, attn_rx)
     }
 
     // ── Event loop ────────────────────────────────────────────────────────────
 
     async fn run(mut self) {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Flush anything queued before the loop started - `connect` puts an
+        // open request in the endpoint's outbox.
+        self.pump().await;
 
         loop {
+            let wait = self.endpoint.next_deadline().map(|deadline| {
+                std::time::Duration::from_micros(deadline.saturating_sub(self.now()))
+            });
+
             tokio::select! {
                 pkt = self.sock.recv() => {
                     match pkt {
-                        Ok(mut p) => self.handle_packet(p.headers, &mut p.payload).await,
+                        Ok(p) => {
+                            let src = tailtalk_packets::nbp::ServiceAddress {
+                                network_number: p.headers.src_network_num,
+                                node_number: p.headers.src_node_id,
+                                socket_number: p.headers.src_sock_num,
+                            };
+                            let now = self.now();
+                            self.endpoint.handle_datagram(src, &p.payload, now);
+                        }
                         Err(e) => {
                             tracing::error!("ADSP socket error: {e}");
                             break;
@@ -366,978 +279,209 @@ impl Adsp {
                 }
                 cmd = self.cmd_rx.recv() => {
                     match cmd {
-                        Some(c) => self.handle_cmd(c).await,
+                        Some(c) => self.handle_cmd(c),
                         None => break,
                     }
                 }
-                _ = tick.tick() => {
-                    self.tick().await;
+                _ = async {
+                    match wait {
+                        Some(d) => tokio::time::sleep(d).await,
+                        // No deadline: park until one of the other branches
+                        // wakes us and recomputes it.
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let now = self.now();
+                    self.endpoint.poll(now);
                 }
             }
+
+            self.pump().await;
         }
     }
 
-    async fn handle_cmd(&mut self, cmd: ActorCmd) {
+    fn handle_cmd(&mut self, cmd: ActorCmd) {
         match cmd {
             ActorCmd::SendData { conn_id, data, eom, reply } => {
-                self.send_data(conn_id, data, eom, reply).await;
+                match self.endpoint.send(conn_id, &data, eom) {
+                    Ok(write_id) => {
+                        if let Some(plumbing) = self.streams.get_mut(&conn_id) {
+                            plumbing.writes.push_back((write_id, reply));
+                        }
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "connection is gone",
+                        )));
+                    }
+                }
             }
             ActorCmd::SendAttention { conn_id, code, data, reply } => {
-                // Completes the reply itself: an attention send resolves on
-                // the peer's acknowledgement, not on transmission.
-                self.send_attention_msg(conn_id, code, data, reply).await;
-            }
-            ActorCmd::Close { conn_id, reply } => {
-                self.close_or_defer(conn_id, reply).await;
-            }
-        }
-    }
-
-    // ── Retransmit tick ───────────────────────────────────────────────────────
-
-    async fn tick(&mut self) {
-        let now = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(3);
-
-        let conn_ids: Vec<u16> = self.connections.keys().copied().collect();
-        for conn_id in conn_ids {
-            // Attention retransmit (spec §12): resend on timer expiry and
-            // restart the timer, "until it receives the appropriate
-            // attention-message acknowledgment or until the connection is torn
-            // down". This runs on its own sequence space, so it is independent
-            // of the data-stream retransmit below.
-            if let Some(in_flight) = self
-                .connections
-                .get_mut(&conn_id)
-                .and_then(|c| c.attn_in_flight.as_mut())
-                && now.duration_since(in_flight.sent_at) > timeout
-            {
-                in_flight.retries += 1;
-                let retries = in_flight.retries;
-                if retries > ATTN_MAX_RETRIES {
-                    tracing::error!(
-                        "ADSP conn {} attention unacknowledged after {} attempts, failing it",
-                        conn_id,
-                        retries
-                    );
-                    let err = io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "attention message was never acknowledged",
-                    );
-                    self.complete_attention(conn_id, Err(err)).await;
-                } else {
-                    tracing::warn!(
-                        "ADSP attention retransmit on conn {}, attempt {}",
-                        conn_id,
-                        retries
-                    );
-                    self.transmit_attention(conn_id).await;
-                }
-            }
-
-            let action = {
-                let Some(conn) = self.connections.get_mut(&conn_id) else { continue };
-                conn.retransmit_action(now, timeout)
-            };
-
-            match action {
-                RetransmitAction::Wait => continue,
-                RetransmitAction::GiveUp => {
-                    tracing::error!(
-                        "ADSP conn {} unacknowledged after {} retransmits, closing",
-                        conn_id,
-                        DATA_MAX_RETRIES
-                    );
-                    // Marking the connection Closing only stopped new
-                    // writes: the flight buffer stayed full and `last_tx`
-                    // stayed old, so this branch was re-entered on every
-                    // tick forever, logging once a second. Tear the
-                    // connection down for real, as a CloseAdvice would.
-                    self.drop_connection(conn_id, "peer stopped acknowledging data");
-                    continue;
-                }
-                RetransmitAction::Resend(attempt) => {
-                    tracing::warn!("ADSP retransmit on conn {}, attempt {}", conn_id, attempt);
-                    self.resend_unacked(conn_id).await;
-                }
-            }
-        }
-    }
-
-    /// Resend everything in the flight buffer from `oldest_unacked_seq`.
-    /// Called from the retransmit tick and on peer RetransmitAdvice.
-    async fn resend_unacked(&mut self, conn_id: u16) {
-        let Some(conn) = self.connections.get_mut(&conn_id) else { return };
-        if conn.flight_buffer.is_empty() {
-            return;
-        }
-
-        let data: Vec<u8> = conn.flight_buffer.clone();
-        let remote_addr = conn.remote_addr;
-        let oldest_seq = conn.oldest_unacked_seq;
-        let recv_seq = conn.recv_seq;
-        let our_conn_id = conn.our_conn_id;
-
-        for (i, chunk) in data.chunks(ADSP_MAX_DATA).enumerate() {
-            let chunk_seq = oldest_seq.wrapping_add((i * ADSP_MAX_DATA) as u32);
-            let pkt = AdspPacket {
-                descriptor: AdspDescriptor::DataPacket,
-                connection_id: our_conn_id,
-                first_byte_seq: chunk_seq,
-                next_recv_seq: recv_seq,
-                recv_window: ADSP_RECV_WINDOW,
-                flags: AdspPacket::FLAG_ACK,
-            };
-            let mut buf = vec![0u8; AdspPacket::HEADER_LEN + chunk.len()];
-            if pkt.to_bytes(&mut buf).is_ok() {
-                buf[AdspPacket::HEADER_LEN..].copy_from_slice(chunk);
-                let _ = self.sock.send_to(&buf, ddp_dest(remote_addr)).await;
-            }
-        }
-
-        if let Some(c) = self.connections.get_mut(&conn_id) {
-            c.last_tx = std::time::Instant::now();
-        }
-    }
-
-    // ── Inbound packet dispatch ───────────────────────────────────────────────
-
-    async fn handle_packet(
-        &mut self,
-        ddp: tailtalk_packets::ddp::DdpPacket,
-        payload: &mut [u8],
-    ) {
-        let packet = match AdspPacket::parse(payload) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("Failed to parse ADSP packet: {:?}", e);
-                return;
-            }
-        };
-
-        tracing::debug!(
-            "ADSP {:?} conn={} from {}.{}",
-            packet.descriptor,
-            packet.connection_id,
-            ddp.src_network_num,
-            ddp.src_node_id,
-        );
-
-        if packet.flags & AdspPacket::FLAG_ATTENTION != 0 {
-            self.handle_attention(packet, &payload[AdspPacket::HEADER_LEN..]).await;
-            return;
-        }
-
-        match packet.descriptor {
-            AdspDescriptor::OpenConnRequest => {
-                self.handle_open_request(ddp, packet).await;
-            }
-            AdspDescriptor::OpenConnAck | AdspDescriptor::OpenConnReqAck => {
-                self.handle_open_ack(ddp, packet, payload).await;
-            }
-            // DataPacket (bit7=0): data from peer. ControlPacket (0x80): probe/ack, may carry data.
-            AdspDescriptor::DataPacket | AdspDescriptor::ControlPacket => {
-                self.handle_data(packet, &payload[AdspPacket::HEADER_LEN..]).await;
-            }
-            AdspDescriptor::RetransmitAdvice => {
-                // Peer is missing data from packet.next_recv_seq onward:
-                // apply the ack state (which rolls oldest_unacked back to
-                // exactly what the peer has), then resend immediately
-                // instead of waiting for the retransmit tick.
-                let conn_id = packet.connection_id;
-                self.handle_ack(packet).await;
-                self.resend_unacked(conn_id).await;
-            }
-            AdspDescriptor::CloseAdvice => {
-                self.handle_close(packet).await;
-            }
-            _ => {
-                tracing::debug!("Unhandled ADSP descriptor: {:?}", packet.descriptor);
-            }
-        }
-    }
-
-    /// Handle an inbound packet carrying the Attention flag.
-    ///
-    /// Two distinct packets share that flag. An attention *message* is a data
-    /// packet whose payload is a 2-byte code plus the message body; an
-    /// attention *acknowledgement* is a control packet the peer sends back to
-    /// retire one we transmitted. Both must be recognised: acking an ack
-    /// would bounce a packet back to a peer that acks it in turn, and
-    /// delivering an ack as a message would hand callers a phantom.
-    async fn handle_attention(&mut self, packet: AdspPacket, data: &[u8]) {
-        if packet.flags & AdspPacket::FLAG_CONTROL != 0 {
-            // Acknowledgement of an attention we sent.
-            //
-            // It must not touch data-stream flow control: attention packets
-            // carry PktAttnRecvWdw = 0 by spec, so feeding one to handle_ack
-            // would clobber the peer's real window and wedge every later write.
-            //
-            // The spec's rule for retiring the message (§12, "Attention
-            // messages"): "Before updating AttnSendSeq, end A must ensure that
-            // the value of PktAttnRecvSeq equals AttnSendSeq+1." Our
-            // attn_send_seq already points past the message in flight, so the
-            // ack we are waiting for names exactly that value.
-            let Some(conn) = self.connections.get(&packet.connection_id) else { return };
-            let Some(in_flight) = conn.attn_in_flight.as_ref() else { return };
-
-            // "Before updating AttnSendSeq, end A must ensure that the value of
-            // PktAttnRecvSeq equals AttnSendSeq+1" — the peer counts the
-            // message it just accepted, so the ack names one past the sequence
-            // we sent. Anything else is a stale or duplicate ack.
-            if packet.next_recv_seq != in_flight.seq.wrapping_add(1) {
-                tracing::debug!(
-                    "ADSP conn {} stale attention ack (got {}, expected {})",
-                    packet.connection_id,
-                    packet.next_recv_seq,
-                    in_flight.seq.wrapping_add(1)
-                );
-                return;
-            }
-
-            tracing::debug!(
-                "ADSP conn {} attention {} acknowledged",
-                packet.connection_id,
-                in_flight.seq
-            );
-            self.complete_attention(packet.connection_id, Ok(())).await;
-            return;
-        }
-
-        // Spec §12: "The Control code in the ADSP descriptor field of an ADSP
-        // Attention packet must always be set to 0. An Attention packet
-        // received with a Control code number other than 0 should be discarded
-        // as invalid." The parser maps any descriptor without the Control bit
-        // to DataPacket without inspecting the low nibble, so check it here.
-        if packet.descriptor as u8 & 0x0F != 0 {
-            tracing::warn!(
-                "ADSP conn {} attention with non-zero control code, discarding",
-                packet.connection_id
-            );
-            return;
-        }
-
-        if data.len() < 2 {
-            tracing::warn!(
-                "ADSP conn {} attention with {}-byte payload, need 2 for the code",
-                packet.connection_id,
-                data.len()
-            );
-            return;
-        }
-        let attention_code = byteorder::BigEndian::read_u16(&data[0..2]);
-        let body = &data[2..];
-
-        let Some(conn) = self.connections.get_mut(&packet.connection_id) else { return };
-        let remote_addr = conn.remote_addr;
-        let our_conn_id = conn.our_conn_id;
-
-        // Attention messages occupy their own sequence space, one per message.
-        // A peer that did not see our ack retransmits, so only deliver the
-        // message when it is the one we are expecting; the ack below is sent
-        // either way, since a duplicate means the previous ack was lost.
-        if packet.first_byte_seq == conn.attn_recv_seq {
-            match conn.attn_tx.try_send((attention_code, body.to_vec())) {
-                Ok(()) => {
-                    conn.attn_recv_seq = conn.attn_recv_seq.wrapping_add(1);
-                    tracing::info!(
-                        "ADSP attention 0x{:04X} ({} byte body) on conn {}",
-                        attention_code,
-                        body.len(),
-                        packet.connection_id
-                    );
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Withhold both the delivery and the sequence bump so the
-                    // peer's retransmission gets another chance, rather than
-                    // the message being lost. Withholding the ack too is what
-                    // prompts that retransmission.
-                    tracing::warn!(
-                        "ADSP conn {} attention queue full, deferring 0x{:04X}",
-                        packet.connection_id,
-                        attention_code
-                    );
+                let Some(plumbing) = self.streams.get_mut(&conn_id) else {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "connection is gone",
+                    )));
+                    return;
+                };
+                // One at a time on the wire; the rest wait their turn.
+                if plumbing.attn_inflight.is_some() {
+                    plumbing.attn_queue.push_back((code, data, reply));
                     return;
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    // The application dropped its AdspStream. Retransmissions
-                    // can never be delivered, so consume the message and ack
-                    // it below instead of asking the peer to send it forever.
-                    conn.attn_recv_seq = conn.attn_recv_seq.wrapping_add(1);
-                    tracing::debug!(
-                        "ADSP conn {} attention 0x{:04X} discarded, no reader",
-                        packet.connection_id,
-                        attention_code
-                    );
+                let now = self.now();
+                match self.endpoint.send_attention(conn_id, code, &data, now) {
+                    Ok(()) => {
+                        self.streams.get_mut(&conn_id).unwrap().attn_inflight = Some(reply);
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(io::Error::other(format!(
+                            "attention rejected: {e:?}"
+                        ))));
+                    }
                 }
             }
-        } else {
-            tracing::debug!(
-                "ADSP conn {} duplicate attention 0x{:04X} (seq {}, expected {})",
-                packet.connection_id,
-                attention_code,
-                packet.first_byte_seq,
-                conn.attn_recv_seq
-            );
-        }
-
-        let attn_send_seq = conn.attn_send_seq;
-        let attn_recv_seq = conn.attn_recv_seq;
-
-        // Attention-control packet: descriptor 0x90 = Control(0x80) | Attention(0x10).
-        //
-        // Attention packets ride the attention sequence space, not the data
-        // stream's (spec §12, "Attention messages"), so PktAttnSendSeq and
-        // PktAttnRecvSeq carry attn_send_seq/attn_recv_seq. The spec also says
-        // an attention-control packet "should not have the Ack Request bit
-        // set" — acking an ack would loop — and that PktAttnRecvWdw "must
-        // always be set to 0", since only one attention may be outstanding.
-        let ack = AdspPacket {
-            descriptor: AdspDescriptor::ControlPacket,
-            connection_id: our_conn_id,
-            first_byte_seq: attn_send_seq,
-            next_recv_seq: attn_recv_seq,
-            recv_window: 0,
-            flags: AdspPacket::FLAG_ATTENTION,
-        };
-        let mut buf = vec![0u8; AdspPacket::HEADER_LEN + 2];
-        if ack.to_bytes(&mut buf).is_ok() {
-            byteorder::BigEndian::write_u16(
-                &mut buf[AdspPacket::HEADER_LEN..],
-                attention_code,
-            );
-            let _ = self.sock.send_to(&buf, ddp_dest(remote_addr)).await;
-        }
-    }
-
-    async fn handle_open_request(
-        &mut self,
-        ddp: tailtalk_packets::ddp::DdpPacket,
-        packet: AdspPacket,
-    ) {
-        let client_conn_id = packet.connection_id;
-        let remote_addr = AdspAddress {
-            network_number: ddp.src_network_num,
-            node_number: ddp.src_node_id,
-            socket_number: ddp.src_sock_num,
-        };
-
-        // A peer whose OpenConnRequest went unanswered retransmits it, and
-        // the retransmission is indistinguishable from the original except
-        // that we have already opened the connection it names. Minting a
-        // fresh ConnID and a second connection for it is actively harmful:
-        // both sides key connections by the peer's ConnID, so the requester
-        // records the ConnID from whichever OpenConnReqAck reaches it first
-        // while we go on sending under the second, and every packet after
-        // the handshake is dropped by one side or the other. The connection
-        // opens and then silently carries nothing.
-        //
-        // So re-acknowledge the existing connection with its original
-        // ConnID and leave it otherwise untouched - no new stream, and
-        // nothing handed to `accept` a second time.
-        if let Some(existing) = self.connections.get(&client_conn_id) {
-            let our_conn_id = existing.our_conn_id;
-            tracing::debug!(
-                "ADSP re-acking retransmitted open for conn {} from {:?}",
-                client_conn_id,
-                remote_addr
-            );
-            self.send_open_req_ack(our_conn_id, client_conn_id, remote_addr).await;
-            return;
-        }
-
-        let our_conn_id: u16 = rand::random();
-
-        tracing::info!("ADSP accepting conn {} from {:?}", client_conn_id, remote_addr);
-
-        let stream = self.open_connection(client_conn_id, our_conn_id, remote_addr, packet.recv_window);
-
-        self.send_open_req_ack(our_conn_id, client_conn_id, remote_addr).await;
-
-        if let Some(tx) = &self.accept_tx {
-            let _ = tx.send(stream).await;
-        }
-    }
-
-    /// Send an OpenConnReqAck, which carries the 8-byte open-conn params
-    /// (spec §12, Figure 12-11): version, then the requester's ConnID
-    /// echoed back so it can match the reply to its pending open.
-    async fn send_open_req_ack(
-        &self,
-        our_conn_id: u16,
-        client_conn_id: u16,
-        remote_addr: AdspAddress,
-    ) {
-        let ack = AdspPacket {
-            descriptor: AdspDescriptor::OpenConnReqAck,
-            connection_id: our_conn_id,
-            first_byte_seq: 0,
-            next_recv_seq: 0,
-            recv_window: ADSP_RECV_WINDOW,
-            flags: 0,
-        };
-        let mut buf = [0u8; AdspPacket::HEADER_LEN + 8];
-        if ack.to_bytes(&mut buf).is_ok() {
-            byteorder::BigEndian::write_u16(&mut buf[AdspPacket::HEADER_LEN..], 0x0100);
-            byteorder::BigEndian::write_u16(&mut buf[AdspPacket::HEADER_LEN + 2..], client_conn_id);
-            let _ = self.sock.send_to(&buf, ddp_dest(remote_addr)).await;
-        }
-    }
-
-    async fn handle_open_ack(
-        &mut self,
-        ddp: tailtalk_packets::ddp::DdpPacket,
-        packet: AdspPacket,
-        payload: &[u8],
-    ) {
-        // Our ConnID echoed back in the open-conn params at payload[15..17]
-        // (DestConnID field, bytes 2-3 of the 8-byte block following the header).
-        let server_conn_id = packet.connection_id;
-        let our_conn_id = if payload.len() >= 17 {
-            u16::from_be_bytes([payload[15], payload[16]])
-        } else {
-            server_conn_id
-        };
-
-        let Some(ready_tx) = self.pending_opens.remove(&our_conn_id) else { return };
-
-        let remote_addr = AdspAddress {
-            network_number: ddp.src_network_num,
-            node_number: ddp.src_node_id,
-            socket_number: ddp.src_sock_num,
-        };
-
-        tracing::info!(
-            "ADSP conn established: our={} server={} remote={:?}",
-            our_conn_id, server_conn_id, remote_addr
-        );
-
-        let stream = self.open_connection(server_conn_id, our_conn_id, remote_addr, packet.recv_window);
-
-        // OpenConnAck completes the 3-way handshake; carries 8-byte open-conn params
-        // like the other two handshake packets (spec §12, Figure 12-11).
-        let ack = AdspPacket {
-            descriptor: AdspDescriptor::OpenConnAck,
-            connection_id: our_conn_id,
-            first_byte_seq: 0,
-            next_recv_seq: 0,
-            recv_window: ADSP_RECV_WINDOW,
-            flags: 0,
-        };
-        let mut buf = [0u8; AdspPacket::HEADER_LEN + 8];
-        if ack.to_bytes(&mut buf).is_ok() {
-            byteorder::BigEndian::write_u16(&mut buf[AdspPacket::HEADER_LEN..], 0x0100);
-            byteorder::BigEndian::write_u16(&mut buf[AdspPacket::HEADER_LEN + 2..], server_conn_id);
-            let _ = self.sock.send_to(&buf, ddp_dest(remote_addr)).await;
-        }
-
-        let _ = ready_tx.send(Ok(stream));
-    }
-
-    async fn handle_data(&mut self, packet: AdspPacket, data: &[u8]) {
-        let Some(conn) = self.connections.get_mut(&packet.connection_id) else { return };
-
-        // EOM consumes one byte of sequence space even with no payload (like
-        // TCP FIN) — must advance recv_seq even when data is empty, or our
-        // own ack of the peer's EOM packet will look short by one to them.
-        let eom_seq_bump: u32 = if packet.flags & AdspPacket::FLAG_EOM != 0 { 1 } else { 0 };
-        let total_len = data.len() as u32 + eom_seq_bump;
-        if total_len > 0 {
-            // Sequence-validate before delivering: peers retransmit on their own
-            // timers, so both duplicates and (after a lost packet) data beyond a
-            // hole occur. Delivering a duplicate corrupts request/reply pairing;
-            // acking past a hole makes the peer never resend it, deadlocking the
-            // stream.
-            let diff = conn.recv_seq.wrapping_sub(packet.first_byte_seq) as i32;
-            if diff < 0 {
-                // Data beyond a hole: discard; the ack below re-states our
-                // recv_seq so the peer rolls back and retransmits.
-                tracing::warn!(
-                    "ADSP conn {} out-of-order data (seq {}, expected {}), discarding",
-                    packet.connection_id,
-                    packet.first_byte_seq,
-                    conn.recv_seq
-                );
-            } else if (diff as u32) < total_len {
-                // In order (diff == 0), or a retransmission overlapping our
-                // position: deliver only the bytes we haven't seen yet.
-                let skip = (diff as usize).min(data.len());
-                let fresh = &data[skip..];
-                if fresh.is_empty() || conn.data_tx.try_send(fresh.to_vec()).is_ok() {
-                    conn.recv_seq = packet.first_byte_seq.wrapping_add(total_len);
-                } else {
-                    // Receive buffer full: leave recv_seq (and thus our ack)
-                    // where it is so the peer retransmits instead of the
-                    // bytes being silently lost.
-                    tracing::warn!(
-                        "ADSP conn {} receive buffer full, deferring data",
-                        packet.connection_id
-                    );
+            ActorCmd::Close { conn_id, reply } => {
+                self.endpoint.close(conn_id);
+                if let Some(mut plumbing) = self.streams.remove(&conn_id) {
+                    plumbing.fail_all("connection closed");
                 }
-            } else {
-                // Pure duplicate of already-delivered data: drop it. The ack
-                // below tells the peer where we really are.
-                tracing::debug!(
-                    "ADSP conn {} dropping duplicate retransmission (seq {}, {} bytes)",
-                    packet.connection_id,
-                    packet.first_byte_seq,
-                    total_len
-                );
+                self.outbound_key.retain(|_, key| *key != conn_id);
+                let _ = reply.send(Ok(()));
             }
         }
-
-        // All ADSP packets (data and control) carry ACK state — apply sender flow control.
-        conn.send_window = packet.recv_window;
-        // Valid ack range is bounded by our own send_seq (which already
-        // accounts for EOM's phantom byte), not flight_buffer.len() directly —
-        // an EOM-terminated send acks 1 higher than its real byte count.
-        let max_valid_acked = conn.send_seq.wrapping_sub(conn.oldest_unacked_seq) as usize;
-        let acked = packet.next_recv_seq.wrapping_sub(conn.oldest_unacked_seq) as usize;
-        if acked > 0 && acked <= max_valid_acked {
-            conn.flight_buffer.drain(..acked.min(conn.flight_buffer.len()));
-            conn.oldest_unacked_seq = packet.next_recv_seq;
-            conn.retries = 0;
-        }
-
-        let conn_id = packet.connection_id;
-        let _ = self.send_ack(conn_id).await;
-        self.drain_pending(conn_id).await;
     }
 
-    async fn handle_ack(&mut self, packet: AdspPacket) {
-        let Some(conn) = self.connections.get_mut(&packet.connection_id) else { return };
-
-        conn.send_window = packet.recv_window;
-
-        let max_valid_acked = conn.send_seq.wrapping_sub(conn.oldest_unacked_seq) as usize;
-        let acked = packet
-            .next_recv_seq
-            .wrapping_sub(conn.oldest_unacked_seq) as usize;
-        if acked > 0 && acked <= max_valid_acked {
-            conn.flight_buffer.drain(..acked.min(conn.flight_buffer.len()));
-            conn.oldest_unacked_seq = packet.next_recv_seq;
-            conn.retries = 0;
-        }
-
-        let conn_id = packet.connection_id;
-        self.drain_pending(conn_id).await;
-    }
-
-    /// Tear a connection down locally: drop it from the map, fail anything
-    /// waiting on it, and let its reader see EOF. Used when we give up on a
-    /// peer, as opposed to the peer closing on us.
-    fn drop_connection(&mut self, conn_id: u16, why: &'static str) {
-        if let Some(conn) = self.connections.remove(&conn_id) {
-            conn.tear_down(why);
-        }
-    }
-
-    async fn handle_close(&mut self, packet: AdspPacket) {
-        if let Some(mut conn) = self.connections.remove(&packet.connection_id) {
-            tracing::info!("ADSP conn {} closed by peer", packet.connection_id);
-            // The spec retransmits an attention "until it receives the
-            // appropriate attention-message acknowledgment or until the
-            // connection is torn down" — this is that teardown, so fail the
-            // in-flight message and everything queued behind it rather than
-            // leaving their callers waiting on an ack that cannot come.
-            fail_pending_attentions(&mut conn, "connection closed by peer");
-            // Dropping both senders is what unblocks a reader: data_tx gives
-            // AsyncRead its EOF, attn_tx makes a waiting attention() call
-            // return None rather than hang for a message that can no longer
-            // arrive.
-            drop(conn.data_tx);
-            drop(conn.attn_tx);
-        }
-    }
-
-    // ── Outbound helpers ──────────────────────────────────────────────────────
-
-    async fn send_open_request(&mut self, conn_id: u16, remote_addr: AdspAddress) {
-        let pkt = AdspPacket {
-            descriptor: AdspDescriptor::OpenConnRequest,
-            connection_id: conn_id,
-            first_byte_seq: 0,
-            next_recv_seq: 0,
-            recv_window: ADSP_RECV_WINDOW,
-            flags: 0,
-        };
-        // Header + 8-byte open-conn params (spec §12, Figure 12-11).
-        // DestConnID is 0 — we don't know the server's ConnID yet.
-        let mut buf = [0u8; AdspPacket::HEADER_LEN + 8];
-        if pkt.to_bytes(&mut buf).is_ok() {
-            byteorder::BigEndian::write_u16(&mut buf[AdspPacket::HEADER_LEN..], 0x0100);
-            let _ = self.sock.send_to(&buf, ddp_dest(remote_addr)).await;
-        }
-    }
-
-    async fn send_data(
-        &mut self,
-        conn_id: u16,
-        data: Vec<u8>,
-        eom: bool,
-        reply: oneshot::Sender<io::Result<()>>,
-    ) {
-        let Some(conn) = self.connections.get_mut(&conn_id) else {
-            let _ = reply.send(Err(io::Error::new(io::ErrorKind::NotConnected, "no such connection")));
-            return;
-        };
-
-        // If earlier writes are still queued, preserve order by appending.
-        if !conn.pending_writes.is_empty() {
-            conn.pending_writes.push_back(PendingWrite { data, offset: 0, eom, reply });
-            return;
-        }
-
-        // Empty EOM (no payload — just marks a record boundary, doesn't consume window).
-        if data.is_empty() && eom {
-            let result = self.send_eom_only(conn_id).await;
-            let _ = reply.send(result);
-            return;
-        }
-
-        // How many bytes fit in the peer's receive window right now?
-        let in_flight = conn.send_seq.wrapping_sub(conn.oldest_unacked_seq);
-        let available = (conn.send_window as u32).saturating_sub(in_flight) as usize;
-
-        if available == 0 {
-            conn.pending_writes.push_back(PendingWrite { data, offset: 0, eom, reply });
-            return;
-        }
-
-        let to_send = data.len().min(available);
-        let all_sent = to_send == data.len();
-        let result = self.send_raw(conn_id, &data[..to_send], eom && all_sent).await;
-
-        if result.is_err() || all_sent {
-            let _ = reply.send(result);
-        } else {
-            let conn = self.connections.get_mut(&conn_id).unwrap();
-            conn.pending_writes.push_back(PendingWrite { data, offset: to_send, eom, reply });
-        }
-    }
-
-    /// Send raw data bytes on a connection without any queuing or window checks.
-    /// Updates flight_buffer and send_seq.
-    async fn send_raw(&mut self, conn_id: u16, data: &[u8], eom: bool) -> io::Result<()> {
-        let conn = self
-            .connections
-            .get_mut(&conn_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no such connection"))?;
-
-        let last_idx = data.chunks(ADSP_MAX_DATA).count().saturating_sub(1);
-        for (i, chunk) in data.chunks(ADSP_MAX_DATA).enumerate() {
-            let eom_flag = if eom && i == last_idx { AdspPacket::FLAG_EOM } else { 0 };
-            let pkt = AdspPacket {
-                descriptor: AdspDescriptor::DataPacket,
-                connection_id: conn.our_conn_id,
-                first_byte_seq: conn.send_seq,
-                next_recv_seq: conn.recv_seq,
-                recv_window: ADSP_RECV_WINDOW,
-                flags: AdspPacket::FLAG_ACK | eom_flag,
-            };
-            let mut buf = vec![0u8; AdspPacket::HEADER_LEN + chunk.len()];
-            pkt.to_bytes(&mut buf)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            buf[AdspPacket::HEADER_LEN..].copy_from_slice(chunk);
-            self.sock.send_to(&buf, ddp_dest(conn.remote_addr)).await.map_err(io::Error::other)?;
-            conn.flight_buffer.extend_from_slice(chunk);
-            // EOM consumes one extra byte of sequence space (like TCP FIN),
-            // even though it carries no payload of its own. Omitting this
-            // makes the peer's legitimate cumulative ack look like an
-            // over-ack, which handle_data/handle_ack then silently reject —
-            // stalling oldest_unacked_seq and retransmitting forever.
-            let eom_seq_bump = if eom_flag != 0 { 1 } else { 0 };
-            conn.send_seq = conn.send_seq.wrapping_add(chunk.len() as u32 + eom_seq_bump);
-        }
-        conn.last_tx = std::time::Instant::now();
-        Ok(())
-    }
-
-    async fn send_eom_only(&mut self, conn_id: u16) -> io::Result<()> {
-        let conn = self
-            .connections
-            .get_mut(&conn_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no such connection"))?;
-        let pkt = AdspPacket {
-            descriptor: AdspDescriptor::DataPacket,
-            connection_id: conn.our_conn_id,
-            first_byte_seq: conn.send_seq,
-            next_recv_seq: conn.recv_seq,
-            recv_window: ADSP_RECV_WINDOW,
-            flags: AdspPacket::FLAG_ACK | AdspPacket::FLAG_EOM,
-        };
-        let remote_addr = conn.remote_addr;
-        let mut buf = [0u8; AdspPacket::HEADER_LEN];
-        pkt.to_bytes(&mut buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        self.sock.send_to(&buf, ddp_dest(remote_addr)).await.map_err(io::Error::other)?;
-        // EOM consumes one byte of sequence space even with no payload (see send_raw).
-        conn.send_seq = conn.send_seq.wrapping_add(1);
-        conn.last_tx = std::time::Instant::now();
-        Ok(())
-    }
-
-    /// Drain as much of the pending write queue as the current window allows.
-    /// Fires deferred replies for completed writes, and a deferred close when the
-    /// queue empties.
-    async fn drain_pending(&mut self, conn_id: u16) {
+    /// Drain the endpoint until it is quiescent: put its packets on the
+    /// wire, deliver its events, and settle any callers whose work the last
+    /// round completed. Events can queue further packets, so this loops.
+    async fn pump(&mut self) {
         loop {
-            // Extract what we need without holding a reference across the await.
-            enum Task { Eom, Data { chunk: Vec<u8>, eom: bool, all_sent: bool } }
+            let mut progressed = false;
 
-            let task = {
-                let Some(conn) = self.connections.get_mut(&conn_id) else { return };
-                let Some(front) = conn.pending_writes.front() else { break };
-
-                if front.data.is_empty() && front.eom {
-                    Task::Eom
-                } else {
-                    let in_flight = conn.send_seq.wrapping_sub(conn.oldest_unacked_seq);
-                    let available = (conn.send_window as u32).saturating_sub(in_flight) as usize;
-                    if available == 0 {
-                        break;
-                    }
-                    let remaining_len = front.data.len() - front.offset;
-                    let to_send = remaining_len.min(available);
-                    let chunk = front.data[front.offset..front.offset + to_send].to_vec();
-                    let all_sent = to_send == remaining_len;
-                    Task::Data { chunk, eom: front.eom && all_sent, all_sent }
+            while let Some((dest, payload)) = self.endpoint.poll_transmit() {
+                progressed = true;
+                if let Err(e) = self.sock.send_to(&payload, ddp_dest(dest.into())).await {
+                    tracing::warn!("ADSP send failed: {e}");
                 }
-            };
+            }
 
-            match task {
-                Task::Eom => {
-                    let result = self.send_eom_only(conn_id).await;
-                    if let Some(conn) = self.connections.get_mut(&conn_id)
-                        && let Some(pw) = conn.pending_writes.pop_front()
-                    {
-                        let _ = pw.reply.send(result);
+            while let Some(event) = self.endpoint.poll_event() {
+                progressed = true;
+                self.handle_event(event).await;
+            }
+
+            self.settle_writes();
+
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    async fn handle_event(&mut self, event: AdspEvent) {
+        match event {
+            AdspEvent::Opened { conn, remote, inbound, pending } => {
+                let remote = remote.into();
+                if inbound {
+                    tracing::info!("ADSP accepting conn {} from {:?}", conn, remote);
+                    let stream = self.attach_stream(conn, remote);
+                    if let Some(tx) = &self.accept_tx {
+                        let _ = tx.send(stream).await;
                     }
+                    return;
                 }
-                Task::Data { chunk, eom, all_sent } => {
-                    let chunk_len = chunk.len();
-                    let result = self.send_raw(conn_id, &chunk, eom).await;
-                    let Some(conn) = self.connections.get_mut(&conn_id) else { return };
-                    if result.is_err() || all_sent {
-                        if let Some(pw) = conn.pending_writes.pop_front() {
-                            let _ = pw.reply.send(result);
-                        }
-                    } else {
-                        if let Some(front) = conn.pending_writes.front_mut() {
-                            front.offset += chunk_len;
-                        }
-                        break;
+
+                let handle = pending.unwrap_or(conn);
+                if let Some(ready) = self.pending_opens.remove(&handle) {
+                    tracing::info!("ADSP conn established: conn={} remote={:?}", conn, remote);
+                    let stream = self.attach_stream(conn, remote);
+                    self.outbound_key.insert(handle, conn);
+                    let _ = ready.send(Ok(stream));
+                } else if let Some(old) = self.outbound_key.insert(handle, conn) {
+                    // Re-key: the peer answered a retransmitted open with a
+                    // second ConnID and moved to it. Carry the plumbing over
+                    // rather than stranding the stream its owner holds.
+                    if old != conn && let Some(plumbing) = self.streams.remove(&old) {
+                        tracing::debug!("ADSP conn {} re-keyed to {}", old, conn);
+                        self.streams.insert(conn, plumbing);
                     }
                 }
             }
+            AdspEvent::OpenFailed { conn } => {
+                if let Some(ready) = self.pending_opens.remove(&conn) {
+                    let _ = ready.send(Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "peer never completed the ADSP open",
+                    )));
+                }
+            }
+            AdspEvent::Data { conn, data, .. } => {
+                if let Some(plumbing) = self.streams.get(&conn)
+                    && plumbing.data_tx.send(data).await.is_err()
+                {
+                    // Reader dropped; the connection is no longer useful.
+                    tracing::debug!("ADSP conn {} reader gone", conn);
+                }
+            }
+            AdspEvent::Attention { conn, code, data } => {
+                if let Some(plumbing) = self.streams.get(&conn) {
+                    let _ = plumbing.attn_tx.send((code, data)).await;
+                }
+            }
+            AdspEvent::AttentionAcked { conn } => {
+                self.finish_attention(conn, Ok(()));
+            }
+            AdspEvent::AttentionFailed { conn } => {
+                self.finish_attention(
+                    conn,
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "attention message was never acknowledged",
+                    )),
+                );
+            }
+            AdspEvent::Closed { conn } => {
+                tracing::info!("ADSP conn {} closed", conn);
+                if let Some(mut plumbing) = self.streams.remove(&conn) {
+                    plumbing.fail_all("connection closed");
+                }
+                self.outbound_key.retain(|_, key| *key != conn);
+            }
         }
+    }
 
-        // If queue is now empty and a close was deferred, execute it.
-        let needs_close = self.connections.get(&conn_id)
-            .map(|c| c.pending_writes.is_empty() && c.pending_close.is_some())
-            .unwrap_or(false);
-        if needs_close {
-            let reply = self.connections.get_mut(&conn_id).unwrap().pending_close.take().unwrap();
-            let result = self.do_close(conn_id).await;
+    /// Settle the caller waiting on this connection's in-flight attention,
+    /// then start whatever queued behind it.
+    fn finish_attention(&mut self, conn: u16, result: io::Result<()>) {
+        let Some(plumbing) = self.streams.get_mut(&conn) else { return };
+        if let Some(reply) = plumbing.attn_inflight.take() {
             let _ = reply.send(result);
         }
-    }
-
-    async fn close_or_defer(&mut self, conn_id: u16, reply: oneshot::Sender<io::Result<()>>) {
-        let Some(conn) = self.connections.get_mut(&conn_id) else {
-            let _ = reply.send(Ok(())); // already gone
-            return;
-        };
-        if conn.pending_writes.is_empty() {
-            let result = self.do_close(conn_id).await;
-            let _ = reply.send(result);
-        } else {
-            conn.pending_close = Some(reply);
+        let Some((code, data, reply)) = plumbing.attn_queue.pop_front() else { return };
+        let now = self.now();
+        match self.endpoint.send_attention(conn, code, &data, now) {
+            Ok(()) => {
+                self.streams.get_mut(&conn).unwrap().attn_inflight = Some(reply);
+            }
+            Err(e) => {
+                let _ = reply.send(Err(io::Error::other(format!(
+                    "attention rejected: {e:?}"
+                ))));
+            }
         }
     }
 
-    async fn send_ack(&mut self, conn_id: u16) -> io::Result<()> {
-        let conn = self
-            .connections
-            .get(&conn_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no such connection"))?;
-
-        // Plain acks are control code 0 (probe/ack, 0x80), not RetransmitAdvice
-        // (0x88) — that's a rollback command and must only be sent in response
-        // to an actual gap in the peer's stream.
-        let pkt = AdspPacket {
-            descriptor: AdspDescriptor::ControlPacket,
-            connection_id: conn.our_conn_id,
-            first_byte_seq: conn.send_seq,
-            next_recv_seq: conn.recv_seq,
-            recv_window: ADSP_RECV_WINDOW,
-            flags: 0,
-        };
-
-        let remote_addr = conn.remote_addr;
-        let mut buf = [0u8; AdspPacket::HEADER_LEN];
-        pkt.to_bytes(&mut buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        self.sock
-            .send_to(&buf, ddp_dest(remote_addr))
-            .await
-            .map_err(io::Error::other)
-    }
-
-    /// Accept a client attention message: validate it, then either put it on
-    /// the wire or queue it behind one already awaiting acknowledgement.
-    ///
-    /// The caller's `reply` is deliberately not completed here. Spec §12 allows
-    /// only one attention outstanding at a time, so `send_attention` resolves
-    /// when the peer acknowledges, which is also what makes the caller's next
-    /// send legal.
-    async fn send_attention_msg(
-        &mut self,
-        conn_id: u16,
-        code: u16,
-        data: Vec<u8>,
-        reply: oneshot::Sender<io::Result<()>>,
-    ) {
-        // Spec §12: an attention message carries "a 2-byte (16-bit) attention
-        // code and from 0 to 570 bytes of client attention data".
-        if data.len() > ADSP_MAX_ATTN_DATA {
-            let _ = reply.send(Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "attention data is {} bytes, limit is {ADSP_MAX_ATTN_DATA}",
-                    data.len()
-                ),
-            )));
-            return;
+    /// Complete every write the endpoint has finished cutting into packets.
+    fn settle_writes(&mut self) {
+        for (conn, plumbing) in self.streams.iter_mut() {
+            let Some(completed) = self.endpoint.writes_completed(*conn) else { continue };
+            while plumbing.writes.front().is_some_and(|(id, _)| *id <= completed) {
+                let (_, reply) = plumbing.writes.pop_front().expect("just checked");
+                let _ = reply.send(Ok(()));
+            }
         }
-        // Codes $F000-$FFFF are reserved for future expansion of ADSP itself;
-        // $0000-$EFFF are the client's to use.
-        if code > ADSP_MAX_CLIENT_ATTN_CODE {
-            let _ = reply.send(Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("attention code 0x{code:04X} is reserved by ADSP"),
-            )));
-            return;
-        }
-
-        let Some(conn) = self.connections.get_mut(&conn_id) else {
-            let _ = reply.send(Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "no such connection",
-            )));
-            return;
-        };
-
-        // One outstanding at a time: queue this one and send it when the
-        // current message is acknowledged.
-        if let Some(in_flight) = conn.attn_in_flight.as_mut() {
-            in_flight.queued.push_back(QueuedAttn { code, data, reply });
-            return;
-        }
-
-        let seq = conn.attn_send_seq;
-        conn.attn_in_flight = Some(AttnInFlight {
-            seq,
-            code,
-            data,
-            sent_at: std::time::Instant::now(),
-            retries: 0,
-            reply: Some(reply),
-            queued: std::collections::VecDeque::new(),
-        });
-
-        self.transmit_attention(conn_id).await;
-    }
-
-    /// Put the connection's in-flight attention message on the wire.
-    ///
-    /// Used for both the first transmission and every retransmission, so the
-    /// bytes are identical each time — the peer dedups on PktAttnSendSeq.
-    async fn transmit_attention(&mut self, conn_id: u16) {
-        let Some(conn) = self.connections.get_mut(&conn_id) else { return };
-        let Some(in_flight) = conn.attn_in_flight.as_mut() else { return };
-
-        in_flight.sent_at = std::time::Instant::now();
-        let (seq, code) = (in_flight.seq, in_flight.code);
-        let data = in_flight.data.clone();
-        let (remote_addr, attn_recv_seq, our_conn_id) =
-            (conn.remote_addr, conn.attn_recv_seq, conn.our_conn_id);
-
-        // Attention packet (spec §12, Figure 12-7): desc byte 0x50 — Control
-        // clear and Ack Request set, which "forces the receiver to immediately
-        // send an acknowledgment of the attention data". PktAttnRecvSeq
-        // piggybacks our own attention receive state, since "an
-        // acknowledgment is implicit in any Attention packet sent".
-        let mut buf = vec![0u8; AdspPacket::HEADER_LEN + 2 + data.len()];
-        let pkt = AdspPacket {
-            descriptor: AdspDescriptor::DataPacket,
-            connection_id: our_conn_id,
-            first_byte_seq: seq,
-            next_recv_seq: attn_recv_seq,
-            recv_window: 0, // must be 0 for attention per spec
-            flags: AdspPacket::FLAG_ACK | AdspPacket::FLAG_ATTENTION,
-        };
-        if pkt.to_bytes(&mut buf).is_err() {
-            return;
-        }
-        byteorder::BigEndian::write_u16(&mut buf[AdspPacket::HEADER_LEN..], code);
-        buf[AdspPacket::HEADER_LEN + 2..].copy_from_slice(&data);
-
-        let _ = self.sock.send_to(&buf, ddp_dest(remote_addr)).await;
-    }
-
-    /// Retire the in-flight attention message and start any queued successor.
-    async fn complete_attention(&mut self, conn_id: u16, result: io::Result<()>) {
-        let Some(conn) = self.connections.get_mut(&conn_id) else { return };
-        let Some(mut in_flight) = conn.attn_in_flight.take() else { return };
-
-        if let Some(reply) = in_flight.reply.take() {
-            let _ = reply.send(result);
-        }
-
-        // Only a delivered message consumes a sequence number.
-        conn.attn_send_seq = conn.attn_send_seq.wrapping_add(1);
-
-        let Some(next) = in_flight.queued.pop_front() else { return };
-        let seq = conn.attn_send_seq;
-        conn.attn_in_flight = Some(AttnInFlight {
-            seq,
-            code: next.code,
-            data: next.data,
-            sent_at: std::time::Instant::now(),
-            retries: 0,
-            reply: Some(next.reply),
-            queued: in_flight.queued,
-        });
-        self.transmit_attention(conn_id).await;
-    }
-
-    async fn do_close(&mut self, conn_id: u16) -> io::Result<()> {
-        let Some(conn) = self.connections.get(&conn_id) else {
-            return Ok(()); // already gone
-        };
-
-        let pkt = AdspPacket {
-            descriptor: AdspDescriptor::CloseAdvice,
-            connection_id: conn.our_conn_id,
-            first_byte_seq: conn.send_seq,
-            next_recv_seq: conn.recv_seq,
-            recv_window: 0,
-            flags: 0,
-        };
-        let remote_addr = conn.remote_addr;
-
-        let mut buf = [0u8; AdspPacket::HEADER_LEN];
-        pkt.to_bytes(&mut buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        self.sock
-            .send_to(&buf, ddp_dest(remote_addr))
-            .await
-            .map_err(io::Error::other)?;
-
-        if let Some(mut conn) = self.connections.remove(&conn_id) {
-            fail_pending_attentions(&mut conn, "connection closed");
-        }
-        Ok(())
     }
 }
 
@@ -1716,149 +860,6 @@ mod tests {
             pending_flush: None,
         };
         (stream, data_tx)
-    }
-
-    /// A connection with unacknowledged data and a stale `last_tx`, so the
-    /// retransmit tick considers it overdue. Returns the reader, a waiter
-    /// blocked on a write, and a waiter blocked on an attention, so a
-    /// teardown has something to fail.
-    #[allow(clippy::type_complexity)]
-    fn stalled_connection() -> (
-        AdspConnection,
-        mpsc::Receiver<Vec<u8>>,
-        oneshot::Receiver<io::Result<()>>,
-        oneshot::Receiver<io::Result<()>>,
-    ) {
-        let (data_tx, data_rx) = mpsc::channel(8);
-        let (attn_tx, _attn_rx) = mpsc::channel(8);
-        let (write_reply, write_waiter) = oneshot::channel();
-        let (attn_reply, attn_waiter) = oneshot::channel();
-
-        let mut pending_writes = std::collections::VecDeque::new();
-        pending_writes.push_back(PendingWrite {
-            data: b"queued".to_vec(),
-            offset: 0,
-            eom: false,
-            reply: write_reply,
-        });
-
-        let conn = AdspConnection {
-            our_conn_id: 7,
-            remote_addr: AdspAddress { network_number: 1, node_number: 2, socket_number: 3 },
-            send_seq: 4,
-            oldest_unacked_seq: 0,
-            recv_seq: 0,
-            send_window: 1024,
-            flight_buffer: b"data".to_vec(),
-            last_tx: std::time::Instant::now() - std::time::Duration::from_secs(60),
-            retries: 0,
-            attn_send_seq: 0,
-            attn_in_flight: Some(AttnInFlight {
-                seq: 0,
-                code: 0x0006,
-                data: Vec::new(),
-                sent_at: std::time::Instant::now(),
-                retries: 0,
-                reply: Some(attn_reply),
-                queued: std::collections::VecDeque::new(),
-            }),
-            attn_recv_seq: 0,
-            data_tx,
-            attn_tx,
-            pending_writes,
-            pending_close: None,
-        };
-        (conn, data_rx, write_waiter, attn_waiter)
-    }
-
-    /// Giving up on an unresponsive peer has to actually tear the
-    /// connection down, not just flag it.
-    ///
-    /// It used to only set a `Closing` flag that nothing acted on, leaving
-    /// the flight buffer full and `last_tx` stale, so the retransmit tick
-    /// re-entered the give-up branch every second: an endless error log,
-    /// and after 250 more ticks `retries: u8` overflowed and panicked the
-    /// runtime. Observed on real hardware as exactly that.
-    #[test]
-    fn giving_up_on_a_peer_tears_the_connection_down() {
-        let (conn, mut data_rx, mut write_waiter, mut attn_waiter) = stalled_connection();
-        let mut conns: HashMap<u16, AdspConnection> = HashMap::new();
-        conns.insert(9, conn);
-
-        // `tear_down` consumes the connection, so "it must not survive"
-        // is enforced by the type system rather than asserted here.
-        conns.remove(&9).expect("present").tear_down("peer stopped acknowledging data");
-
-        assert!(
-            matches!(data_rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)),
-            "reader must see EOF"
-        );
-        let write_err = write_waiter
-            .try_recv()
-            .expect("blocked write must be answered")
-            .expect_err("and answered with an error");
-        assert_eq!(write_err.kind(), io::ErrorKind::ConnectionAborted);
-        let attn_err = attn_waiter
-            .try_recv()
-            .expect("blocked attention must be answered")
-            .expect_err("and answered with an error");
-        assert_eq!(attn_err.kind(), io::ErrorKind::NotConnected);
-    }
-
-    /// The tick retransmits up to the limit and then gives up exactly once.
-    #[test]
-    fn retransmits_are_bounded_then_the_connection_is_given_up() {
-        let (mut conn, _rx, _w, _a) = stalled_connection();
-        let now = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(1);
-
-        for attempt in 1..=DATA_MAX_RETRIES {
-            assert_eq!(
-                conn.retransmit_action(now, timeout),
-                RetransmitAction::Resend(attempt),
-            );
-        }
-        assert_eq!(
-            conn.retransmit_action(now, timeout),
-            RetransmitAction::GiveUp,
-        );
-    }
-
-    /// A connection with nothing in flight, or one whose last send is still
-    /// recent, must not be counted as a retry - otherwise an idle
-    /// connection would march toward the give-up branch on its own.
-    #[test]
-    fn nothing_overdue_is_not_a_retry() {
-        let now = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(1);
-
-        let (mut idle, _rx, _w, _a) = stalled_connection();
-        idle.flight_buffer.clear();
-        assert_eq!(idle.retransmit_action(now, timeout), RetransmitAction::Wait);
-        assert_eq!(idle.retries, 0, "an idle connection must not accrue retries");
-
-        let (mut fresh, _rx2, _w2, _a2) = stalled_connection();
-        fresh.last_tx = now;
-        assert_eq!(fresh.retransmit_action(now, timeout), RetransmitAction::Wait);
-        assert_eq!(fresh.retries, 0);
-    }
-
-    /// The counter must not be able to wrap even if the give-up branch is
-    /// somehow re-entered, which is how the original overflow panicked.
-    #[test]
-    fn the_retry_counter_cannot_wrap() {
-        let (mut conn, _rx, _w, _a) = stalled_connection();
-        let now = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(1);
-
-        conn.retries = u8::MAX - 1;
-        for _ in 0..4 {
-            assert_eq!(
-                conn.retransmit_action(now, timeout),
-                RetransmitAction::GiveUp,
-            );
-        }
-        assert_eq!(conn.retries, u8::MAX);
     }
 
     /// A read whose buffer is smaller than the arriving chunk must keep the

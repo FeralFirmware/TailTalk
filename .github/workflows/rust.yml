@@ -53,6 +53,18 @@ jobs:
     - name: Run clippy
       run: cargo clippy --workspace --all-targets -- -D warnings
 
+  no-std:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install the embedded target
+      run: rustup target add thumbv6m-none-eabi
+    - name: Build tailtalk-core for bare metal
+      # --no-default-features because the default set is `std`, which this
+      # target has no implementation of. It is also how the firmware depends
+      # on the crate.
+      run: cargo build -p tailtalk-core --target thumbv6m-none-eabi --no-default-features
+
   release:
     runs-on: ${{ matrix.os }}
     strategy:
