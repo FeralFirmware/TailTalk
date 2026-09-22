@@ -19,3 +19,11 @@ std = ["tailtalk-packets/std"]
 # Dropping them loses std (the firmware has none) and afp (a file-server
 # protocol with no place on a printer bridge).
 tailtalk-packets = { path = "../tailtalk-packets", version = "^0.11", default-features = false }
+
+# The desktop crate depends on this one, so this is a cycle - but only
+# through dev-dependencies, which cargo allows and resolves. It is what lets
+# tests/ check these state machines against the independently written
+# desktop implementations, each side an oracle for the other.
+[dev-dependencies]
+tailtalk = { workspace = true }
+tokio = { workspace = true }

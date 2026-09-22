@@ -33,6 +33,7 @@ pub mod link;
 pub mod nbp;
 pub mod rtmp;
 pub mod stack;
+pub mod stylewriter;
 
 /// Monotonic time in microseconds, supplied by the caller on every input.
 /// The zero point is arbitrary; only differences are used.
