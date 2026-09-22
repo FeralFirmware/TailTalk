@@ -29,6 +29,7 @@ pub mod adsp;
 pub mod aep;
 pub mod atp;
 pub mod ddp;
+pub mod imagewriter;
 pub mod link;
 pub mod nbp;
 pub mod pap;

@@ -42,8 +42,7 @@ use tailtalk_packets::nbp::ServiceAddress;
 use crate::Micros;
 use crate::adsp::{AdspEndpoint, AdspEvent};
 
-/// NBP type the Mac's Color StyleWriter 2400 driver looks up (verified in
-/// `tailtalk-gui/printer_tool.rs`).
+/// NBP type the Mac's Color StyleWriter 2400 driver looks up.
 pub const NBP_TYPE: &str = "ColorStyleWriter2400AT";
 
 /// The print-request attention (lpstyl `at_printer_open`).
@@ -266,7 +265,7 @@ impl StyleWriterRole {
                 State::Piping { conn: dc, kill_seen } if conn == dc => {
                     if !kill_seen {
                         // Client vanished mid-job: eject and reset so paper
-                        // is not left in the feed path (brief step 8).
+                        // is not left in the feed path.
                         self.events
                             .push_back(StyleWriterEvent::ToPrinter(PRINTER_RESET.to_vec()));
                     }
@@ -293,7 +292,7 @@ impl StyleWriterRole {
         match code {
             ATTN_PRINT_REQUEST => {
                 // printRequest { u32 be port; pascal string user; } zero
-                // padded to 70 (lpstyl / desktop build_print_request).
+                // padded to 70, as lpstyl builds it.
                 if data.len() < 5 {
                     return;
                 }
