@@ -173,9 +173,9 @@ impl Stack {
                     && llap.dst_node == node
                     && self.acquire.is_none()
                 {
-                    // Defend our address: lapACK with dst = src = our node,
-                    // matching the desktop responder and LLAP itself (the
-                    // probe carries dst == src == candidate).
+                    // Defend our address: lapACK with dst = src = our
+                    // node, as LLAP requires - the probe being defended
+                    // carries dst == src == candidate.
                     self.outbox.push_back(OutFrame {
                         dst: node,
                         src: node,
@@ -212,8 +212,8 @@ impl Stack {
             // No address yet: nothing above LLAP is running.
             return;
         };
-        // LocalTalk address match is by node number only (network numbers on
-        // a nonextended cable are advisory), same as the desktop stack.
+        // LocalTalk address match is by node number only: network numbers
+        // on a nonextended cable are advisory.
         let for_us = headers.dest_node_id == 255 || headers.dest_node_id == node;
         if !for_us {
             return;
@@ -335,8 +335,8 @@ impl Stack {
             return Err(SendError::TooLarge);
         }
 
-        // A datagram to ourselves never comes back off the wire; loop it
-        // back to the local socket like the desktop stack does.
+        // A datagram to ourselves never comes back off the wire, so loop
+        // it back to the local socket here.
         let on_cable = dest.network_number == 0 || dest.network_number == self.network;
         if dest.node_number == our.node_number && on_cable {
             let headers_proto = proto;

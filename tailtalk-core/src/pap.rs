@@ -533,7 +533,8 @@ impl PapServer {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    //! A packet-level stand-in for the Mac side.
+    //! A packet-level stand-in for the Mac side, shared by the PAP
+    //! server's own tests and by the printer roles built on it.
     use super::*;
 
     pub(crate) fn addr(node: u8, socket: u8) -> ServiceAddress {
@@ -551,9 +552,61 @@ pub(crate) mod test_support {
         pub(crate) addr: ServiceAddress,
     }
 
+    impl MiniClient {
+        pub(crate) fn new(node: u8, socket: u8) -> Self {
+            Self {
+                ep: AtpEndpoint::new(socket),
+                addr: addr(node, socket),
+            }
+        }
+
+        /// OpenConn, naming this client's own socket as the responding one.
+        pub(crate) fn open_conn(&mut self, listener: ServiceAddress, now: Micros) {
+            let socket = self.addr.socket_number;
+            let open = PapPacket {
+                connection_id: socket,
+                function: PapFunction::OpenConn,
+                sequence_num: 0,
+                eof: false,
+                data: &[socket, FLOW_QUANTUM, 0, 0],
+            };
+            let (ub, d) = open.to_atp_parts();
+            self.ep.request(listener, ub, d, 0x01, now);
+        }
+    }
+
+    /// What [`shuttle`] needs of the server side: a bare [`PapServer`], or a
+    /// printer role that wraps one.
+    pub(crate) trait PapPeer {
+        fn handle_datagram(
+            &mut self,
+            local_socket: u8,
+            src: ServiceAddress,
+            payload: &[u8],
+            now: Micros,
+        );
+        fn poll_transmit(&mut self) -> Option<(u8, ServiceAddress, Vec<u8>)>;
+    }
+
+    impl PapPeer for PapServer {
+        fn handle_datagram(
+            &mut self,
+            local_socket: u8,
+            src: ServiceAddress,
+            payload: &[u8],
+            now: Micros,
+        ) {
+            PapServer::handle_datagram(self, local_socket, src, payload, now);
+        }
+
+        fn poll_transmit(&mut self) -> Option<(u8, ServiceAddress, Vec<u8>)> {
+            PapServer::poll_transmit(self)
+        }
+    }
+
     /// Carry datagrams both ways until neither side has more to say.
     pub(crate) fn shuttle(
-        server: &mut PapServer,
+        server: &mut impl PapPeer,
         server_node: u8,
         client: &mut MiniClient,
         now: Micros,
