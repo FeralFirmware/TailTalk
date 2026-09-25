@@ -178,8 +178,20 @@ impl AdspEndpoint {
     /// Set the advertised receive window. Track free space in the data sink
     /// and shrink toward zero rather than dropping; every outgoing packet
     /// carries the current value.
+    ///
+    /// Reopening a closed window is announced with an ack on every
+    /// connection. A peer told zero stops sending, so nothing it sends will
+    /// prompt a reply carrying the new window; a receiver with no data of
+    /// its own would otherwise leave it waiting forever.
     pub fn set_recv_window(&mut self, window: u16) {
+        let reopened = self.recv_window == 0 && window > 0;
         self.recv_window = window;
+        if reopened {
+            let keys: Vec<u16> = self.connections.keys().copied().collect();
+            for key in keys {
+                self.send_ack(key);
+            }
+        }
     }
 
     /// Begin an outbound connect. Returns the handle (our ConnID) that
@@ -1161,6 +1173,29 @@ mod tests {
         assert!(matches!(
             server.poll_event(),
             Some(AdspEvent::Data { data, .. }) if data == b"blocked bytes"
+        ));
+        assert_eq!(client.tx_backlog(client_conn), 0);
+    }
+
+    #[test]
+    fn reopened_window_is_announced_without_data() {
+        let (mut client, ca, mut server, sa, client_conn, _server_conn) = connect_pair();
+
+        // Server closes its window and the client hears about it.
+        server.set_recv_window(0);
+        client.send(client_conn, b"x", false).unwrap();
+        shuttle(&mut client, ca, &mut server, sa, 100);
+        while server.poll_event().is_some() {}
+        client.send(client_conn, b"blocked", false).unwrap();
+        assert!(client.poll_transmit().is_none(), "window is closed");
+
+        // The server reopens and has nothing of its own to say. The reopen
+        // alone must get the client moving again.
+        server.set_recv_window(512);
+        shuttle(&mut client, ca, &mut server, sa, 200);
+        assert!(matches!(
+            server.poll_event(),
+            Some(AdspEvent::Data { data, .. }) if data == b"blocked"
         ));
         assert_eq!(client.tx_backlog(client_conn), 0);
     }

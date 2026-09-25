@@ -58,6 +58,9 @@ pub const NBP_TYPE: &str = "ImageWriter";
 /// Self ID query (manual Table 6-7). Answered with `IW<width>[C][F]`.
 pub const SELF_ID: &[u8] = &[0x1B, b'?'];
 
+/// The card's rename command, followed by the new name as a Pascal string.
+pub const RENAME: &[u8] = &[0x1B, b'b'];
+
 /// Colour ribbon fitted (status word bit 7). Verified active-high on a
 /// real ImageWriter II; see the module docs for the readings.
 pub const STATUS_COLOUR_RIBBON: u16 = 0x0080;
@@ -93,13 +96,33 @@ enum Ident {
     Settled,
 }
 
+/// What the embedder sees. The PAP server's own events pass through; the
+/// rename is the role's, because `ESC b` is a printer-stream command and PAP
+/// has no business knowing about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageWriterEvent {
+    ConnectionOpened {
+        client: ServiceAddress,
+    },
+    /// Job bytes for the printer UART.
+    ToPrinter(Vec<u8>),
+    JobEof,
+    ConnectionClosed,
+    /// The client renamed the card, as raw MacRoman bytes. The embedder owns
+    /// what happens next: re-register under it, and persist it. A real card
+    /// keeps the name across a power cycle and re-registers itself.
+    Rename(Vec<u8>),
+}
+
 pub struct ImageWriterRole {
     server: PapServer,
     ident: Ident,
     ident_reply: Vec<u8>,
     /// Events the role raises itself, ahead of the PAP server's.
-    events: VecDeque<PapEvent>,
+    events: VecDeque<ImageWriterEvent>,
     colour_ribbon: bool,
+    /// Set while the next job bytes are still the first of a job.
+    job_start: bool,
 }
 
 impl ImageWriterRole {
@@ -110,6 +133,7 @@ impl ImageWriterRole {
             ident_reply: Vec::new(),
             events: VecDeque::new(),
             colour_ribbon: true,
+            job_start: true,
         };
         role.apply_status();
         role
@@ -222,7 +246,8 @@ impl ImageWriterRole {
         match self.ident {
             Ident::Due if !self.server.busy() => {
                 self.ident_reply.clear();
-                self.events.push_back(PapEvent::ToPrinter(SELF_ID.to_vec()));
+                self.events
+                    .push_back(ImageWriterEvent::ToPrinter(SELF_ID.to_vec()));
                 self.ident = Ident::Waiting {
                     since: now,
                     last: None,
@@ -263,18 +288,54 @@ impl ImageWriterRole {
         self.server.poll_transmit()
     }
 
-    pub fn poll_event(&mut self) -> Option<PapEvent> {
+    pub fn poll_event(&mut self) -> Option<ImageWriterEvent> {
         if let Some(event) = self.events.pop_front() {
             return Some(event);
         }
-        let event = self.server.poll_event()?;
-        if matches!(event, PapEvent::ConnectionClosed) {
-            // The ribbon can be changed between jobs, so ask again once the
-            // printer is idle.
-            self.ident = Ident::Due;
+        match self.server.poll_event()? {
+            PapEvent::ConnectionOpened { client } => {
+                self.job_start = true;
+                Some(ImageWriterEvent::ConnectionOpened { client })
+            }
+            PapEvent::JobEof => {
+                self.job_start = true;
+                Some(ImageWriterEvent::JobEof)
+            }
+            PapEvent::ConnectionClosed => {
+                // The ribbon can be changed between jobs, so ask again once
+                // the printer is idle.
+                self.ident = Ident::Due;
+                self.job_start = true;
+                Some(ImageWriterEvent::ConnectionClosed)
+            }
+            PapEvent::ToPrinter(bytes) => {
+                // A rename is sent the way a job is, so it has to be pulled
+                // out of the stream before the bytes reach the UART - the
+                // printer has no `ESC b` and would print the name. Only
+                // honoured at the head of a job, which is how a client sends
+                // it: a bitmap run is arbitrary binary and a packet of it may
+                // well begin with 1B 62.
+                let at_start = self.job_start;
+                self.job_start = false;
+                match parse_rename(&bytes) {
+                    Some(name) if at_start => Some(ImageWriterEvent::Rename(name)),
+                    _ => Some(ImageWriterEvent::ToPrinter(bytes)),
+                }
+            }
         }
-        Some(event)
     }
+}
+
+/// Pull a rename out of a job's opening bytes: `ESC b` then a Pascal string,
+/// and nothing else. `ESC b` is unassigned in the ImageWriter's own command
+/// set, which is what left it free for the card to claim.
+fn parse_rename(bytes: &[u8]) -> Option<Vec<u8>> {
+    let rest = bytes.strip_prefix(RENAME)?;
+    let (&len, name) = rest.split_first()?;
+    if len == 0 || name.len() != len as usize {
+        return None;
+    }
+    Some(name.to_vec())
 }
 
 #[cfg(test)]
@@ -301,7 +362,7 @@ mod tests {
     /// printer.
     fn next_to_printer(role: &mut ImageWriterRole) -> Option<Vec<u8>> {
         core::iter::from_fn(|| role.poll_event()).find_map(|e| match e {
-            PapEvent::ToPrinter(bytes) => Some(bytes),
+            ImageWriterEvent::ToPrinter(bytes) => Some(bytes),
             _ => None,
         })
     }
@@ -397,6 +458,121 @@ mod tests {
         assert!(role.colour_ribbon(), "no answer must not clear the bit");
     }
 
+    /// Open a session and answer the server's pulls with `chunks`, one PAP
+    /// data packet each, the last carrying eof. Returns every event raised.
+    ///
+    /// Chunking matters here: the role sees one `ToPrinter` per packet, so a
+    /// raster split such that a packet begins with `1B 62` is exactly the
+    /// case the start-of-job rule has to reject.
+    fn run_job(chunks: &[&[u8]]) -> Vec<ImageWriterEvent> {
+        use crate::atp::AtpEvent;
+        use tailtalk_packets::pap::{PapFunction, PapPacket};
+
+        let mut role = ImageWriterRole::new(190, 191);
+        role.set_sink_credit(64 * 1024, 0);
+        let mut client = MiniClient::new(10, 70);
+        client.open_conn(addr(130, role.listener_socket()), 0);
+        shuttle(&mut role, 130, &mut client, 0);
+
+        let mut events: Vec<ImageWriterEvent> = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let now = 20 + i as Micros * 10;
+            // The server pulls as soon as it has credit, so a SendData is
+            // already among the events the last exchange produced.
+            let (source, tid) = loop {
+                match client.ep.poll_event() {
+                    Some(AtpEvent::Request {
+                        source,
+                        tid,
+                        user_bytes,
+                        data,
+                        ..
+                    }) => {
+                        let pap = PapPacket::parse_from_atp(user_bytes, &data).unwrap();
+                        if pap.function == PapFunction::SendData {
+                            break (source, tid);
+                        }
+                    }
+                    Some(_) => continue,
+                    None => panic!("the server never pulled for chunk {i}"),
+                }
+            };
+            let job = PapPacket {
+                connection_id: 70,
+                function: PapFunction::Data,
+                sequence_num: 0,
+                eof: i + 1 == chunks.len(),
+                data: chunk,
+            };
+            let (ub, d) = job.to_atp_parts();
+            client
+                .ep
+                .respond(source, tid, ub, d, crate::pap::PAP_MAX_DATA_PER_PACKET, now);
+            shuttle(&mut role, 130, &mut client, now);
+            events.extend(core::iter::from_fn(|| role.poll_event()));
+        }
+        events
+    }
+
+    /// A rename must never reach the UART: the printer has no `ESC b` and
+    /// would print the name across the page.
+    #[test]
+    fn a_rename_job_is_swallowed_rather_than_printed() {
+        let events = run_job(&[b"\x1bb\x04Inky"]);
+        assert!(
+            events.contains(&ImageWriterEvent::Rename(b"Inky".to_vec())),
+            "the rename must be raised: {events:02X?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ImageWriterEvent::ToPrinter(b) if b.starts_with(RENAME))),
+            "and must not also go to the printer: {events:02X?}"
+        );
+    }
+
+    /// A later packet that begins with the rename bytes is still pixels: a
+    /// bitmap run is arbitrary binary and may be split anywhere.
+    #[test]
+    fn esc_b_later_in_a_job_stays_printer_data() {
+        let events = run_job(&[b"\x1bG0008", b"\x1bb\x04Inky"]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ImageWriterEvent::Rename(_))),
+            "1B 62 in a bitmap run is data, not a rename: {events:02X?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ImageWriterEvent::ToPrinter(b) if b.ends_with(b"Inky"))),
+            "the bytes must reach the printer: {events:02X?}"
+        );
+    }
+
+    /// The wire format: `ESC b`, a length byte, then the name.
+    #[test]
+    fn a_rename_is_pulled_out_of_the_job_stream() {
+        assert_eq!(parse_rename(b"\x1bb\x04Inky"), Some(b"Inky".to_vec()));
+    }
+
+    /// Strict on its own, not only through the start-of-job rule: 1B 62
+    /// occurs in bitmap runs as pixel data, so anything but exactly `ESC b`,
+    /// a length byte and that many name bytes stays printer data.
+    #[test]
+    fn only_a_bare_well_formed_rename_is_taken() {
+        // Trailing bytes: a raster that merely opens with the same two bytes.
+        assert_eq!(parse_rename(b"\x1bb\x04Inky\x1bG0008"), None);
+        // Length byte disagreeing with what follows.
+        assert_eq!(parse_rename(b"\x1bb\x09Inky"), None);
+        // Empty name.
+        assert_eq!(parse_rename(b"\x1bb\x00"), None);
+        // Truncated.
+        assert_eq!(parse_rename(b"\x1bb"), None);
+        // An ordinary bitmap run.
+        assert_eq!(parse_rename(b"\x1bG0004\x1bb\x04Inky"), None);
+    }
+
     /// The manual's constraint (p89): the printer does not read a command
     /// until the paper reaches that point in the job, so a query issued
     /// mid-stream would land in the middle of a bitmap and be answered
@@ -412,7 +588,7 @@ mod tests {
         shuttle(&mut role, 130, &mut client, 0);
         assert!(
             core::iter::from_fn(|| role.poll_event())
-                .any(|e| matches!(e, PapEvent::ConnectionOpened { .. })),
+                .any(|e| matches!(e, ImageWriterEvent::ConnectionOpened { .. })),
             "the session must be open for this test to mean anything"
         );
 

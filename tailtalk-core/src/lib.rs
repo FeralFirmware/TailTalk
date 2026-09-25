@@ -15,7 +15,9 @@
 //! says when `poll` next needs calling.
 //!
 //! The caller supplies the I/O and the clock, so the same state machines run
-//! under tokio on the desktop and Embassy on the firmware.
+//! under tokio on the desktop and Embassy on the firmware. `tailtalk-net`
+//! is the ready-made caller: async socket handles over these machines, for
+//! any executor.
 //!
 //! Layering: [`atp`] and [`adsp`] are the transports, each standalone. The
 //! protocols built on them - PAP, and the printer roles - belong here too,
