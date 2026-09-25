@@ -109,6 +109,12 @@ impl Stack {
         })
     }
 
+    /// A value from the stack's PRNG, for layers above that need randomness
+    /// (ADSP connection IDs) and have no entropy source of their own.
+    pub fn next_random(&mut self) -> u32 {
+        self.rng.next_u32()
+    }
+
     /// Whether a router has been seen (switches DDP to long form).
     pub fn router_seen(&self) -> bool {
         self.router.is_some()

@@ -49,8 +49,16 @@ pub const NBP_TYPE: &str = "ColorStyleWriter2400AT";
 pub const ATTN_PRINT_REQUEST: u16 = 0x000B;
 /// Buffer-ready query, answered with in-band 0xFFFF.
 pub const ATTN_BUFFER_READY: u16 = 0x0006;
-/// Kill/teardown attention (lpstyl `at_printer_kill`).
+/// Kill/teardown attention (lpstyl `at_printer_kill`). The rename sequence
+/// reuses this code as its commit step, so the two are told apart by which
+/// connection the attention arrives on: a job's kill comes in on the data
+/// connection, a commit on a control connection.
 pub const ATTN_KILL: u16 = 0x0012;
+/// Opens the rename sequence. Despite the name, no name comes back: the
+/// answer is in-band 0x0000, and the client checks for exactly that.
+pub const ATTN_GET_NAME: u16 = 0x0011;
+/// Carries the new name as a Pascal string. Answered with in-band 0x0000.
+pub const ATTN_SET_NAME: u16 = 0x0009;
 
 /// In-band print-request results (step 4).
 const RESULT_ACCEPTED: [u8; 2] = [0x00, 0x00];
@@ -72,6 +80,12 @@ pub enum StyleWriterEvent {
     /// a vanished client; on an unclean end a reset was already queued as a
     /// `ToPrinter` event.
     JobEnded { clean: bool },
+    /// The client committed a new NBP name, as raw MacRoman bytes. The
+    /// embedder owns what happens next: re-register under it, and persist it
+    /// if the hardware has somewhere to put it. A real adapter keeps the name
+    /// across a power cycle and re-registers itself, so a client looking the
+    /// printer up shortly afterwards expects to find the new name.
+    Rename(Vec<u8>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,9 +99,14 @@ enum State {
         data_socket: u8,
     },
     /// Reverse connection in flight.
-    Connecting { conn: u16 },
+    Connecting {
+        conn: u16,
+    },
     /// Byte pipe active on this data connection.
-    Piping { conn: u16, kill_seen: bool },
+    Piping {
+        conn: u16,
+        kill_seen: bool,
+    },
 }
 
 /// How long a half-finished handshake may sit before the role gives up and
@@ -109,6 +128,8 @@ pub struct StyleWriterRole {
     /// deadline of its own and ends when the connection does.
     state_since: Micros,
     events: alloc::collections::VecDeque<StyleWriterEvent>,
+    /// Name staged by [`ATTN_SET_NAME`], published when the commit arrives.
+    pending_name: Option<Vec<u8>>,
 }
 
 impl StyleWriterRole {
@@ -120,6 +141,7 @@ impl StyleWriterRole {
             state: State::Idle,
             state_since: 0,
             events: alloc::collections::VecDeque::new(),
+            pending_name: None,
         }
     }
 
@@ -143,7 +165,8 @@ impl StyleWriterRole {
     /// This becomes the ADSP receive window: it shrinks toward zero instead
     /// of data being dropped, which is InkTalk's only flow control.
     pub fn set_printer_credit(&mut self, bytes: usize) {
-        self.endpoint.set_recv_window(bytes.min(u16::MAX as usize) as u16);
+        self.endpoint
+            .set_recv_window(bytes.min(u16::MAX as usize) as u16);
     }
 
     /// Bytes the printer produced (UART RX): forward down the data pipe.
@@ -230,10 +253,15 @@ impl StyleWriterRole {
                 // retransmitted open with a second connection and moved to
                 // it, and latching onto the new key is the whole point of
                 // that notification.
-                if !inbound
-                    && matches!(self.state, State::Connecting { .. } | State::Piping { .. })
+                if !inbound && matches!(self.state, State::Connecting { .. } | State::Piping { .. })
                 {
-                    self.enter(State::Piping { conn, kill_seen: false }, now);
+                    self.enter(
+                        State::Piping {
+                            conn,
+                            kill_seen: false,
+                        },
+                        now,
+                    );
                 }
             }
             AdspEvent::Attention { conn, code, data } => {
@@ -262,7 +290,10 @@ impl StyleWriterRole {
                     let pending = self.endpoint.connect(dest, now);
                     self.enter(State::Connecting { conn: pending }, now);
                 }
-                State::Piping { conn: dc, kill_seen } if conn == dc => {
+                State::Piping {
+                    conn: dc,
+                    kill_seen,
+                } if conn == dc => {
                     if !kill_seen {
                         // Client vanished mid-job: eject and reset so paper
                         // is not left in the feed path.
@@ -327,14 +358,45 @@ impl StyleWriterRole {
                 let _ = self.endpoint.send(conn, &[0xFF, 0xFF], false);
             }
             ATTN_KILL => {
-                // Two in-band reply bytes; value unverified on hardware, see
-                // the module docs. Then expect the peer to close.
-                let _ = self.endpoint.send(conn, &[0xFF, 0xFF], false);
+                // Kill on the data connection, rename commit anywhere else;
+                // see ATTN_KILL.
                 if let State::Piping { conn: dc, .. } = self.state
                     && conn == dc
                 {
-                    self.enter(State::Piping { conn: dc, kill_seen: true }, now);
+                    // Two in-band reply bytes; value unverified on hardware,
+                    // see the module docs. Then expect the peer to close.
+                    let _ = self.endpoint.send(conn, &[0xFF, 0xFF], false);
+                    self.enter(
+                        State::Piping {
+                            conn: dc,
+                            kill_seen: true,
+                        },
+                        now,
+                    );
+                } else {
+                    // Commit: publish whatever SET_NAME staged. A commit with
+                    // nothing staged is still answered, because the client
+                    // waits on the reply either way.
+                    if let Some(name) = self.pending_name.take() {
+                        self.events.push_back(StyleWriterEvent::Rename(name));
+                    }
+                    let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
                 }
+            }
+            ATTN_GET_NAME => {
+                let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
+            }
+            ATTN_SET_NAME => {
+                // Pascal string: one length byte, then MacRoman bytes. Staged
+                // rather than published, because the client only treats the
+                // rename as done once its commit is answered.
+                if let Some(&len) = data.first()
+                    && len > 0
+                    && data.len() > len as usize
+                {
+                    self.pending_name = Some(data[1..1 + len as usize].to_vec());
+                }
+                let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
             }
             _ => {}
         }
@@ -357,7 +419,12 @@ mod tests {
 
     /// Move traffic between the role (printer, node 130 socket 129) and a
     /// raw client endpoint (Mac, node 10) until quiescent.
-    fn shuttle(role: &mut StyleWriterRole, mac: &mut AdspEndpoint, mac_ctrl: ServiceAddress, now: Micros) {
+    fn shuttle(
+        role: &mut StyleWriterRole,
+        mac: &mut AdspEndpoint,
+        mac_ctrl: ServiceAddress,
+        now: Micros,
+    ) {
         let printer = addr(130, role.control_socket());
         loop {
             let mut progressed = false;
@@ -389,6 +456,98 @@ mod tests {
         p
     }
 
+    /// Open a control connection from the Mac side, returning its handle.
+    fn open_control(
+        role: &mut StyleWriterRole,
+        mac: &mut AdspEndpoint,
+        mac_addr: ServiceAddress,
+    ) -> u16 {
+        let _ = mac.connect(addr(130, 129), 0);
+        shuttle(role, mac, mac_addr, 0);
+        match mac.poll_event() {
+            Some(AdspEvent::Opened { conn, .. }) => conn,
+            other => panic!("expected ctrl Opened, got {other:?}"),
+        }
+    }
+
+    /// The next in-band data the Mac sees on `want`.
+    fn in_band(mac: &mut AdspEndpoint, want: u16) -> Vec<u8> {
+        loop {
+            match mac.poll_event() {
+                Some(AdspEvent::Data { conn, data, .. }) if conn == want => break data,
+                Some(_) => continue,
+                None => panic!("no in-band reply"),
+            }
+        }
+    }
+
+    fn pascal(name: &[u8]) -> Vec<u8> {
+        let mut v = alloc::vec![name.len() as u8];
+        v.extend_from_slice(name);
+        v
+    }
+
+    fn role_events(role: &mut StyleWriterRole) -> Vec<StyleWriterEvent> {
+        core::iter::from_fn(|| role.poll_event()).collect()
+    }
+
+    /// The three-attention rename: query, set, commit.
+    ///
+    /// Each step is answered with in-band 0x0000, and the client blocks on
+    /// that reply before sending the next - so an unanswered step stalls the
+    /// rename rather than failing it.
+    #[test]
+    fn a_rename_is_answered_at_each_step_and_published_on_commit() {
+        let mac_addr = addr(10, 70);
+        let mut role = StyleWriterRole::new(129, 42);
+        let mut mac = AdspEndpoint::new(70, 77);
+        mac.set_listening(true);
+        let ctrl = open_control(&mut role, &mut mac, mac_addr);
+
+        let mut now = 100;
+        for (code, payload) in [
+            (ATTN_GET_NAME, alloc::vec![0x00]),
+            (ATTN_SET_NAME, pascal(b"Inky")),
+            (ATTN_KILL, alloc::vec![0x00]),
+        ] {
+            mac.send_attention(ctrl, code, &payload, now).unwrap();
+            shuttle(&mut role, &mut mac, mac_addr, now);
+            assert_eq!(
+                in_band(&mut mac, ctrl),
+                alloc::vec![0x00, 0x00],
+                "step {code:#06x} must be answered"
+            );
+            now += 100;
+        }
+
+        assert_eq!(
+            role_events(&mut role),
+            alloc::vec![StyleWriterEvent::Rename(b"Inky".to_vec())]
+        );
+    }
+
+    /// A name arriving with no commit behind it is never published: the
+    /// client has not been told the rename took.
+    #[test]
+    fn a_staged_name_without_a_commit_is_not_published() {
+        let mac_addr = addr(10, 70);
+        let mut role = StyleWriterRole::new(129, 42);
+        let mut mac = AdspEndpoint::new(70, 77);
+        mac.set_listening(true);
+        let ctrl = open_control(&mut role, &mut mac, mac_addr);
+
+        mac.send_attention(ctrl, ATTN_SET_NAME, &pascal(b"Never"), 100)
+            .unwrap();
+        shuttle(&mut role, &mut mac, mac_addr, 100);
+
+        assert!(
+            !role_events(&mut role)
+                .iter()
+                .any(|e| matches!(e, StyleWriterEvent::Rename(_))),
+            "nothing is published until the commit"
+        );
+    }
+
     #[test]
     fn full_handshake_and_byte_pipe() {
         let mac_addr = addr(10, 70);
@@ -409,13 +568,20 @@ mod tests {
         let _ = ctrl;
 
         // Step 3: print request naming data socket 70 (same endpoint here).
-        mac.send_attention(ctrl_conn, ATTN_PRINT_REQUEST, &print_request(70, b"Bob"), 100)
-            .unwrap();
+        mac.send_attention(
+            ctrl_conn,
+            ATTN_PRINT_REQUEST,
+            &print_request(70, b"Bob"),
+            100,
+        )
+        .unwrap();
         shuttle(&mut role, &mut mac, mac_addr, 100);
 
         assert_eq!(
             role.poll_event(),
-            Some(StyleWriterEvent::JobStarted { user: b"Bob".to_vec() })
+            Some(StyleWriterEvent::JobStarted {
+                user: b"Bob".to_vec()
+            })
         );
 
         // Step 4: two-byte accept arrives in band on the control conn.
@@ -460,7 +626,8 @@ mod tests {
         assert_eq!(reply, b"CS\r");
 
         // Attention 0x0006 is answered with in-band 0xFFFF.
-        mac.send_attention(data_conn, ATTN_BUFFER_READY, &[0x00], 500).unwrap();
+        mac.send_attention(data_conn, ATTN_BUFFER_READY, &[0x00], 500)
+            .unwrap();
         shuttle(&mut role, &mut mac, mac_addr, 500);
         let br = loop {
             match mac.poll_event() {
@@ -472,7 +639,8 @@ mod tests {
         assert_eq!(br, [0xFF, 0xFF]);
 
         // Step 8: kill attention then close = clean end, no reset injected.
-        mac.send_attention(data_conn, ATTN_KILL, &[0x00], 600).unwrap();
+        mac.send_attention(data_conn, ATTN_KILL, &[0x00], 600)
+            .unwrap();
         shuttle(&mut role, &mut mac, mac_addr, 600);
         mac.close(data_conn);
         shuttle(&mut role, &mut mac, mac_addr, 700);
@@ -511,8 +679,13 @@ mod tests {
             other => panic!("{other:?}"),
         };
         let _ = ctrl;
-        mac.send_attention(ctrl_conn, ATTN_PRINT_REQUEST, &print_request(70, b"Eve"), 100)
-            .unwrap();
+        mac.send_attention(
+            ctrl_conn,
+            ATTN_PRINT_REQUEST,
+            &print_request(70, b"Eve"),
+            100,
+        )
+        .unwrap();
         shuttle(&mut role, &mut mac, mac_addr, 100);
         mac.close(ctrl_conn);
         shuttle(&mut role, &mut mac, mac_addr, 200);
@@ -565,15 +738,23 @@ mod tests {
             Some(AdspEvent::Opened { conn, .. }) => conn,
             other => panic!("{other:?}"),
         };
-        mac.send_attention(ctrl_conn, ATTN_PRINT_REQUEST, &print_request(70, b"Gone"), 100)
-            .unwrap();
+        mac.send_attention(
+            ctrl_conn,
+            ATTN_PRINT_REQUEST,
+            &print_request(70, b"Gone"),
+            100,
+        )
+        .unwrap();
         shuttle(&mut role, &mut mac, mac_addr, 100);
         assert!(role.busy(), "accepted request should hold the role");
 
         // The client now disappears: it never closes the control
         // connection, so nothing else moves the state machine.
         role.poll(200);
-        assert!(role.busy(), "must not release while the wait is still fresh");
+        assert!(
+            role.busy(),
+            "must not release while the wait is still fresh"
+        );
 
         role.poll(200 + HANDSHAKE_TIMEOUT_US + 1);
         assert!(!role.busy(), "stalled handshake must release the role");

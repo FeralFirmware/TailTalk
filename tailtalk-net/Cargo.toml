@@ -1,0 +1,25 @@
+[package]
+name = "tailtalk-net"
+version.workspace = true
+edition = "2024"
+license-file = "../LICENSE"
+description = "Async AppleTalk sockets over tailtalk-core's sans-io state machines, for any executor"
+authors = ["FeralFirmware"]
+repository = "https://github.com/feralfirmware/tailtalk"
+
+[dependencies]
+# Not inherited from the workspace, for the same reason as in tailtalk-core:
+# this crate must build without std for the firmware.
+tailtalk-core = { path = "../tailtalk-core", version = "^0.11", default-features = false }
+tailtalk-packets = { path = "../tailtalk-packets", version = "^0.11", default-features = false }
+
+# Pinned to the minor versions the InkTalk firmware uses. RawMutex has to be
+# the same trait on both sides, or the firmware's ThreadModeRawMutex does not
+# satisfy it.
+embassy-sync = "0.6"
+embassy-futures = "0.1"
+embedded-io-async = "0.6"
+
+[dev-dependencies]
+tailtalk = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

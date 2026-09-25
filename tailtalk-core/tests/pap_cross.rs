@@ -21,8 +21,7 @@ use tailtalk::{
     pap::PapClient,
     route_table::{LearningMode, RouteTable},
 };
-use tailtalk_core::imagewriter::{self, ImageWriterRole};
-use tailtalk_core::pap::PapEvent;
+use tailtalk_core::imagewriter::{self, ImageWriterEvent, ImageWriterRole};
 use tailtalk_packets::aarp::{AddressSource, AppleTalkAddress};
 use tailtalk_packets::ddp::{DdpPacket as DdpHeaders, DdpProtocolType};
 use tailtalk_packets::nbp::ServiceAddress;
@@ -159,18 +158,18 @@ async fn embedded_imagewriter_streams_a_job_verbatim() {
             }
             while let Some(ev) = role.poll_event() {
                 match ev {
-                    PapEvent::ConnectionOpened { .. } => job_open = true,
-                    PapEvent::ConnectionClosed => job_open = false,
+                    ImageWriterEvent::ConnectionOpened { .. } => job_open = true,
+                    ImageWriterEvent::ConnectionClosed => job_open = false,
                     // Stand in for the printer: answer the self ID query,
                     // and treat everything else as job data on paper.
-                    PapEvent::ToPrinter(bytes) if bytes == imagewriter::SELF_ID => {
+                    ImageWriterEvent::ToPrinter(bytes) if bytes == imagewriter::SELF_ID => {
                         if job_open {
                             *identify_in_task.lock().unwrap() = true;
                         }
                         let reply = *ribbon_in_task.lock().unwrap();
                         role.printer_input(reply, now);
                     }
-                    PapEvent::ToPrinter(bytes) => {
+                    ImageWriterEvent::ToPrinter(bytes) => {
                         received_in_task.lock().unwrap().extend_from_slice(&bytes);
                     }
                     _ => {}

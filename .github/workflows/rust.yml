@@ -64,6 +64,9 @@ jobs:
       # target has no implementation of. It is also how the firmware depends
       # on the crate.
       run: cargo build -p tailtalk-core --target thumbv6m-none-eabi --no-default-features
+    - name: Build tailtalk-net for bare metal
+      # No feature flags: this crate has no std side to switch off.
+      run: cargo build -p tailtalk-net --target thumbv6m-none-eabi
 
   release:
     runs-on: ${{ matrix.os }}
