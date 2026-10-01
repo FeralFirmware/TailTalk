@@ -11,7 +11,7 @@ use common::{Tokio, cable, desktop, settle, start};
 use embassy_futures::select::{Either, select};
 use embedded_io_async::Write as _;
 use tailtalk::adsp::{Adsp, AdspAddress};
-use tailtalk_net::adsp::{AdspError, AdspListener, AdspStream, RX_WINDOW, TX_BUFFER};
+use tailtalk_net::adsp::{AdspError, AdspListener, AdspStream, MessageError, RX_WINDOW, TX_BUFFER};
 use tailtalk_net::ddp::DdpSocket;
 use tailtalk_net::{Net, ServiceAddress};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -133,6 +133,106 @@ async fn a_message_carries_its_eom_on_its_last_packet() {
                 sent.iter().all(|&(d, len)| len > 0 && d & eom != 0),
                 "every reply one packet, flagged EOM: {sent:?}"
             );
+        })
+        .await;
+}
+
+/// Messages come out one per read, however their end was marked, and the
+/// stream's close ends them.
+#[tokio::test(start_paused = true)]
+async fn messages_are_read_whole_and_one_at_a_time() {
+    LocalSet::new()
+        .run_until(async {
+            let (a, b) = two_nodes();
+            tokio::join!(a.wait_address(), b.wait_address());
+            let listener = AdspListener::bind(b, None).unwrap();
+            let target = at(b, listener.socket());
+            let (client, server) = tokio::join!(AdspStream::connect(a, target), listener.accept());
+            let client = client.expect("connect failed");
+            let mut buf = [0u8; 16];
+
+            // Back to back, so they can share the receive queue.
+            client.write_message(b"one").await.unwrap();
+            client.write_message(b"two").await.unwrap();
+            assert_eq!(server.read_message(&mut buf).await, Ok(3));
+            assert_eq!(&buf[..3], b"one");
+            assert_eq!(server.read_message(&mut buf).await, Ok(3));
+            assert_eq!(&buf[..3], b"two");
+
+            // The end marked in an empty packet after the data went out.
+            (&client).write_all(b"three").await.unwrap();
+            client.flush_data().await.unwrap();
+            client.write_eom().unwrap();
+            assert_eq!(server.read_message(&mut buf).await, Ok(5));
+            assert_eq!(&buf[..5], b"three");
+
+            drop(client);
+            assert_eq!(server.read_message(&mut buf).await, Err(MessageError::Closed));
+        })
+        .await;
+}
+
+/// Reads stop where messages end, as `dspRead` does, so a message longer
+/// than the receive window still comes through, in parts.
+#[tokio::test(start_paused = true)]
+async fn reads_stop_at_the_end_of_each_message() {
+    LocalSet::new()
+        .run_until(async {
+            let (a, b) = two_nodes();
+            tokio::join!(a.wait_address(), b.wait_address());
+            let listener = AdspListener::bind(b, None).unwrap();
+            let target = at(b, listener.socket());
+            let (client, server) = tokio::join!(AdspStream::connect(a, target), listener.accept());
+            let client = client.expect("connect failed");
+
+            let long: Vec<u8> = (0..RX_WINDOW * 2).map(|i| i as u8).collect();
+            let read = async {
+                let mut got = Vec::new();
+                let mut buf = [0u8; 1000];
+                loop {
+                    let (n, eom) = server.read_with_eom(&mut buf).await;
+                    got.extend_from_slice(&buf[..n]);
+                    if eom {
+                        return got;
+                    }
+                    assert!(n > 0, "closed mid-message");
+                }
+            };
+            let (sent, got) = tokio::join!(client.write_message(&long), read);
+            sent.unwrap();
+            assert_eq!(got, long);
+
+            client.write_message(b"ab").await.unwrap();
+            client.write_message(b"cd").await.unwrap();
+            client.flush_data().await.unwrap();
+            let mut buf = [0u8; 16];
+            assert_eq!(server.read_data(&mut buf).await, 2);
+            assert_eq!(&buf[..2], b"ab");
+        })
+        .await;
+}
+
+/// A message too long for the buffer goes entirely, including the part
+/// that only arrives after it was refused.
+#[tokio::test(start_paused = true)]
+async fn a_message_too_long_is_skipped_whole() {
+    LocalSet::new()
+        .run_until(async {
+            let (a, b) = two_nodes();
+            tokio::join!(a.wait_address(), b.wait_address());
+            let listener = AdspListener::bind(b, None).unwrap();
+            let target = at(b, listener.socket());
+            let (client, server) = tokio::join!(AdspStream::connect(a, target), listener.accept());
+            let client = client.expect("connect failed");
+            let mut buf = [0u8; 4];
+
+            (&client).write_all(b"too long").await.unwrap();
+            client.flush_data().await.unwrap();
+            assert_eq!(server.read_message(&mut buf).await, Err(MessageError::TooLong));
+            client.write_message(b" still").await.unwrap();
+            client.write_message(b"ok").await.unwrap();
+            assert_eq!(server.read_message(&mut buf).await, Ok(2));
+            assert_eq!(&buf[..2], b"ok");
         })
         .await;
 }

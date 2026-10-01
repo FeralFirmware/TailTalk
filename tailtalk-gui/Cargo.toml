@@ -23,6 +23,7 @@ binhex-rs = "0.1.1"
 dirs = "6"
 hfs-reader = { workspace = true } #unified
 if-addrs = "0.15"
+inkproto = { workspace = true }
 ipp = "6.0.1"
 keepawake = "0.6"
 mdns-sd = "0.20.3"

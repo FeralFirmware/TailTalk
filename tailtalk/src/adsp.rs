@@ -1,5 +1,5 @@
 use crate::ddp::{DdpAddress, DdpHandle, DdpSocket};
-use bytes::{Buf, BytesMut};
+use bytes::BytesMut;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -16,6 +16,7 @@ use tailtalk_core::adsp::{AdspEndpoint, AdspEvent};
 /// small; a desktop has memory to spare and asks for more.
 const ADSP_RECV_WINDOW: u16 = 4096;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::PollSender;
 
 
 
@@ -63,7 +64,8 @@ fn ddp_dest(addr: AdspAddress) -> DdpAddress {
 /// retransmission - lives in [`AdspEndpoint`] and is shared with the
 /// embedded firmware. What is left here is strictly the tokio adaptation.
 struct StreamPlumbing {
-    data_tx: mpsc::Sender<Vec<u8>>,
+    /// Received data, and whether the peer ended a message with it.
+    data_tx: mpsc::Sender<(Vec<u8>, bool)>,
     attn_tx: mpsc::Sender<(u16, Vec<u8>)>,
     /// Writes handed to the endpoint, oldest first. Each caller's flush
     /// completes when the endpoint reports that write fully cut into
@@ -215,20 +217,18 @@ impl Adsp {
         &self,
         conn_id: u16,
         remote_addr: AdspAddress,
-        data_rx: mpsc::Receiver<Vec<u8>>,
+        data_rx: mpsc::Receiver<(Vec<u8>, bool)>,
         attn_rx: mpsc::Receiver<(u16, Vec<u8>)>,
     ) -> AdspStream {
         AdspStream {
             conn_id,
             remote_addr,
             cmd_tx: self.cmd_tx.clone(),
-            read: std::sync::Mutex::new(ReadState {
-                rx: data_rx,
-                leftover: BytesMut::new(),
-            }),
+            read: std::sync::Mutex::new(ReadState::new(data_rx)),
             attn_rx: std::sync::Mutex::new(attn_rx),
             write_buf: BytesMut::new(),
-            pending_flush: None,
+            flush_tx: PollSender::new(self.cmd_tx.clone()),
+            flush_reply: None,
         }
     }
 
@@ -417,14 +417,12 @@ impl Adsp {
                     )));
                 }
             }
-            // If a peer marks the end of a message after its data has already
-            // gone out, the flag arrives in an empty packet. We don't expose
-            // message boundaries on this stream, and an empty chunk would
-            // look like end of stream to the reader, so just drop it.
-            AdspEvent::Data { data, .. } if data.is_empty() => {}
-            AdspEvent::Data { conn, data, .. } => {
+            // An empty chunk still counts: if a peer marks the end of a
+            // message after its data has already gone out, the flag arrives
+            // in an empty packet.
+            AdspEvent::Data { conn, data, eom } => {
                 if let Some(plumbing) = self.streams.get(&conn)
-                    && plumbing.data_tx.send(data).await.is_err()
+                    && plumbing.data_tx.send((data, eom)).await.is_err()
                 {
                     // Reader dropped; the connection is no longer useful.
                     tracing::debug!("ADSP conn {} reader gone", conn);
@@ -507,17 +505,100 @@ impl Adsp {
 /// across an `.await`, so it is uncontended in practice and cannot stall the
 /// runtime.
 struct ReadState {
-    rx: mpsc::Receiver<Vec<u8>>,
-    /// Bytes from a chunk that was larger than the caller's buffer.
-    leftover: BytesMut,
+    rx: mpsc::Receiver<(Vec<u8>, bool)>,
+    /// Bytes the actor has delivered that nobody has read yet.
+    held: BytesMut,
+    /// Where messages end in `held`, as offsets from its front.
+    eoms: std::collections::VecDeque<usize>,
+}
+
+impl ReadState {
+    fn new(rx: mpsc::Receiver<(Vec<u8>, bool)>) -> Self {
+        Self { rx, held: BytesMut::new(), eoms: Default::default() }
+    }
+
+    /// Move the next chunk from the actor into `held`. `false` once the
+    /// actor has hung up, which is the end of the stream.
+    fn poll_chunk(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some((data, eom))) => {
+                self.held.extend_from_slice(&data);
+                if eom {
+                    self.eoms.push_back(self.held.len());
+                }
+                Poll::Ready(true)
+            }
+            Poll::Ready(None) => Poll::Ready(false),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Ready once there is something to read, if only the end of an empty
+    /// message, or the stream has ended.
+    fn poll_readable(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        while self.held.is_empty() && self.eoms.is_empty() {
+            if !std::task::ready!(self.poll_chunk(cx)) {
+                break;
+            }
+        }
+        Poll::Ready(())
+    }
+
+    /// Up to `max` held bytes, stopping at the end of a message, and whether
+    /// they reached it.
+    fn take(&mut self, max: usize) -> (BytesMut, bool) {
+        let to_end = self.eoms.front().copied().unwrap_or(self.held.len());
+        let n = to_end.min(max);
+        self.eoms.iter_mut().for_each(|e| *e -= n);
+        let eom = self.eoms.front() == Some(&0);
+        if eom {
+            self.eoms.pop_front();
+        }
+        (self.held.split_to(n), eom)
+    }
+
+    /// [`ReadState::take`] for a byte stream reader, ready once there is at
+    /// least one byte or the stream has ended. Empty messages are skipped,
+    /// since an empty read means the end of the stream.
+    fn poll_take(&mut self, cx: &mut Context<'_>, max: usize) -> Poll<BytesMut> {
+        loop {
+            std::task::ready!(self.poll_readable(cx));
+            match self.take(max) {
+                (bytes, true) if bytes.is_empty() && max > 0 => continue,
+                (bytes, _) => return Poll::Ready(bytes),
+            }
+        }
+    }
+
+    /// The next whole message, waiting for its end to arrive.
+    fn poll_message(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Vec<u8>>>> {
+        loop {
+            if let Some(end) = self.eoms.pop_front() {
+                self.eoms.iter_mut().for_each(|e| *e -= end);
+                return Poll::Ready(Ok(Some(self.held.split_to(end).to_vec())));
+            }
+            if !std::task::ready!(self.poll_chunk(cx)) {
+                return Poll::Ready(if self.held.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "ADSP connection closed in the middle of a message",
+                    ))
+                });
+            }
+        }
+    }
 }
 
 /// An open ADSP connection: a byte stream plus an out-of-band attention queue.
 ///
 /// Read the byte stream with [`read_data`](Self::read_data) or the
-/// [`AsyncRead`] impl, write with the [`AsyncWrite`] impl (and
-/// [`write_eom`](Self::write_eom) for record framing), and take out-of-band
-/// messages with [`attention`](Self::attention).
+/// [`AsyncRead`] impl, write with the [`AsyncWrite`] impl, and take
+/// out-of-band messages with [`attention`](Self::attention). A peer that
+/// frames its data in ADSP messages is read with
+/// [`read_message`](Self::read_message) and written with
+/// [`write_eom`](Self::write_eom) after each message.
 ///
 /// # Cancel safety
 ///
@@ -549,10 +630,17 @@ pub struct AdspStream {
     /// single non-blocking poll.
     attn_rx: std::sync::Mutex<mpsc::Receiver<(u16, Vec<u8>)>>,
     write_buf: BytesMut,
-    /// Boxed future for an in-progress flush. Stored so poll_flush can be
-    /// called repeatedly until the actor has processed the send command.
-    pending_flush: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send>>>,
+    /// `cmd_tx` again, in a form [`AsyncWrite::poll_flush`] can send on.
+    flush_tx: PollSender<ActorCmd>,
+    /// The actor's answer to the send a flush is waiting on.
+    flush_reply: Option<oneshot::Receiver<io::Result<()>>>,
 }
+
+// A task can only hold a `&self` read across an await if the stream is `Sync`.
+const _: fn() = || {
+    fn sync<T: Sync>() {}
+    sync::<AdspStream>();
+};
 
 impl AdspStream {
     pub fn remote_addr(&self) -> AdspAddress {
@@ -587,29 +675,14 @@ impl AdspStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let mut read = self.read.lock().expect("read state poisoned");
-
-        if !read.leftover.is_empty() {
-            let to_copy = read.leftover.len().min(buf.remaining());
-            buf.put_slice(&read.leftover[..to_copy]);
-            read.leftover.advance(to_copy);
-            return Poll::Ready(Ok(()));
-        }
-
-        match read.rx.poll_recv(cx) {
-            Poll::Ready(Some(data)) => {
-                let to_copy = data.len().min(buf.remaining());
-                buf.put_slice(&data[..to_copy]);
-                if to_copy < data.len() {
-                    read.leftover.extend_from_slice(&data[to_copy..]);
-                }
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(None) => Poll::Ready(Ok(())), // EOF — data_tx was dropped
-            Poll::Pending => Poll::Pending,
-        }
+        let bytes = std::task::ready!(read.poll_take(cx, buf.remaining()));
+        buf.put_slice(&bytes);
+        Poll::Ready(Ok(()))
     }
 
     /// Read stream bytes into `buf`, returning the number read (`0` at EOF).
+    /// A read stops at the end of a message, as the Mac's `dspRead` does, so
+    /// it can come up short.
     ///
     /// Equivalent to [`AsyncReadExt::read`](tokio::io::AsyncReadExt::read) but
     /// takes `&self`, so it can share a `tokio::select!` with
@@ -635,34 +708,43 @@ impl AdspStream {
     /// `AsyncReadExt` method for existing callers, which would silently change
     /// which function a bare `.read(..)` resolves to.
     pub async fn read_data(&self, buf: &mut [u8]) -> io::Result<usize> {
-        // Wait for readable data *without* taking it, so that dropping this
-        // future (the losing branch of every select! iteration) cannot strand
-        // bytes that were consumed but never returned.
-        std::future::poll_fn(|cx| {
-            let mut read = self.read.lock().expect("read state poisoned");
-            if !read.leftover.is_empty() {
-                return Poll::Ready(());
-            }
-            match read.rx.poll_recv(cx) {
-                // Bank the chunk and report readiness in the same critical
-                // section: an await point between the two would reintroduce
-                // the cancellation hole this exists to close.
-                Poll::Ready(Some(chunk)) => {
-                    read.leftover.extend_from_slice(&chunk);
-                    Poll::Ready(())
-                }
-                Poll::Ready(None) => Poll::Ready(()), // EOF
-                Poll::Pending => Poll::Pending,
-            }
+        // Nothing is taken until the poll that returns it, so a dropped
+        // future cannot strand bytes.
+        let bytes = std::future::poll_fn(|cx| {
+            self.read.lock().expect("read state poisoned").poll_take(cx, buf.len())
         })
         .await;
+        buf[..bytes.len()].copy_from_slice(&bytes);
+        Ok(bytes.len())
+    }
 
-        // Past the await: copying out is synchronous, so it cannot be cancelled.
-        let mut read = self.read.lock().expect("read state poisoned");
-        let to_copy = read.leftover.len().min(buf.len());
-        buf[..to_copy].copy_from_slice(&read.leftover[..to_copy]);
-        read.leftover.advance(to_copy);
-        Ok(to_copy)
+    /// Read stream bytes as the Mac's `dspRead` does: up to `buf.len()`, but
+    /// never past the end of a message. Returns how many, and whether they
+    /// reached the end of a message. A message longer than `buf` comes in
+    /// several reads, the last with the flag set, and an empty one as
+    /// `(0, true)`. `(0, false)` at EOF.
+    ///
+    /// Takes `&self` and is cancel-safe, like [`read_data`](Self::read_data).
+    pub async fn read_with_eom(&self, buf: &mut [u8]) -> io::Result<(usize, bool)> {
+        let (bytes, eom) = std::future::poll_fn(|cx| {
+            let mut read = self.read.lock().expect("read state poisoned");
+            std::task::ready!(read.poll_readable(cx));
+            Poll::Ready(read.take(buf.len()))
+        })
+        .await;
+        buf[..bytes.len()].copy_from_slice(&bytes);
+        Ok((bytes.len(), eom))
+    }
+
+    /// Read one whole message: everything up to the peer's next
+    /// end-of-message. `None` once the connection has closed between
+    /// messages; a close in the middle of one is an
+    /// [`UnexpectedEof`](io::ErrorKind::UnexpectedEof) error.
+    ///
+    /// Takes `&self` and is cancel-safe, like [`read_data`](Self::read_data):
+    /// a message leaves the stream only in the poll that returns it.
+    pub async fn read_message(&self) -> io::Result<Option<Vec<u8>>> {
+        std::future::poll_fn(|cx| self.read.lock().expect("read state poisoned").poll_message(cx)).await
     }
 
     /// Receive the next ADSP attention message from the peer, as
@@ -776,44 +858,27 @@ impl AsyncWrite for AdspStream {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        let actor_dead = || io::Error::new(io::ErrorKind::BrokenPipe, "adsp actor dead");
 
-        // If a send is already in-flight, poll it to completion.
-        if let Some(fut) = this.pending_flush.as_mut() {
-            let result = fut.as_mut().poll(cx);
-            if result.is_ready() {
-                this.pending_flush = None;
+        if this.flush_reply.is_none() {
+            if this.write_buf.is_empty() {
+                return Poll::Ready(Ok(()));
             }
-            return result;
+            // Ship the write buffer to the actor once there's room for it.
+            std::task::ready!(this.flush_tx.poll_reserve(cx)).map_err(|_| actor_dead())?;
+            let (reply, flush_reply) = oneshot::channel();
+            let data = this.write_buf.split().to_vec();
+            this.flush_tx
+                .send_item(ActorCmd::SendData { conn_id: this.conn_id, data, eom: false, reply })
+                .map_err(|_| actor_dead())?;
+            this.flush_reply = Some(flush_reply);
         }
 
-        if this.write_buf.is_empty() {
-            return Poll::Ready(Ok(()));
-        }
-
-        // Drain the write buffer and ship it to the actor.
-        let data = this.write_buf.split().to_vec();
-        let cmd_tx = this.cmd_tx.clone();
-        let conn_id = this.conn_id;
-
-        let fut: Pin<Box<dyn Future<Output = io::Result<()>> + Send>> = Box::pin(async move {
-            let (tx, rx) = oneshot::channel();
-            cmd_tx
-                .send(ActorCmd::SendData { conn_id, data, eom: false, reply: tx })
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "adsp actor dead"))?;
-            rx.await
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "adsp actor dead"))?
-        });
-
-        this.pending_flush = Some(fut);
-
-        // Poll it immediately — will often complete in one shot.
-        let fut = this.pending_flush.as_mut().unwrap();
-        let result = fut.as_mut().poll(cx);
-        if result.is_ready() {
-            this.pending_flush = None;
-        }
-        result
+        // The actor answers once the peer's window has taken every byte.
+        let reply = this.flush_reply.as_mut().expect("a send in flight");
+        let result = std::task::ready!(Pin::new(reply).poll(cx));
+        this.flush_reply = None;
+        Poll::Ready(result.unwrap_or_else(|_| Err(actor_dead())))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -848,21 +913,19 @@ mod tests {
 
     /// Build a stream fed by the returned sender, with no actor or socket
     /// behind it, so a test drives the receive queue directly.
-    fn test_stream() -> (AdspStream, mpsc::Sender<Vec<u8>>) {
+    fn test_stream() -> (AdspStream, mpsc::Sender<(Vec<u8>, bool)>) {
         let (data_tx, data_rx) = mpsc::channel(8);
         let (_attn_tx, attn_rx) = mpsc::channel(8);
         let (cmd_tx, _cmd_rx) = mpsc::channel(8);
         let stream = AdspStream {
             conn_id: 1,
             remote_addr: AdspAddress { network_number: 1, node_number: 2, socket_number: 3 },
-            cmd_tx,
-            read: std::sync::Mutex::new(ReadState {
-                rx: data_rx,
-                leftover: BytesMut::new(),
-            }),
+            cmd_tx: cmd_tx.clone(),
+            read: std::sync::Mutex::new(ReadState::new(data_rx)),
             attn_rx: std::sync::Mutex::new(attn_rx),
             write_buf: BytesMut::new(),
-            pending_flush: None,
+            flush_tx: PollSender::new(cmd_tx),
+            flush_reply: None,
         };
         (stream, data_tx)
     }
@@ -872,13 +935,13 @@ mod tests {
     ///
     /// This also covers the cancellation contract: `read_data` waits without
     /// consuming and only takes bytes after it resolves, so the remainder has
-    /// to survive in `ReadState::leftover` between calls. A `select!`-based
+    /// to survive in `ReadState::held` between calls. A `select!`-based
     /// test cannot add to this — the macro always runs the handler of a branch
     /// that resolves, so a dropped losing branch has taken nothing to lose.
     #[tokio::test]
     async fn read_data_preserves_partial_chunk_remainder() {
         let (stream, data_tx) = test_stream();
-        data_tx.send(b"ABCDEFGH".to_vec()).await.expect("send failed");
+        data_tx.send((b"ABCDEFGH".to_vec(), false)).await.expect("send failed");
 
         let mut first = [0u8; 4];
         let n = stream.read_data(&mut first).await.expect("read failed");
@@ -887,5 +950,52 @@ mod tests {
         let mut second = [0u8; 8];
         let n2 = stream.read_data(&mut second).await.expect("read failed");
         assert_eq!(&second[..n2], b"EFGH", "the chunk remainder was stranded");
+    }
+
+    /// A message is everything up to its end, however the peer's packets
+    /// cut it, and a bare end-of-message closes one too.
+    #[tokio::test]
+    async fn read_message_follows_the_peers_boundaries() {
+        let (stream, data_tx) = test_stream();
+        for (data, eom) in [("he", false), ("llo", true), ("x", false), ("", true), ("y", false)] {
+            data_tx.send((data.into(), eom)).await.expect("send failed");
+        }
+        drop(data_tx);
+
+        assert_eq!(stream.read_message().await.unwrap().as_deref(), Some(&b"hello"[..]));
+        assert_eq!(stream.read_message().await.unwrap().as_deref(), Some(&b"x"[..]));
+        let cut_off = stream.read_message().await.unwrap_err();
+        assert_eq!(cut_off.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// Reads stop at each message's end and say when they reach it, a long
+    /// message comes in parts, and an empty one reads as `(0, true)`. A byte
+    /// stream read stops at a message's end too.
+    #[tokio::test]
+    async fn reads_stop_at_the_end_of_each_message() {
+        let (stream, data_tx) = test_stream();
+        for (data, eom) in [("abc", false), ("de", true), ("", true), ("f", true), ("g", true), ("h", true)] {
+            data_tx.send((data.into(), eom)).await.expect("send failed");
+        }
+
+        // However the parts fall, they add up to the message and only the
+        // last carries the flag.
+        let mut buf = [0u8; 2];
+        let mut message = Vec::new();
+        loop {
+            let (n, eom) = stream.read_with_eom(&mut buf).await.unwrap();
+            message.extend_from_slice(&buf[..n]);
+            if eom {
+                break;
+            }
+        }
+        assert_eq!(message, b"abcde");
+        assert_eq!(stream.read_with_eom(&mut buf).await.unwrap(), (0, true));
+        assert_eq!(stream.read_with_eom(&mut buf).await.unwrap(), (1, true));
+        assert_eq!(buf[0], b'f');
+
+        let mut buf = [0u8; 8];
+        assert_eq!(stream.read_data(&mut buf).await.unwrap(), 1);
+        assert_eq!(buf[0], b'g');
     }
 }

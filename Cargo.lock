@@ -3258,6 +3258,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "inkproto"
+version = "0.1.0"
+
+[[package]]
 name = "input"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6802,6 +6806,7 @@ dependencies = [
  "hfs-reader",
  "i-slint-backend-winit",
  "if-addrs",
+ "inkproto",
  "ipp",
  "keepawake",
  "libc",

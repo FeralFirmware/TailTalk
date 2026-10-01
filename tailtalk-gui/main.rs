@@ -18,6 +18,7 @@ slint::include_modules!();
 
 #[cfg(ethertalk)]
 mod bpf;
+mod inktalk;
 mod ipp_bridge;
 mod lw_bridge;
 mod network_explorer;

@@ -12,6 +12,9 @@
 //!     PostScript over PAP (`pap-print`).
 //!   * ImageWriter — rename, as the option card's `ESC b` command over PAP.
 //!     Status comes back from the same card as a packed status word.
+//!   * InkTalk: name, emulated printer and port speed, over its own ADSP
+//!     control socket (`inktalk.rs`). An InkTalk also registers the printer
+//!     it's emulating, but we hide that one so the device only shows up once.
 //!
 //! Everything else is listed, described from its NBP registration and pinged,
 //! but has no protocol we can query or configure it with.
@@ -42,6 +45,7 @@ use tailtalk_packets::nbp::EntityName;
 use tokio::io::AsyncReadExt;
 use tokio::time::{Duration, timeout};
 
+use crate::inktalk::{self, Mode};
 use crate::{DeviceRow, ExplorerHandles, InfoRow, NetworkExplorerWindow};
 
 /// One line of the information panel. The query tasks build these and hand them
@@ -90,6 +94,9 @@ enum DeviceKind {
     /// Apple ImageWriter II/LQ behind a LocalTalk Option Card, queried over PAP
     /// (NBP type "ImageWriter").
     ImageWriter,
+    /// An InkTalk LocalTalk-to-serial adapter's control socket, over ADSP
+    /// (NBP type "InkTalk").
+    InkTalk,
     /// Anything else NBP advertises: file servers, workstations, routers,
     /// third-party printers.
     Generic,
@@ -111,6 +118,7 @@ impl DeviceKind {
             DeviceKind::LaserWriter => Some("LaserWriter"),
             DeviceKind::StyleWriter => Some("ColorStyleWriter2400AT"),
             DeviceKind::ImageWriter => Some("ImageWriter"),
+            DeviceKind::InkTalk => Some(inkproto::NBP_TYPE),
             DeviceKind::Generic => None,
         }
     }
@@ -121,7 +129,12 @@ impl DeviceKind {
     /// LaserWriter in the sidebar and still treated as an unknown device, with
     /// no query and no settings.
     fn from_nbp_type(nbp_type: &str) -> DeviceKind {
-        for kind in [DeviceKind::LaserWriter, DeviceKind::StyleWriter, DeviceKind::ImageWriter] {
+        for kind in [
+            DeviceKind::LaserWriter,
+            DeviceKind::StyleWriter,
+            DeviceKind::ImageWriter,
+            DeviceKind::InkTalk,
+        ] {
             if kind.nbp_type().is_some_and(|t| t.eq_ignore_ascii_case(nbp_type)) {
                 return kind;
             }
@@ -139,6 +152,7 @@ impl DeviceKind {
             DeviceKind::StyleWriter => SW_MAX_NAME_LEN,
             DeviceKind::LaserWriter => LW_MAX_NAME_LEN,
             DeviceKind::ImageWriter => imagewriter::MAX_NAME_LEN,
+            DeviceKind::InkTalk => inkproto::MAX_NAME_LEN,
             // Nothing to rename, but the field's limit still has to be a number.
             DeviceKind::Generic => SW_MAX_NAME_LEN,
         }
@@ -153,6 +167,7 @@ const KNOWN_TYPES: &[(&str, &str, &str)] = &[
     ("ColorStyleWriter2400AT", "🖨", "Color StyleWriter"),
     ("ImageWriter", "🖨", "ImageWriter"),
     ("ImageWriter LQ", "🖨", "ImageWriter LQ"),
+    ("InkTalk", "🖨", "InkTalk"),
     ("DeskWriter", "🖨", "HP DeskWriter"),
     ("AFPServer", "🗄", "File Server"),
     ("Workstation", "💻", "Workstation"),
@@ -209,7 +224,8 @@ struct Device {
 }
 
 impl Device {
-    /// The advertised print endpoint, as an ADSP address (StyleWriter).
+    /// The advertised endpoint as an ADSP address. For a StyleWriter that's
+    /// the print socket, and for an InkTalk it's the control socket.
     fn adsp_print_addr(&self) -> AdspAddress {
         AdspAddress {
             network_number: self.net,
@@ -259,6 +275,7 @@ impl Device {
             is_stylewriter: self.kind == DeviceKind::StyleWriter,
             is_imagewriter: self.kind == DeviceKind::ImageWriter,
             is_laserwriter: self.kind == DeviceKind::LaserWriter,
+            is_inktalk: self.kind == DeviceKind::InkTalk,
         }
     }
 }
@@ -333,8 +350,22 @@ fn pts_to_paper_index(pts: &str) -> i32 {
 #[derive(Clone)]
 struct Queried {
     lines: Vec<Line>,
-    /// LaserWriter only: current values for the editable controls.
-    settings: Option<LaserSettings>,
+    /// Current values for the editable controls, for the families that give
+    /// us any.
+    settings: Option<Settings>,
+}
+
+#[derive(Clone)]
+enum Settings {
+    Laser(LaserSettings),
+    InkTalk(InkTalkSettings),
+}
+
+#[derive(Clone)]
+struct InkTalkSettings {
+    name: String,
+    mode: Mode,
+    baud: u32,
 }
 
 #[derive(Clone)]
@@ -389,6 +420,11 @@ const PING_INTERVAL: Duration = Duration::from_millis(100);
 /// updated when clicked would be a reading of when it was clicked. One timer
 /// sweeps every node instead.
 const LATENCY_REFRESH: Duration = Duration::from_secs(30);
+
+/// How long an InkTalk takes to come back after a save that restarts it. It
+/// resets after replying, then has to boot, claim its node again and
+/// re-register before a lookup can find it.
+const INKTALK_RESTART_WAIT: Duration = Duration::from_secs(6);
 
 /// Ping-test bounds. These are handed to the .slint at startup rather than
 /// written down twice, so the field's limits are these limits. The floor on
@@ -516,17 +552,22 @@ fn latency_text(stats: &PingStats) -> (String, bool) {
 /// Discover everything registered with NBP.
 ///
 /// The wildcard `=:=@*` alone would be enough for a well-behaved network, but
-/// the three printer families are asked for by name as well: they are the ones
-/// the explorer can actually configure, and asking for a type directly is the
+/// the configurable families are asked for by name as well: they are the ones
+/// the explorer can actually act on, and asking for a type directly is the
 /// lookup those printers have always been tested against. The results are merged,
 /// so a device answering both is listed once.
 async fn discover(handles: &ExplorerHandles) -> anyhow::Result<Vec<Device>> {
     let patterns: Vec<String> = std::iter::once("=:=@*".to_string())
         .chain(
-            [DeviceKind::LaserWriter, DeviceKind::StyleWriter, DeviceKind::ImageWriter]
-                .iter()
-                .filter_map(|k| k.nbp_type())
-                .map(|t| format!("=:{t}@*")),
+            [
+                DeviceKind::LaserWriter,
+                DeviceKind::StyleWriter,
+                DeviceKind::ImageWriter,
+                DeviceKind::InkTalk,
+            ]
+            .iter()
+            .filter_map(|k| k.nbp_type())
+            .map(|t| format!("=:{t}@*")),
         )
         .collect();
 
@@ -586,6 +627,17 @@ async fn discover(handles: &ExplorerHandles) -> anyhow::Result<Vec<Device>> {
             });
         }
     }
+
+    // An InkTalk registers the printer it's emulating as well as its control
+    // socket. If we listed both, one box would show up as two devices, and
+    // one of them could only be configured the limited way the emulated
+    // printer allows. So for those nodes we only keep the InkTalk entry.
+    let inktalk_nodes: HashSet<(u16, u8)> = found
+        .iter()
+        .filter(|d| d.kind == DeviceKind::InkTalk)
+        .map(|d| (d.net, d.node))
+        .collect();
+    found.retain(|d| d.kind == DeviceKind::InkTalk || !inktalk_nodes.contains(&(d.net, d.node)));
 
     // Configurable devices first, since they are what the window can act on,
     // then everything else alphabetically so a refresh doesn't reshuffle.
@@ -681,6 +733,71 @@ async fn query_imagewriter(ddp: &DdpHandle, addr: AtpAddress) -> anyhow::Result<
         lines: imagewriter_lines(&s),
         settings: None,
     })
+}
+
+/// Query an InkTalk over its control socket.
+async fn query_inktalk(ddp: &DdpHandle, addr: AdspAddress) -> anyhow::Result<Queried> {
+    let info = inktalk::query(ddp, addr).await?;
+    let unknown = || "not reported".to_string();
+    let yes_no = |b: Option<bool>| b.map_or_else(unknown, |b| if b { "Yes" } else { "No" }.to_string());
+
+    let condition = match (info.job_active, info.printer_ready) {
+        (Some(true), _) => "Printing".to_string(),
+        (_, Some(false)) => "Waiting: the printer is not ready".to_string(),
+        (Some(false), _) => "Ready".to_string(),
+        _ => unknown(),
+    };
+    let mut lines = vec![
+        Line::section("Status"),
+        Line::field("Condition", condition),
+        Line::field("Printing", yes_no(info.job_active)),
+        Line::field("Printer ready", yes_no(info.printer_ready)),
+        Line::section("Settings"),
+        Line::field("Emulating", info.mode.map_or_else(unknown, |m| m.label().to_string())),
+        Line::field("Port speed", info.baud.map_or_else(unknown, |b| format!("{b} baud"))),
+    ];
+    // Only a StyleWriter identifies itself, so the line is left out rather
+    // than shown as "not reported" for every other role.
+    if let Some(model) = &info.printer_model {
+        let model = if model.is_empty() { "Did not answer".to_string() } else { model.clone() };
+        lines.insert(4, Line::field("Printer", model));
+    }
+    if info.pending == Some(true) {
+        lines.push(Line::field(
+            "Unapplied changes",
+            "Yes, made on the device's debug port; Save here applies them",
+        ));
+    }
+    lines.extend([
+        Line::section("Device"),
+        Line::field("Firmware", info.firmware.clone().unwrap_or_else(unknown)),
+        Line::field("Protocol version", info.protocol.map_or_else(unknown, |v| v.to_string())),
+        Line::field("Up for", info.uptime_secs.map_or_else(unknown, format_uptime)),
+        Line::field(
+            "Node address",
+            info.address.map_or_else(unknown, |(net, node)| format!("{net}.{node}")),
+        ),
+        Line::section("Printer port traffic"),
+        Line::field("Bytes to printer", info.printer_tx.map_or_else(unknown, |n| n.to_string())),
+        Line::field("Bytes from printer", info.printer_rx.map_or_else(unknown, |n| n.to_string())),
+    ]);
+
+    let settings = match (info.name.or(info.live_name), info.mode, info.baud) {
+        (Some(name), Some(mode), Some(baud)) => Some(Settings::InkTalk(InkTalkSettings { name, mode, baud })),
+        _ => anyhow::bail!("the InkTalk did not report its settings"),
+    };
+    Ok(Queried { lines, settings })
+}
+
+fn format_uptime(secs: u32) -> String {
+    let (d, h, m, s) = (secs / 86_400, secs / 3600 % 24, secs / 60 % 60, secs % 60);
+    if d > 0 {
+        format!("{d} d {h} h {m} min")
+    } else if h > 0 {
+        format!("{h} h {m} min")
+    } else {
+        format!("{m} min {s} s")
+    }
 }
 
 /// The printer half of the info panel for one status word. Every row here bar
@@ -912,11 +1029,11 @@ async fn query_laserwriter(ddp: &DdpHandle, addr: AtpAddress) -> anyhow::Result<
 
     Ok(Queried {
         lines,
-        settings: Some(LaserSettings {
+        settings: Some(Settings::Laser(LaserSettings {
             paper_index: pts_to_paper_index(by_label("Tray 0 paper (pts)")),
             startup_enabled: by_label("Startup page") == "true",
             printer_name: by_label("Printer name").to_string(),
-        }),
+        })),
     })
 }
 
@@ -1004,6 +1121,8 @@ pub fn open(
     window.set_ping_size_min(MIN_PING_BYTES as i32);
     window.set_ping_size_max(MAX_ECHO_DATA as i32);
     window.set_ping_count_max(MAX_PING_COUNT as i32);
+    window.set_baud_min(*inkproto::BAUD_RANGE.start() as i32);
+    window.set_baud_max(*inkproto::BAUD_RANGE.end() as i32);
 
     // Discovered devices, kept 1:1 with the Slint model rows so a row index
     // maps back to a real AppleTalk address.
@@ -1012,6 +1131,11 @@ pub fn open(
     // Everything already measured or fetched. The information panel is rendered
     // from this, never from what happens to be on screen.
     let cache: Arc<Mutex<Cache>> = Arc::new(Mutex::new(Cache::default()));
+
+    // The name of an InkTalk to select once the next discovery finds it. We
+    // set this after a save restarts one, since its node number might be
+    // different when it comes back.
+    let reselect: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     // Bumped whenever the selection changes or the list is refreshed. Background
     // tasks capture the value they started with and drop their results if it no
@@ -1037,6 +1161,7 @@ pub fn open(
         let generation = generation.clone();
         let sweep_gen = sweep_gen.clone();
         let ping_cancel = ping_cancel.clone();
+        let reselect = reselect.clone();
         window.on_refresh(move || {
             generation.fetch_add(1, Ordering::SeqCst);
             let my_sweep = sweep_gen.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1060,6 +1185,7 @@ pub fn open(
             let discovered = discovered.clone();
             let cache = cache.clone();
             let sweep_gen = sweep_gen.clone();
+            let reselect = reselect.clone();
             rt.spawn(async move {
                 let result = discover(&handles).await;
                 let nodes: Vec<AppleTalkAddress> = match &result {
@@ -1073,8 +1199,14 @@ pub fn open(
                     let cache = cache.clone();
                     slint::invoke_from_event_loop(move || {
                         let Some(w) = weak.upgrade() else { return };
+                        let mut reselect_at = None;
                         match result {
                             Ok(found) => {
+                                reselect_at = reselect.lock().unwrap().take().and_then(|name| {
+                                    found
+                                        .iter()
+                                        .position(|d| d.kind == DeviceKind::InkTalk && d.name == name)
+                                });
                                 let rows: Vec<DeviceRow> = found.iter().map(Device::row).collect();
                                 let n = rows.len();
                                 *discovered.lock().unwrap() = found;
@@ -1091,6 +1223,10 @@ pub fn open(
                             Err(e) => w.set_status_text(format!("Discovery failed: {e}").into()),
                         }
                         w.set_busy(false);
+                        if let Some(i) = reselect_at {
+                            w.set_selected(i as i32);
+                            w.invoke_query(i as i32);
+                        }
                     })
                 };
                 if posted.is_err() {
@@ -1173,6 +1309,7 @@ pub fn open(
                     }
                     DeviceKind::LaserWriter => query_laserwriter(&ddp, device.atp_addr()).await,
                     DeviceKind::ImageWriter => query_imagewriter(&ddp, device.atp_addr()).await,
+                    DeviceKind::InkTalk => query_inktalk(&ddp, device.adsp_print_addr()).await,
                     // Nothing beyond the registration and the latency reading.
                     DeviceKind::Generic => Ok(Queried { lines: Vec::new(), settings: None }),
                 };
@@ -1326,6 +1463,7 @@ pub fn open(
         let weak = window.as_weak();
         let discovered = discovered.clone();
         let cache = cache.clone();
+        let reselect = reselect.clone();
         window.on_save(move |index| {
             let Some(w) = weak.upgrade() else { return };
             let Some(device) = discovered.lock().unwrap().get(index as usize).cloned() else {
@@ -1360,6 +1498,40 @@ pub fn open(
                     rt.spawn(async move {
                         let result = rename_imagewriter(&ddp, device.atp_addr(), &name).await;
                         finish_save(weak, cache, index, result, false);
+                    });
+                }
+                DeviceKind::InkTalk => {
+                    let mode = Mode::from_index(w.get_inktalk_mode_index());
+                    let baud = w.get_inktalk_baud().max(0) as u32;
+                    let reselect = reselect.clone();
+                    rt.spawn(async move {
+                        let addr = device.adsp_print_addr();
+                        match inktalk::configure(&ddp, addr, &name, mode, baud).await {
+                            // Only the name changed, so it was applied live.
+                            Ok(false) => {
+                                let msg = format!("Saved. The InkTalk is now \"{name}\".");
+                                finish_save(weak, cache, index, Ok(msg), true);
+                            }
+                            Ok(true) => {
+                                set_status_from_task(
+                                    &weak,
+                                    "Saved. The InkTalk is restarting with the new settings…",
+                                );
+                                tokio::time::sleep(INKTALK_RESTART_WAIT).await;
+                                slint::invoke_from_event_loop(move || {
+                                    let Some(w) = weak.upgrade() else { return };
+                                    w.set_busy(false);
+                                    // Only follow it if nothing else got picked
+                                    // while it was restarting.
+                                    if w.get_selected() == index {
+                                        *reselect.lock().unwrap() = Some(name);
+                                    }
+                                    w.invoke_refresh();
+                                })
+                                .ok();
+                            }
+                            Err(e) => finish_save(weak, cache, index, Err(e), false),
+                        }
                     });
                 }
                 // The Save button is hidden for these, so this is unreachable
@@ -1591,20 +1763,37 @@ fn render_panel(
     w.set_info_rows(to_model(lines));
 }
 
-/// Push a LaserWriter's queried settings into the editable controls. The other
-/// families report none, and leave the name field on the NBP name.
+/// Push queried settings into the editable controls. For families that
+/// don't report any, the name field just keeps the NBP name.
 fn apply_settings(
     w: &NetworkExplorerWindow,
     discovered: &Mutex<Vec<Device>>,
     index: usize,
-    settings: Option<&LaserSettings>,
+    settings: Option<&Settings>,
 ) {
-    let Some(s) = settings else { return };
-    w.set_paper_index(s.paper_index);
-    w.set_startup_enabled(s.startup_enabled);
-    if !s.printer_name.is_empty() {
-        w.set_edit_name(s.printer_name.as_str().into());
-        rename_row(w, discovered, index, &s.printer_name);
+    match settings {
+        Some(Settings::Laser(s)) => {
+            w.set_paper_index(s.paper_index);
+            w.set_startup_enabled(s.startup_enabled);
+            if !s.printer_name.is_empty() {
+                w.set_edit_name(s.printer_name.as_str().into());
+                rename_row(w, discovered, index, &s.printer_name);
+            }
+        }
+        Some(Settings::InkTalk(s)) => {
+            w.set_edit_name(s.name.as_str().into());
+            w.set_inktalk_mode_index(s.mode.index());
+            w.set_inktalk_baud(s.baud as i32);
+            rename_row(w, discovered, index, &s.name);
+            // We hide the emulated printer's own registration, so this is where
+            // the sidebar shows which printer the box is pretending to be.
+            let model = w.get_devices();
+            if let Some(mut row) = model.row_data(index) {
+                row.kind = format!("InkTalk, emulating {}", s.mode.label()).into();
+                model.set_row_data(index, row);
+            }
+        }
+        None => {}
     }
 }
 
@@ -1711,6 +1900,13 @@ fn set_status(weak: &Weak<NetworkExplorerWindow>, status: &str) {
     if let Some(w) = weak.upgrade() {
         w.set_status_text(status.into());
     }
+}
+
+/// Set the status line from a background task.
+fn set_status_from_task(weak: &Weak<NetworkExplorerWindow>, status: &str) {
+    let weak = weak.clone();
+    let status = status.to_string();
+    slint::invoke_from_event_loop(move || set_status(&weak, &status)).ok();
 }
 
 /// Marshal a Save result back to the window.

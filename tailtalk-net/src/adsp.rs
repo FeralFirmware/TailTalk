@@ -20,6 +20,12 @@
 //!     }
 //! }
 //! ```
+//!
+//! ADSP can also mark the end of a message in the stream. Reads stop at the
+//! end of each message, as the Mac's `dspRead` does, and
+//! [`AdspStream::read_with_eom`] says when a read reached one.
+//! [`AdspStream::read_message`] reads a whole message at once, and
+//! [`AdspStream::write_message`] writes one.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -64,6 +70,17 @@ pub enum AdspError {
     AttentionUnacknowledged,
 }
 
+/// Why [`AdspStream::read_message`] returned no message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageError {
+    /// The message was longer than the buffer, or than the receive window
+    /// can hold. All of it is discarded, including any part still to
+    /// arrive, and the next read starts at the message after it.
+    TooLong,
+    /// The connection closed. Bytes after the last end-of-message are lost.
+    Closed,
+}
+
 impl embedded_io_async::Error for AdspError {
     fn kind(&self) -> ErrorKind {
         match self {
@@ -91,6 +108,10 @@ struct Conn {
     key: u16,
     remote: ServiceAddress,
     rx: VecDeque<u8>,
+    /// Where messages end in `rx`, as offsets from its front.
+    eoms: VecDeque<usize>,
+    /// Throwing away the rest of a message that was too long to read.
+    skipping: bool,
     attn_rx: VecDeque<(u16, Vec<u8>)>,
     attn: Attn,
     closed: bool,
@@ -132,6 +153,8 @@ impl AdspState {
                 key,
                 remote,
                 rx: VecDeque::new(),
+                eoms: VecDeque::new(),
+                skipping: false,
                 attn_rx: VecDeque::new(),
                 attn: Attn::Idle,
                 closed: false,
@@ -195,9 +218,16 @@ impl AdspState {
                         *slot = Some(Err(AdspError::OpenFailed));
                     }
                 }
-                AdspEvent::Data { conn, data, .. } => {
+                AdspEvent::Data { conn, data, eom } => {
                     if let Some(c) = self.by_key(conn) {
-                        c.rx.extend(data);
+                        if c.skipping {
+                            c.skipping = !eom;
+                        } else {
+                            c.rx.extend(data);
+                            if eom {
+                                c.eoms.push_back(c.rx.len());
+                            }
+                        }
                     }
                 }
                 AdspEvent::Attention { conn, code, data } => {
@@ -402,35 +432,110 @@ impl<'a, P: Platform> AdspStream<'a, P> {
     }
 
     /// Read stream bytes, returning how many; 0 once the connection has
-    /// closed and everything before the close has been read.
+    /// closed and everything before the close has been read. A read stops at
+    /// the end of a message, so it can come up short.
     ///
     /// Cancel safe: bytes leave the stream only in the poll that returns
     /// them.
     pub async fn read_data(&self, buf: &mut [u8]) -> usize {
+        loop {
+            match self.read_with_eom(buf).await {
+                // An empty message is not the end of the stream.
+                (0, true) => continue,
+                (n, _) => return n,
+            }
+        }
+    }
+
+    /// Read stream bytes as the Mac's `dspRead` does: up to `buf.len()`, but
+    /// never past the end of a message. Returns how many, and whether they
+    /// reached the end of a message. A message longer than `buf` comes in
+    /// several reads, the last with the flag set, and an empty one as
+    /// `(0, true)`. `(0, false)` once the connection has closed and
+    /// everything before the close has been read.
+    ///
+    /// Cancel safe: bytes leave the stream only in the poll that returns
+    /// them.
+    pub async fn read_with_eom(&self, buf: &mut [u8]) -> (usize, bool) {
         if buf.is_empty() {
-            return 0;
+            return (0, false);
         }
         let id = self.id;
-        let n = self
+        let read = self
             .net
             .wait_on::<AdspState, _>(self.slot, |s| {
                 let c = s.conns.get_mut(&id)?;
-                if c.rx.is_empty() {
-                    return c.closed.then_some(0);
+                let to_end = c.eoms.front().copied().unwrap_or(c.rx.len());
+                if to_end == 0 && c.eoms.is_empty() {
+                    return c.closed.then_some((0, false));
                 }
-                let n = buf.len().min(c.rx.len());
+                let n = buf.len().min(to_end);
                 for (dst, b) in buf.iter_mut().zip(c.rx.drain(..n)) {
                     *dst = b;
                 }
-                Some(n)
+                c.eoms.iter_mut().for_each(|e| *e -= n);
+                let eom = c.eoms.front() == Some(&0);
+                if eom {
+                    c.eoms.pop_front();
+                }
+                Some((n, eom))
             })
             .await;
-        // Room was made; the window may have reopened.
+        self.reopen_window();
+        read
+    }
+
+    /// Read one whole message, up to the peer's next end-of-message, into
+    /// `buf`, and return its length. Never returns part of a message: one
+    /// that does not fit is discarded and reported as
+    /// [`MessageError::TooLong`].
+    ///
+    /// A message has to arrive in full before it can be read, so it can be
+    /// no longer than [`RX_WINDOW`] less one packet, whatever the size of
+    /// `buf`. Read longer ones in parts with [`AdspStream::read_with_eom`].
+    ///
+    /// Cancel safe: a message leaves the stream only in the poll that
+    /// returns it.
+    pub async fn read_message(&self, buf: &mut [u8]) -> Result<usize, MessageError> {
+        let id = self.id;
+        let result = self
+            .net
+            .wait_on::<AdspState, _>(self.slot, |s| {
+                let c = s.conns.get_mut(&id)?;
+                if let Some(end) = c.eoms.pop_front() {
+                    c.eoms.iter_mut().for_each(|e| *e -= end);
+                    let message = c.rx.drain(..end);
+                    if end > buf.len() {
+                        return Some(Err(MessageError::TooLong));
+                    }
+                    for (dst, b) in buf.iter_mut().zip(message) {
+                        *dst = b;
+                    }
+                    return Some(Ok(end));
+                }
+                if c.closed {
+                    return Some(Err(MessageError::Closed));
+                }
+                // No end yet. Past the buffer, or past the point where the
+                // window shuts, it can only be too long.
+                if c.rx.len() > buf.len() || c.rx.len() > RX_WINDOW - ADSP_MAX_DATA {
+                    c.rx.clear();
+                    c.skipping = true;
+                    return Some(Err(MessageError::TooLong));
+                }
+                None
+            })
+            .await;
+        self.reopen_window();
+        result
+    }
+
+    /// Room was made; the window may have reopened.
+    fn reopen_window(&self) {
         self.net.with(|inner| {
             inner.get::<AdspState>(self.slot).update_window();
             inner.kick();
         });
-        n
     }
 
     /// Queue as much of `data` as fits, waiting while the queue toward the
