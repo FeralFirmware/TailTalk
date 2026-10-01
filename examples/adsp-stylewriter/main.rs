@@ -4,9 +4,8 @@ use tailtalk::{
     TalkStack,
     adsp::AdspAddress,
     stylewriter::{
-        MAX_BATCH_BYTES, PrintQuality, SW2200_PRINT_ROWBYTES, SW2200_PRINT_WIDTH,
-        StyleWriterEncoder, StyleWriterSession, chunky_to_mono_plane, chunky_to_planes,
-        encode_page_batches,
+        MAX_BATCH_BYTES, PrintQuality, StyleWriterEncoder, StyleWriterFamily, StyleWriterSession,
+        chunky_to_mono_plane, chunky_to_planes, encode_page_batches,
     },
 };
 use tailtalk_packets::nbp::EntityName;
@@ -50,13 +49,25 @@ struct Args {
     /// combinations are verified on real hardware)
     #[arg(short, long, default_value = "normal")]
     quality: String,
+
+    /// The printer is an original StyleWriter (identifies as "IJ10"): black
+    /// only, its own page setup and width, rows not delta-encoded. Implies
+    /// --mono.
+    #[arg(long)]
+    original: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().init();
 
-    let args = Args::parse();
+    let mut args = Args::parse();
+    let family = if args.original {
+        args.mono = true;
+        StyleWriterFamily::Original
+    } else {
+        StyleWriterFamily::Color
+    };
 
     let quality = match args.quality.as_str() {
         "normal" => PrintQuality::Normal,
@@ -71,8 +82,8 @@ async fn main() -> anyhow::Result<()> {
     let total_rows = raw_data.len() / chunky_scanline_len;
 
     eprintln!("Image: {} pixels wide, {} scanlines", width_pixels, total_rows);
-    eprintln!("SW2200_PRINT_ROWBYTES = {}, padding {} px per plane with white",
-        SW2200_PRINT_ROWBYTES, SW2200_PRINT_WIDTH - width_pixels);
+    eprintln!("{:?}: {} bytes per row, padding {} px per plane with white",
+        family, family.print_rowbytes(), family.print_width().saturating_sub(width_pixels));
 
     // Unpack every chunky scanline into raw planar rows, then encode the
     // whole page into rect+G bands (delta chains and band splitting live in
@@ -88,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
             }
         })
         .collect();
-    let batches = encode_page_batches(&rows, args.mono);
+    let batches = encode_page_batches(&rows, args.mono, family);
 
     // ── Dump mode: write raster blocks to stdout for comparison with C reference ─
     if args.dump {
@@ -96,10 +107,10 @@ async fn main() -> anyhow::Result<()> {
         let mut out = stdout.lock();
         for batch in &batches {
             // Rows are padded to the full printable width, so the rect
-            // right edge is SW2200_PRINT_WIDTH (not the source width) —
+            // right edge is the family's print width (not the source width) -
             // keeps dump output byte-identical to what write_batch sends.
             let rect = StyleWriterEncoder::encode_rect(
-                batch.top, 0, batch.bottom, SW2200_PRINT_WIDTH as u16, !args.mono,
+                batch.top, 0, batch.bottom, family.print_width() as u16, !args.mono,
             );
             let g_block = StyleWriterEncoder::wrap_raster_chunk(&batch.data);
             out.write_all(&rect)?;
@@ -148,9 +159,9 @@ async fn main() -> anyhow::Result<()> {
     // Run setup + raster transmission in a block so any failure can eject
     // the loaded page and reset the printer instead of leaving it stuck.
     let print_result: anyhow::Result<()> = async {
-        session.setup(!args.mono, quality).await?;
+        session.setup(family, !args.mono, quality).await?;
 
-        eprintln!("Transmitting {} rasters as {} delta-encoded band(s) ({} bytes/batch max)...",
+        eprintln!("Transmitting {} rasters as {} band(s) ({} bytes/batch max)...",
             if args.mono { "monochrome" } else { "color" },
             batches.len(),
             MAX_BATCH_BYTES);

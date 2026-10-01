@@ -92,6 +92,8 @@ struct Slot {
     hosted: Box<dyn Hosted>,
     sockets: Vec<u8>,
     wakers: WakerSet,
+    /// Tells this occupant of the slot from any before or after it.
+    generation: u32,
 }
 
 /// Something the runner has to do outside the lock.
@@ -109,6 +111,7 @@ pub(crate) struct Inner {
     /// waiting for a frame or a timer.
     kicked: bool,
     address_waiters: WakerSet,
+    next_generation: u32,
 }
 
 impl Inner {
@@ -124,10 +127,13 @@ impl Inner {
         for &s in &sockets {
             self.by_socket.insert(s, id);
         }
+        let generation = self.next_generation;
+        self.next_generation = generation.wrapping_add(1);
         self.slots[id] = Some(Slot {
             hosted,
             sockets,
             wakers: WakerSet::default(),
+            generation,
         });
         id
     }
@@ -149,6 +155,25 @@ impl Inner {
         let slot = self.slots[id].as_mut().expect("handle outlived its slot");
         let any: &mut dyn Any = &mut *slot.hosted;
         any.downcast_mut().expect("slot holds another socket type")
+    }
+
+    /// The generation of whatever is in slot `id` now. Slots are reused, so a
+    /// handle that does not own its slot keeps this alongside the id and
+    /// looks its state up with [`Inner::try_get`].
+    pub(crate) fn generation(&self, id: usize) -> u32 {
+        self.slots[id].as_ref().expect("no slot to take a generation of").generation
+    }
+
+    /// The state machine in slot `id`, if it is still the one from
+    /// `generation`. `None` once it has been removed, even if the slot has
+    /// been reused since.
+    pub(crate) fn try_get<T: Hosted>(&mut self, id: usize, generation: u32) -> Option<&mut T> {
+        let slot = self.slots.get_mut(id)?.as_mut()?;
+        if slot.generation != generation {
+            return None;
+        }
+        let any: &mut dyn Any = &mut *slot.hosted;
+        Some(any.downcast_mut().expect("slot holds another socket type"))
     }
 
     fn register(&mut self, id: usize, waker: &Waker) {
@@ -279,6 +304,7 @@ impl<P: Platform> NetState<P> {
                 runner: None,
                 kicked: false,
                 address_waiters: WakerSet::default(),
+                next_generation: 0,
             })),
         }
     }

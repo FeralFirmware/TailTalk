@@ -12,7 +12,7 @@ use tailtalk::atp::{Atp, AtpAddress};
 use tailtalk::imagewriter::ImageWriter;
 use tailtalk::pap::PapClient;
 use tailtalk::stylewriter::StyleWriterSession;
-use tailtalk_net::printer::{Printer, PrinterEvent, WINDOW};
+use tailtalk_net::printer::{Printer, PrinterEvent, RenameError, WINDOW};
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 
@@ -170,6 +170,54 @@ async fn imagewriter_rename_reregisters_and_reports() {
             // The rename is the card's, not the printer's: `ESC b` must never
             // reach the port, where the printer would print the name.
             assert!(!written.lock().unwrap().windows(2).any(|w| w == b"\x1bb"));
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn name_handle_renames_while_the_printer_runs() {
+    LocalSet::new()
+        .run_until(async {
+            let (desk, link) = desktop();
+            let net = start(0xF00D, link);
+            settle(net, &desk).await;
+
+            let printer = Printer::stylewriter(net, "Inky").unwrap();
+            let name = printer.name_handle();
+            let (tx, rx) = port(Silent);
+            let mut events = serve(printer, tx, rx);
+
+            name.set("Renamed").unwrap();
+            assert_eq!(name.get().as_deref(), Some("Renamed"));
+            assert_eq!(name.set("No:colons"), Err(RenameError::BadName));
+            assert_eq!(name.get().as_deref(), Some("Renamed"));
+            // We made the rename ourselves, so the printer shouldn't report it
+            // back as an event.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(events.try_recv().is_err());
+        })
+        .await;
+}
+
+/// A handle kept after its printer is dropped refers to nothing, even once
+/// another printer has taken the dropped one's place.
+#[tokio::test]
+async fn name_handle_outliving_its_printer_touches_no_other() {
+    LocalSet::new()
+        .run_until(async {
+            let (desk, link) = desktop();
+            let net = start(0xFEED, link);
+            settle(net, &desk).await;
+
+            let first = Printer::stylewriter(net, "First").unwrap();
+            let stale = first.name_handle();
+            drop(first);
+            let second = Printer::stylewriter(net, "Second").unwrap();
+
+            assert_eq!(stale.get(), None);
+            assert_eq!(stale.set("Hijacked"), Err(RenameError::Gone));
+            assert_eq!(second.name(), "Second");
+            assert_eq!(second.name_handle().get().as_deref(), Some("Second"));
         })
         .await;
 }

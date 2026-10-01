@@ -3,12 +3,98 @@ use crate::{
     ddp::DdpHandle,
 };
 use std::time::Duration;
+use tailtalk_core::stylewriter as stylewriter_core;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Native printable width / row-byte-count for the Color StyleWriter 2200
 /// (lpstyl `printerSetup()` for KIND_SW2200).
 pub const SW2200_PRINT_WIDTH: usize = 2919;
 pub const SW2200_PRINT_ROWBYTES: usize = SW2200_PRINT_WIDTH.div_ceil(8); // 365
+
+/// Native printable width / row-byte-count for the original StyleWriter
+/// (lpstyl `printerSetup()` for KIND_SW1: 8 inches at 360 dpi, less one).
+pub const SW1_PRINT_WIDTH: usize = 2879;
+pub const SW1_PRINT_ROWBYTES: usize = SW1_PRINT_WIDTH.div_ceil(8); // 360
+
+/// Which of lpstyl's printer paths a StyleWriter takes. They differ in
+/// nearly every step after the ADSP handshake (setup, page start, row
+/// encoding, idle status, out-of-paper handling, finish) and in the
+/// printable area, so both the rasterizer and the session need to know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StyleWriterFamily {
+    /// Color StyleWriter 1500/2200/2400/2500, which identify as "CS". The
+    /// path verified on a real 2200, and the one every model took before the
+    /// original StyleWriter had its own.
+    #[default]
+    Color,
+    /// The original StyleWriter, which identifies as "IJ10" (lpstyl
+    /// KIND_SW1). Black only, with an 8 KB buffer. It answers status queries
+    /// and `?` on real hardware; printing on this path follows lpstyl and
+    /// has not been verified on one yet.
+    Original,
+}
+
+impl StyleWriterFamily {
+    /// The family for a `?` reply. Anything but "IJ10" keeps the Color path,
+    /// as before; the StyleWriter II and 1200 have lpstyl paths of their own
+    /// that are not implemented here.
+    pub fn from_identity(identity: &str) -> Self {
+        match identity {
+            "IJ10" => StyleWriterFamily::Original,
+            _ => StyleWriterFamily::Color,
+        }
+    }
+
+    /// Printable width in dots (lpstyl `PRINT_WIDTH`), which is also the
+    /// right edge of every rect.
+    pub const fn print_width(self) -> usize {
+        match self {
+            StyleWriterFamily::Color => SW2200_PRINT_WIDTH,
+            StyleWriterFamily::Original => SW1_PRINT_WIDTH,
+        }
+    }
+
+    /// Bytes per encoded row: every row is padded out to this with white.
+    pub const fn print_rowbytes(self) -> usize {
+        match self {
+            StyleWriterFamily::Color => SW2200_PRINT_ROWBYTES,
+            StyleWriterFamily::Original => SW1_PRINT_ROWBYTES,
+        }
+    }
+
+    /// Dots cropped off the left of the page. lpstyl rounds its margin up to
+    /// whole bytes (`LEFT_MARGIN_BYTES`): 72 dots stays 72, but the original
+    /// StyleWriter's 90 becomes 96.
+    pub const fn left_margin_px(self) -> usize {
+        match self {
+            StyleWriterFamily::Color => 72,
+            StyleWriterFamily::Original => 96,
+        }
+    }
+
+    /// Only the Color StyleWriters take a color cartridge.
+    pub const fn can_print_color(self) -> bool {
+        matches!(self, StyleWriterFamily::Color)
+    }
+
+    /// Whether rows are XOR-delta encoded against the previous row. lpstyl
+    /// encodes the original StyleWriter's rows on their own (`appendEncode`
+    /// with no previous line) and differences everyone else's.
+    const fn delta_rows(self) -> bool {
+        matches!(self, StyleWriterFamily::Color)
+    }
+
+    /// Whether status 'B' reads idle. The original StyleWriter's idle value
+    /// is exactly 0xA0 (lpstyl `waitNonBusy()`, and its post-reset reading on
+    /// hardware); its mid-page gauge values are unknown, so nothing else
+    /// counts. See [`SW2200_IDLE_MASK`] for the Color StyleWriter.
+    const fn buffer_idle(self, b: u8) -> bool {
+        match self {
+            StyleWriterFamily::Color => b & SW2200_IDLE_MASK == SW2200_IDLE_MASK,
+            StyleWriterFamily::Original => b == 0xA0,
+        }
+    }
+}
 
 /// Max compressed bytes in one rect+G band.
 ///
@@ -107,19 +193,13 @@ pub struct StyleWriterInfo {
 impl StyleWriterInfo {
     /// Human-readable model name (lpstyl's identify tables).
     pub fn model_name(&self) -> &'static str {
-        match self.identity.as_str() {
-            "IJ10" => "Apple StyleWriter",
-            "SW" => "Apple StyleWriter II",
-            "SW3" => "Apple StyleWriter 1200",
-            "CS" => match self.submodel {
-                Some(0x01) => "Apple Color StyleWriter 2400",
-                Some(0x02) => "Apple Color StyleWriter 2200",
-                Some(0x04) => "Apple Color StyleWriter 1500",
-                Some(0x05) => "Apple Color StyleWriter 2500",
-                _ => "Apple Color StyleWriter",
-            },
-            _ => "Apple StyleWriter",
-        }
+        stylewriter_core::model_name(self.identity.as_bytes(), self.submodel)
+            .unwrap_or("Apple StyleWriter")
+    }
+
+    /// Which print path this printer takes.
+    pub fn family(&self) -> StyleWriterFamily {
+        StyleWriterFamily::from_identity(&self.identity)
     }
 
     /// CS-family printers are the only ones that can print color at all
@@ -205,8 +285,14 @@ async fn write_flush(data: &mut AdspStream, bytes: &[u8]) -> anyhow::Result<()> 
 ///   comment warns: "If you don't get it just right, after the disconnect
 ///   the printer tries to open a new connection to the original control
 ///   socket" — confirmed by observation when this was skipped.
+///
+/// Everything above is the Color StyleWriter. [`Self::setup`] takes the
+/// [`StyleWriterFamily`], and the original StyleWriter follows lpstyl's
+/// KIND_SW1 path instead; see the comments at each difference.
 pub struct StyleWriterSession {
     data: AdspStream,
+    /// Set by [`Self::setup`]; Color until then.
+    family: StyleWriterFamily,
 }
 
 impl StyleWriterSession {
@@ -235,7 +321,7 @@ impl StyleWriterSession {
         }
 
         let data = data_listener.accept().await?;
-        Ok(Self { data })
+        Ok(Self { data, family: StyleWriterFamily::default() })
     }
 
     /// Discard bytes already buffered from the printer. `poll_status`
@@ -275,19 +361,11 @@ impl StyleWriterSession {
         }
     }
 
-    /// Identify the attached printer and its cartridge without starting a
-    /// page (no 'L' is sent, so no paper feeds). Mirrors lpstyl's
-    /// `printerSetup()` identify path: write `?`, read the CR-terminated
-    /// identity string, then for CS-family printers query submodel ('p') and
-    /// cartridge ('D' + 'H').
-    ///
-    /// Intended for a dedicated capability-probe session: connect, call
-    /// this, then `abort()` (whose 'I' reset is a no-op with no page loaded).
-    pub async fn query_info(&mut self) -> anyhow::Result<StyleWriterInfo> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-
+    /// Send `?` and read the CR-terminated identity string. `None` when the
+    /// printer says nothing at all.
+    async fn identify(&mut self) -> anyhow::Result<Option<String>> {
         self.drain_stale_input().await;
-        write_flush(&mut self.data, b"?").await?;
+        write_flush(&mut self.data, &[stylewriter_core::IDENTIFY]).await?;
         let mut identity = Vec::new();
         loop {
             let mut b = [0u8; 1];
@@ -299,10 +377,59 @@ impl StyleWriterSession {
                 // lpstyl's identify reply is CR-terminated, but tolerate a
                 // printer that stops without the CR.
                 Err(_) if !identity.is_empty() => break,
-                Err(_) => anyhow::bail!("No reply to printer identify query '?'"),
+                Err(_) => return Ok(None),
             }
         }
-        let identity = String::from_utf8_lossy(&identity).trim().to_string();
+        Ok(Some(String::from_utf8_lossy(&identity).trim().to_string()))
+    }
+
+    /// lpstyl's `printerSetup()` reset: eject and reset, give the printer two
+    /// seconds, then poll '1'/'2'/'B' until it reads ready. Gives up quietly
+    /// after 15 s, as a printer that never reads ready may still answer `?`.
+    async fn reset_and_wait_ready(&mut self) -> anyhow::Result<()> {
+        write_flush(&mut self.data, &stylewriter_core::status_query(b'I')).await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            let status = self.poll_status(stylewriter_core::QUERY_STATUS, deadline).await;
+            let error = self.poll_status(stylewriter_core::QUERY_ERROR, deadline).await;
+            let buffer = self.poll_status(stylewriter_core::QUERY_BUFFER, deadline).await;
+            if stylewriter_core::ready_after_reset(status, error, buffer) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        tracing::debug!("printer not ready 15 s after reset; asking '?' anyway");
+        Ok(())
+    }
+
+    /// Identify the attached printer and its cartridge without starting a
+    /// page (no 'L' is sent, so no paper feeds). Mirrors lpstyl's
+    /// `printerSetup()` identify path: write `?`, read the CR-terminated
+    /// identity string, then for CS-family printers query submodel ('p') and
+    /// cartridge ('D' + 'H').
+    ///
+    /// Intended for a dedicated capability-probe session: connect, call
+    /// this, then `abort()` (whose 'I' reset is a no-op with no page loaded).
+    ///
+    /// A printer that ignores the first `?` is reset and asked again, which
+    /// is what lpstyl always does first. The original StyleWriter needs it:
+    /// left idle, it ignores `?` until it has been reset (confirmed on
+    /// hardware). The reset stays a fallback because the Color StyleWriter
+    /// answers without one, and a reset in its print setup regressed paper
+    /// feed (see [`StyleWriterSession`]).
+    pub async fn query_info(&mut self) -> anyhow::Result<StyleWriterInfo> {
+        let identity = match self.identify().await? {
+            Some(identity) => identity,
+            None => {
+                tracing::debug!("no reply to '?'; resetting the printer and asking again");
+                self.reset_and_wait_ready().await?;
+                self.identify()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("No reply to printer identify query '?'"))?
+            }
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
 
         let submodel = if identity == "CS" {
             self.poll_status(b'p', deadline).await
@@ -350,6 +477,10 @@ impl StyleWriterSession {
     /// '2' == 0x04 (out of paper) gets lpstyl's retry handling: send
     /// `FF FF FF 'S'` and keep waiting. Other non-0x00/0x80 values are only
     /// logged, since the full set of benign codes on this adapter isn't known.
+    ///
+    /// The original StyleWriter does not know 'S' (lpstyl only sends it to
+    /// the Color StyleWriters), so there out of paper fails the page instead,
+    /// and the caller's abort ejects it.
     pub async fn wait_ready(&mut self) -> anyhow::Result<()> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
         let mut last = None;
@@ -368,6 +499,7 @@ impl StyleWriterSession {
             };
             last = Some((c1, c2, cb));
             if c2 == 0x04 {
+                anyhow::ensure!(self.family != StyleWriterFamily::Original, "Printer is out of paper");
                 tracing::warn!("Printer is out of paper; sending retry ('S') and waiting...");
                 write_flush(&mut self.data, &[0xFF, 0xFF, 0xFF, b'S']).await?;
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -378,7 +510,7 @@ impl StyleWriterSession {
                     "Unexpected printer error status: 2=0x{c2:02X} (1=0x{c1:02X} B=0x{cb:02X})"
                 );
             }
-            if cb & SW2200_IDLE_MASK == SW2200_IDLE_MASK {
+            if self.family.buffer_idle(cb) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -413,7 +545,31 @@ impl StyleWriterSession {
     /// mono-best `"m2sZAH"`, colour `"m2sAH"` (colour ignores quality). Its tag
     /// must match the raster tag ('R' for mono, 'c' for colour) or the printer
     /// misreconstructs every row. See [`PrintQuality`] for the grammar.
-    pub async fn setup(&mut self, color: bool, quality: PrintQuality) -> anyhow::Result<()> {
+    ///
+    /// That is the Color StyleWriter. The original StyleWriter gets none of
+    /// 'D', 'H' or a mode string, all codes it does not know, which make it
+    /// eject and reset; lpstyl starts its page with `"nuA"` alone. It has no
+    /// quality setting and prints black only.
+    pub async fn setup(
+        &mut self,
+        family: StyleWriterFamily,
+        color: bool,
+        quality: PrintQuality,
+    ) -> anyhow::Result<()> {
+        self.family = family;
+        if family == StyleWriterFamily::Original {
+            anyhow::ensure!(!color, "The original StyleWriter prints black only");
+            if quality != PrintQuality::Normal {
+                tracing::debug!("the original StyleWriter has no quality setting; printing normally");
+            }
+            write_flush(&mut self.data, b"nuA").await?;
+            tokio::time::sleep(MECHANISM_SETTLE_DELAY).await;
+            return self
+                .wait_ready()
+                .await
+                .map_err(|e| e.context("waiting for printer to become ready after page start"));
+        }
+
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
         write_flush(&mut self.data, b"D").await?;
@@ -464,6 +620,12 @@ impl StyleWriterSession {
     /// 0) as its buffer fills, so we can never overflow it. The native driver
     /// streams bands back-to-back the same way; with bands capped well under
     /// the buffer ([`MAX_BATCH_BYTES`]) it always has several buffered ahead.
+    ///
+    /// The original StyleWriter waits for full idle before every band
+    /// instead, as lpstyl does: its buffer is only 8 KB, so it never has room
+    /// for a second band of up to [`MAX_BATCH_BYTES`] behind the first, and
+    /// behind InkTalk the ADSP window follows the bridge's UART buffer, not
+    /// the printer's.
     pub async fn write_batch(
         &mut self,
         top: u16,
@@ -477,10 +639,19 @@ impl StyleWriterSession {
             encoded_planes.len(),
             MAX_BATCH_BYTES
         );
-        self.check_paper()
-            .await
-            .map_err(|e| e.context("checking printer status before raster block"))?;
-        let rect = StyleWriterEncoder::encode_rect(top, 0, bottom, SW2200_PRINT_WIDTH as u16, color);
+        match self.family {
+            StyleWriterFamily::Color => self
+                .check_paper()
+                .await
+                .map_err(|e| e.context("checking printer status before raster block"))?,
+            StyleWriterFamily::Original => {
+                anyhow::ensure!(!color, "The original StyleWriter prints black only");
+                self.wait_ready()
+                    .await
+                    .map_err(|e| e.context("waiting for the printer to drain before raster block"))?;
+            }
+        }
+        let rect = StyleWriterEncoder::encode_rect(top, 0, bottom, self.family.print_width() as u16, color);
         let g_block = StyleWriterEncoder::wrap_raster_chunk(encoded_planes);
         self.data.write_all(&rect).await?;
         self.data.write_all(&g_block).await?;
@@ -525,6 +696,10 @@ impl StyleWriterSession {
     /// while the last band is still printing, cutting off the bottom of the
     /// page. lpstyl calls `waitNonBusy(0)` right before its form-feed/eject
     /// sequence for the same reason.
+    ///
+    /// The original StyleWriter skips `"El"`: the evidence for it is captures
+    /// of the Color StyleWriter driver, and lpstyl's original StyleWriter
+    /// finish is the form feed and the idle wait alone.
     pub async fn finish(mut self) -> anyhow::Result<()> {
         self.wait_ready()
             .await
@@ -539,7 +714,9 @@ impl StyleWriterSession {
             tracing::warn!("Printer not idle after form feed ({e}); ejecting anyway");
         }
 
-        write_flush(&mut self.data, b"El").await?;
+        if self.family == StyleWriterFamily::Color {
+            write_flush(&mut self.data, b"El").await?;
+        }
         self.teardown().await
     }
 
@@ -628,15 +805,18 @@ pub fn chunky_to_mono_plane(chunky: &[u8], planar_input_len: usize) -> Vec<u8> {
 /// each plane against the previous row's raw plane first (lpstyl's
 /// `appendEncode()` differencing).
 ///
-/// Delta is not optional: both colour ('c'/"m2sAH") and mono ('R'/"m2nZAH")
-/// mode reconstruct each row by XORing against the previous one, so a
-/// non-delta'd row prints as cumulative-XOR garbage.
+/// On the Color StyleWriter delta is not optional: both colour
+/// ('c'/"m2sAH") and mono ('R'/"m2nZAH") mode reconstruct each row by XORing
+/// against the previous one, so a non-delta'd row prints as cumulative-XOR
+/// garbage. The original StyleWriter is the opposite: lpstyl never deltas
+/// its rows.
 ///
 /// `use_delta` must be false for the first row of every rect+G block, since
 /// the printer's differencing state resets per block. Does not mutate
 /// `last` — the caller updates it once per source row, so a row re-encoded
 /// after a batch flush still deltas correctly.
-fn encode_row(planes: &[Vec<u8>], last: &[Vec<u8>], use_delta: bool, mono: bool) -> Vec<u8> {
+/// Every plane is padded with white to `row_bytes`.
+fn encode_row(planes: &[Vec<u8>], last: &[Vec<u8>], use_delta: bool, mono: bool, row_bytes: usize) -> Vec<u8> {
     let mut out = Vec::new();
     for (i, plane) in planes.iter().enumerate() {
         let delta;
@@ -653,7 +833,7 @@ fn encode_row(planes: &[Vec<u8>], last: &[Vec<u8>], use_delta: bool, mono: bool)
         //  - colour 'c': yes for C/M/Y, but not the K plane (index 3), which
         //    the driver always spells out even when it's blank.
         let allow_shortcut = mono || i != 3;
-        out.extend_from_slice(&StyleWriterEncoder::encode_scanline(src, SW2200_PRINT_ROWBYTES, allow_shortcut));
+        out.extend_from_slice(&StyleWriterEncoder::encode_scanline(src, row_bytes, allow_shortcut));
     }
     out
 }
@@ -661,12 +841,14 @@ fn encode_row(planes: &[Vec<u8>], last: &[Vec<u8>], use_delta: bool, mono: bool)
 /// Encode a whole page of raw planar scanlines into rect+G bands.
 ///
 /// `rows` holds one entry per scanline: 4 CMYK planes for color, 1 K plane
-/// for mono (all planes the same length, at most [`SW2200_PRINT_ROWBYTES`];
-/// shorter planes are padded to the printable width with white). Handles the
-/// XOR-delta chain (restarting it at each band boundary, where the printer's
+/// for mono (all planes the same length, at most the family's
+/// [`StyleWriterFamily::print_rowbytes`]; shorter planes are padded to the
+/// printable width with white). Handles the XOR-delta chain where the family
+/// uses one (restarting it at each band boundary, where the printer's
 /// differencing state resets) and splits bands so each stays strictly below
 /// [`MAX_BATCH_BYTES`].
-pub fn encode_page_batches(rows: &[Vec<Vec<u8>>], mono: bool) -> Vec<RasterBatch> {
+pub fn encode_page_batches(rows: &[Vec<Vec<u8>>], mono: bool, family: StyleWriterFamily) -> Vec<RasterBatch> {
+    let row_bytes = family.print_rowbytes();
     let mut batches = Vec::new();
     let plane_len = rows.first().map(|planes| planes[0].len()).unwrap_or(0);
     let num_planes = if mono { 1 } else { 4 };
@@ -676,7 +858,8 @@ pub fn encode_page_batches(rows: &[Vec<Vec<u8>>], mono: bool) -> Vec<RasterBatch
     for (row_idx, planes) in rows.iter().enumerate() {
         // The first row of every band is absolute; the rest delta against the
         // previous row (the printer resets its differencing state per band).
-        let mut row_enc = encode_row(planes, &last_planes, !batch_data.is_empty(), mono);
+        let use_delta = family.delta_rows() && !batch_data.is_empty();
+        let mut row_enc = encode_row(planes, &last_planes, use_delta, mono, row_bytes);
         // Flush before this row would cross *either* printer limit: the
         // compressed G block must stay strictly below MAX_BATCH_BYTES, and
         // the band must stay within MAX_BAND_ROWS scanlines (compressible
@@ -692,7 +875,7 @@ pub fn encode_page_batches(rows: &[Vec<Vec<u8>>], mono: bool) -> Vec<RasterBatch
             });
             batch_start = row_idx;
             // This row now starts a new band, so re-encode it absolute.
-            row_enc = encode_row(planes, &last_planes, false, mono);
+            row_enc = encode_row(planes, &last_planes, false, mono, row_bytes);
         }
         batch_data.extend_from_slice(&row_enc);
         last_planes = planes.clone();
@@ -999,7 +1182,7 @@ mod tests {
                     .collect()
             })
             .collect();
-        let batches = encode_page_batches(&rows, false);
+        let batches = encode_page_batches(&rows, false, StyleWriterFamily::Color);
         assert!(batches.len() > 1, "expected multiple bands, got {}", batches.len());
         assert_eq!(batches[0].top, 0);
         assert_eq!(batches.last().unwrap().bottom as usize, rows.len() - 1);
@@ -1021,7 +1204,7 @@ mod tests {
         // must stay within MAX_BAND_ROWS scanlines.
         let rows: Vec<Vec<Vec<u8>>> =
             (0..MAX_BAND_ROWS * 3 + 17).map(|_| vec![vec![0u8; SW2200_PRINT_ROWBYTES]]).collect();
-        let batches = encode_page_batches(&rows, true);
+        let batches = encode_page_batches(&rows, true, StyleWriterFamily::Color);
         assert!(batches.len() >= 4, "row cap must split the page into several bands");
         for b in &batches {
             let band_rows = (b.bottom - b.top + 1) as usize;
@@ -1039,7 +1222,7 @@ mod tests {
     fn test_encode_page_batches_mono_single_band() {
         // A small all-white mono page fits in a single band.
         let rows: Vec<Vec<Vec<u8>>> = (0..10).map(|_| vec![vec![0u8; 100]]).collect();
-        let batches = encode_page_batches(&rows, true);
+        let batches = encode_page_batches(&rows, true, StyleWriterFamily::Color);
         assert_eq!(batches.len(), 1);
         assert_eq!((batches[0].top, batches[0].bottom), (0, 9));
     }
@@ -1053,5 +1236,27 @@ mod tests {
         let encoded = StyleWriterEncoder::encode_scanline(&white_line, 100, false);
         assert_ne!(encoded, vec![MASK_RUNWHT]);
         assert_eq!(encoded, vec![MASK_RUNWHT + 62, MASK_RUNWHT + 38]);
+    }
+
+    #[test]
+    fn test_original_stylewriter_rows_are_not_deltaed() {
+        // Two identical inked rows. The Color path deltas the second against
+        // the first, which leaves it blank; the original StyleWriter encodes
+        // it again in full, as lpstyl does.
+        let row = vec![vec![0x11, 0x22, 0x33]];
+        let rows = vec![row.clone(), row];
+
+        let original = encode_page_batches(&rows, true, StyleWriterFamily::Original);
+        assert_eq!(original.len(), 1);
+        let one = encode_row(&rows[0], &[vec![0; 3]], false, true, SW1_PRINT_ROWBYTES);
+        assert_eq!(original[0].data, [one.clone(), one.clone()].concat());
+        // Each row is its 3 bytes, then white runs out to 360 bytes, not 365.
+        let padded: usize = one[4..].iter().map(|&b| (b - MASK_RUNWHT) as usize).sum();
+        assert_eq!(3 + padded, SW1_PRINT_ROWBYTES);
+
+        let color = encode_page_batches(&rows, true, StyleWriterFamily::Color);
+        let blank = encode_row(&[vec![0; 3]], &[vec![0; 3]], false, true, SW2200_PRINT_ROWBYTES);
+        assert!(color[0].data.ends_with(&blank));
+        assert_ne!(original[0].data, color[0].data);
     }
 }

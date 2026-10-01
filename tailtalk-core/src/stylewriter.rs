@@ -66,8 +66,70 @@ const RESULT_BUSY: [u8; 2] = [0x00, 0x01];
 
 /// Sent to the serial printer when a client disappears mid-job: lpstyl's
 /// eject-and-reset bytes (null then `FF FF FF 'I'`), so paper does not sit
-/// in the feed path until the next job.
-const PRINTER_RESET: &[u8] = &[0x00, 0xFF, 0xFF, 0xFF, b'I'];
+/// in the feed path until the next job. Silent: the printer does not reply.
+pub const PRINTER_RESET: &[u8] = &[0x00, 0xFF, 0xFF, 0xFF, b'I'];
+
+/// The identify command. The printer answers with its model string,
+/// terminated by a carriage return. lpstyl only sends it after a reset and a
+/// ready status, and that order matters: an original StyleWriter left idle
+/// ignores it until it has been reset (confirmed on hardware).
+pub const IDENTIFY: u8 = b'?';
+
+/// Status queries, sent as `FF FF FF <q>` and each answered with one byte.
+/// The meanings are lpstyl's README.protocol.
+pub const QUERY_STATUS: u8 = b'1';
+/// Error status: 0x00 and 0x80 mean nothing wrong, 0x04 out of paper.
+pub const QUERY_ERROR: u8 = b'2';
+/// Buffer gauge, scaled differently on every model.
+pub const QUERY_BUFFER: u8 = b'B';
+/// Color StyleWriter submodel. Only ask a printer that identified as
+/// [`COLOR_FAMILY`]: a StyleWriter given a code it does not know ejects the
+/// page and resets.
+pub const QUERY_SUBMODEL: u8 = b'p';
+
+/// The identify string every Color StyleWriter (1500, 2200, 2400, 2500)
+/// shares; [`QUERY_SUBMODEL`] tells them apart.
+pub const COLOR_FAMILY: &[u8] = b"CS";
+
+/// The bytes of status query `q`.
+pub const fn status_query(q: u8) -> [u8; 4] {
+    [0xFF, 0xFF, 0xFF, q]
+}
+
+/// Whether a printer that was just reset is ready to be identified, given
+/// its replies to [`QUERY_STATUS`], [`QUERY_ERROR`] and [`QUERY_BUFFER`]
+/// (`None` where it did not answer).
+///
+/// This is lpstyl's post-reset loop (`printerSetup()`), which waits while
+/// status `1` is 0x01 or unanswered, except that an original StyleWriter
+/// shows readiness as `1` = 0x01, `2` = 0x00 and `B` = 0xA0. That reading is
+/// confirmed on hardware.
+pub fn ready_after_reset(status: Option<u8>, error: Option<u8>, buffer: Option<u8>) -> bool {
+    match status {
+        None => false,
+        Some(0x01) => error == Some(0x00) && buffer == Some(0xA0),
+        Some(_) => true,
+    }
+}
+
+/// The model an identify string names, using lpstyl's tables, with the
+/// [`QUERY_SUBMODEL`] reply for a Color StyleWriter. `None` for a string
+/// lpstyl does not know.
+pub fn model_name(identity: &[u8], submodel: Option<u8>) -> Option<&'static str> {
+    Some(match identity {
+        b"IJ10" => "Apple StyleWriter",
+        b"SW" => "Apple StyleWriter II",
+        b"SW3" => "Apple StyleWriter 1200",
+        COLOR_FAMILY => match submodel {
+            Some(0x01) => "Apple Color StyleWriter 2400",
+            Some(0x02) => "Apple Color StyleWriter 2200",
+            Some(0x04) => "Apple Color StyleWriter 1500",
+            Some(0x05) => "Apple Color StyleWriter 2500",
+            _ => "Apple Color StyleWriter",
+        },
+        _ => return None,
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StyleWriterEvent {
@@ -489,6 +551,19 @@ mod tests {
 
     fn role_events(role: &mut StyleWriterRole) -> Vec<StyleWriterEvent> {
         core::iter::from_fn(|| role.poll_event()).collect()
+    }
+
+    /// An original StyleWriter after a reset answered 01 / 00 / A0 on
+    /// hardware, and only then answered `?`.
+    #[test]
+    fn an_original_stylewriter_is_ready_on_its_own_status_pattern() {
+        assert!(ready_after_reset(Some(0x01), Some(0x00), Some(0xA0)));
+        // 0x01 on its own is lpstyl's "still busy" for everyone else.
+        assert!(!ready_after_reset(Some(0x01), Some(0x00), Some(0xF8)));
+        assert!(!ready_after_reset(Some(0x01), None, None));
+        // Any other answer is ready, and silence never is.
+        assert!(ready_after_reset(Some(0x80), None, None));
+        assert!(!ready_after_reset(None, Some(0x00), Some(0xA0)));
     }
 
     /// The three-attention rename: query, set, commit.
