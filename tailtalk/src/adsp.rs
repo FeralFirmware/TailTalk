@@ -417,6 +417,11 @@ impl Adsp {
                     )));
                 }
             }
+            // If a peer marks the end of a message after its data has already
+            // gone out, the flag arrives in an empty packet. We don't expose
+            // message boundaries on this stream, and an empty chunk would
+            // look like end of stream to the reader, so just drop it.
+            AdspEvent::Data { data, .. } if data.is_empty() => {}
             AdspEvent::Data { conn, data, .. } => {
                 if let Some(plumbing) = self.streams.get(&conn)
                     && plumbing.data_tx.send(data).await.is_err()

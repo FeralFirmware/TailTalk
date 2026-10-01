@@ -76,6 +76,14 @@ pub fn cable(taps: usize) -> Vec<CablePort> {
         .collect()
 }
 
+impl CablePort {
+    /// Every frame the other taps put on the cable, so a test can look at them
+    /// directly instead of attaching a node.
+    pub fn into_frames(self) -> mpsc::UnboundedReceiver<Vec<u8>> {
+        self.rx
+    }
+}
+
 impl Link for CablePort {
     async fn receive(&mut self, buf: &mut [u8]) -> usize {
         let frame = self.rx.recv().await.expect("cable cut");

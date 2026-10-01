@@ -237,6 +237,12 @@ struct PortState {
     written_total: u64,
     /// Each event with the `queued_total` it followed.
     events: VecDeque<(u64, PortEvent)>,
+    /// The NBP registration. It lives here instead of in the [`Printer`] so a
+    /// [`PrinterName`] handle can change it from another task.
+    socket: u8,
+    nbp_type: String,
+    name: String,
+    registered: Option<EntityName>,
 }
 
 impl PortState {
@@ -303,10 +309,8 @@ impl Hosted for PortState {
 pub struct Printer<'a, P: Platform> {
     net: Net<'a, P>,
     id: usize,
+    generation: u32,
     socket: u8,
-    nbp_type: String,
-    name: String,
-    registered: Option<EntityName>,
 }
 
 impl<'a, P: Platform> Printer<'a, P> {
@@ -380,31 +384,40 @@ impl<'a, P: Platform> Printer<'a, P> {
                 queued_total: 0,
                 written_total: 0,
                 events: VecDeque::new(),
+                socket: sockets[0],
+                nbp_type: nbp_type.to_string(),
+                name: name.to_string(),
+                registered: Some(entity),
             };
             // Grant the first window now, or a PAP server would never pull.
             state.settle(P::now());
             let socket = sockets[0];
             let id = inner.insert(Box::new(state), sockets);
+            let generation = inner.generation(id);
             inner.kick();
-            Ok(Self {
-                net,
-                id,
-                socket,
-                nbp_type: nbp_type.to_string(),
-                name: name.to_string(),
-                registered: Some(entity),
-            })
+            Ok(Self { net, id, generation, socket })
         })
     }
 
     /// The name the printer is registered under.
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn name(&self) -> String {
+        self.net
+            .with(|inner| inner.get::<PortState>(self.id).name.clone())
     }
 
     /// The socket its NBP name points at.
     pub fn socket(&self) -> u8 {
         self.socket
+    }
+
+    /// A handle for reading and changing the printer's name from another task
+    /// while this one is busy inside [`Printer::run`].
+    pub fn name_handle(&self) -> PrinterName<'a, P> {
+        PrinterName {
+            net: self.net,
+            id: self.id,
+            generation: self.generation,
+        }
     }
 
     /// For an ImageWriter, whether a colour ribbon is reported: the printer's
@@ -482,41 +495,93 @@ impl<'a, P: Platform> Printer<'a, P> {
         // The wire carries MacRoman. Read as UTF-8 that accepts ASCII and
         // refuses nearly everything else, which beats registering a name
         // the Chooser would show mangled.
-        let Some(entity) = core::str::from_utf8(raw)
-            .ok()
-            .and_then(|name| entity_name(name, &self.nbp_type).map(|e| (name, e)))
-        else {
+        let Ok(name) = core::str::from_utf8(raw) else {
             return PrinterEvent::RenameRejected;
         };
-        let (new_name, new_entity) = entity;
-        let socket = self.socket;
-        let registered = self.net.with(|inner| {
-            if let Some(old) = &self.registered {
+        match self.name_handle().set(name) {
+            Ok(()) => PrinterEvent::Renamed(name.to_string()),
+            Err(_) => PrinterEvent::RenameRejected,
+        }
+    }
+}
+
+/// Why [`PrinterName::set`] did not rename the printer. The old name stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameError {
+    /// The name is empty, too long, or carries an NBP delimiter or wildcard.
+    BadName,
+    /// The printer this handle came from has been dropped.
+    Gone,
+}
+
+/// Reads and changes a [`Printer`]'s NBP name from outside the task that's
+/// running it. It's `Copy`, and can outlive the printer: once the printer is
+/// dropped, [`PrinterName::get`] returns `None` and [`PrinterName::set`]
+/// fails with [`RenameError::Gone`], even if another printer has taken its
+/// place.
+pub struct PrinterName<'a, P: Platform> {
+    net: Net<'a, P>,
+    id: usize,
+    generation: u32,
+}
+
+impl<P: Platform> Clone for PrinterName<'_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P: Platform> Copy for PrinterName<'_, P> {}
+
+impl<P: Platform> PrinterName<'_, P> {
+    /// The name the printer is registered under, or `None` once it has been
+    /// dropped.
+    pub fn get(&self) -> Option<String> {
+        self.net.with(|inner| {
+            inner
+                .try_get::<PortState>(self.id, self.generation)
+                .map(|s| s.name.clone())
+        })
+    }
+
+    /// Re-register the printer as `name` right away. If that fails the old
+    /// name stays registered. Unlike a client's rename, [`Printer::run`]
+    /// doesn't report this one, since the caller already knows about it.
+    pub fn set(&self, name: &str) -> Result<(), RenameError> {
+        let (id, generation) = (self.id, self.generation);
+        self.net.with(|inner| {
+            let (socket, new_entity, old) = {
+                let s = inner
+                    .try_get::<PortState>(id, generation)
+                    .ok_or(RenameError::Gone)?;
+                let new_entity = entity_name(name, &s.nbp_type).ok_or(RenameError::BadName)?;
+                (s.socket, new_entity, s.registered.clone())
+            };
+            if let Some(old) = &old {
                 inner.stack.nbp_unregister(old, socket);
             }
-            if inner.stack.nbp_register(new_entity.clone(), socket).is_ok() {
-                return true;
+            if inner.stack.nbp_register(new_entity.clone(), socket).is_err() {
+                // Not expected: `entity_name` only passes names NBP accepts,
+                // and the old name is out of the way. Put it back rather than
+                // leave the printer invisible.
+                if let Some(old) = old {
+                    let _ = inner.stack.nbp_register(old, socket);
+                }
+                return Err(RenameError::BadName);
             }
-            // Put the old name back rather than leave the printer invisible.
-            if let Some(old) = &self.registered {
-                let _ = inner.stack.nbp_register(old.clone(), socket);
-            }
-            false
-        });
-        if !registered {
-            return PrinterEvent::RenameRejected;
-        }
-        self.registered = Some(new_entity);
-        self.name = new_name.to_string();
-        PrinterEvent::Renamed(self.name.clone())
+            let s = inner.get::<PortState>(id);
+            s.registered = Some(new_entity);
+            s.name = name.to_string();
+            Ok(())
+        })
     }
 }
 
 impl<P: Platform> Drop for Printer<'_, P> {
     fn drop(&mut self) {
         self.net.with(|inner| {
-            if let Some(name) = &self.registered {
-                inner.stack.nbp_unregister(name, self.socket);
+            if let Some(name) = inner.get::<PortState>(self.id).registered.take() {
+                inner.stack.nbp_unregister(&name, self.socket);
             }
             inner.remove(self.id);
         });
@@ -549,11 +614,15 @@ impl<P: Platform> Drop for WriteGuard<'_, P> {
 
 /// `<name>:<nbp_type>@*`, or `None` if `name` cannot be one: empty, too
 /// long, or carrying a delimiter that would split it.
+/// `name:nbp_type@*`, if NBP will register it: no delimiters, no wildcards,
+/// and short enough.
 fn entity_name(name: &str, nbp_type: &str) -> Option<EntityName> {
     if name.is_empty() || name.contains([':', '@']) {
         return None;
     }
-    EntityName::try_from(format!("{name}:{nbp_type}@*").as_str()).ok()
+    EntityName::try_from(format!("{name}:{nbp_type}@*").as_str())
+        .ok()
+        .filter(EntityName::fully_qualified)
 }
 
 #[cfg(test)]
@@ -567,5 +636,15 @@ mod tests {
         assert!(entity_name("a:b", "ImageWriter").is_none());
         assert!(entity_name("a@b", "ImageWriter").is_none());
         assert!(entity_name(&"x".repeat(33), "ImageWriter").is_none());
+    }
+
+    #[test]
+    fn entity_names_refuse_wildcards() {
+        // NBP's registry refuses these, so catch them up front as bad names.
+        assert!(entity_name("=", "ImageWriter").is_none());
+        assert!(entity_name("Ink=", "ImageWriter").is_none());
+        assert!(entity_name("Ink*", "ImageWriter").is_none());
+        // The same names parse; it is only the wildcards that rule them out.
+        assert!(EntityName::try_from("Ink=:ImageWriter@*").is_ok());
     }
 }

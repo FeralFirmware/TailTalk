@@ -436,6 +436,30 @@ impl<'a, P: Platform> AdspStream<'a, P> {
     /// Queue as much of `data` as fits, waiting while the queue toward the
     /// peer is full. Returns how many bytes were taken.
     pub async fn write_data(&self, data: &[u8]) -> Result<usize, AdspError> {
+        self.write_chunk(data, false).await
+    }
+
+    /// Queue all of `data` as one message, with the end-of-message flag set on
+    /// the packet that carries its last bytes. Writing the data and then
+    /// calling [`AdspStream::write_eom`] gives you the same stream, but if the
+    /// data has already gone out by then the flag gets sent in an extra empty
+    /// packet.
+    pub async fn write_message(&self, data: &[u8]) -> Result<(), AdspError> {
+        if data.is_empty() {
+            return self.write_eom();
+        }
+        let mut rest = data;
+        while !rest.is_empty() {
+            let n = self.write_chunk(rest, true).await?;
+            rest = &rest[n..];
+        }
+        Ok(())
+    }
+
+    /// Queue as much of `data` as fits, like [`AdspStream::write_data`]. If
+    /// `eom_at_end` is set and this write takes the rest of `data`, it also
+    /// marks the end of the message.
+    async fn write_chunk(&self, data: &[u8], eom_at_end: bool) -> Result<usize, AdspError> {
         if data.is_empty() {
             return Ok(0);
         }
@@ -455,7 +479,8 @@ impl<'a, P: Platform> AdspStream<'a, P> {
                     return None;
                 }
                 let n = room.min(data.len());
-                Some(match s.ep.send(key, &data[..n], false) {
+                let eom = eom_at_end && n == data.len();
+                Some(match s.ep.send(key, &data[..n], eom) {
                     Ok(_) => Ok(n),
                     Err(_) => Err(AdspError::Closed),
                 })

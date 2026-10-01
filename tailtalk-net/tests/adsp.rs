@@ -70,6 +70,73 @@ async fn streams_carry_data_both_ways() {
         .await;
 }
 
+/// Pulls the ADSP data packets `node` sent out of the raw LLAP frames seen on
+/// the cable, as (descriptor, data length).
+fn adsp_data_packets(frames: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, node: u8) -> Vec<(u8, usize)> {
+    const LLAP_SHORT_DDP: u8 = 1;
+    const LLAP_LONG_DDP: u8 = 2;
+    const DDP_ADSP: u8 = 7;
+    const ADSP_HEADER_LEN: usize = 13;
+    let mut out = Vec::new();
+    while let Ok(f) = frames.try_recv() {
+        let (ddp_len, ddp_type) = match f.get(2) {
+            Some(&LLAP_SHORT_DDP) => (5, f.get(3 + 4)),
+            Some(&LLAP_LONG_DDP) => (13, f.get(3 + 12)),
+            _ => continue,
+        };
+        if f[1] != node || ddp_type != Some(&DDP_ADSP) {
+            continue;
+        }
+        let len = (u16::from_be_bytes([f[3], f[4]]) & 0x3FF) as usize;
+        let Some(adsp) = f.get(3 + ddp_len..3 + len) else { continue };
+        if adsp.len() < ADSP_HEADER_LEN {
+            continue;
+        }
+        let descriptor = adsp[12];
+        if descriptor & tailtalk_packets::adsp::AdspPacket::FLAG_CONTROL == 0 {
+            out.push((descriptor, adsp.len() - ADSP_HEADER_LEN));
+        }
+    }
+    out
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_message_carries_its_eom_on_its_last_packet() {
+    LocalSet::new()
+        .run_until(async {
+            let mut taps = cable(3).into_iter();
+            let a = start(0x1111, taps.next().unwrap());
+            let b = start(0x2222, taps.next().unwrap());
+            let mut frames = taps.next().unwrap().into_frames();
+            tokio::join!(a.wait_address(), b.wait_address());
+
+            let listener = AdspListener::bind(b, None).unwrap();
+            let target = at(b, listener.socket());
+            let (client, server) = tokio::join!(AdspStream::connect(a, target), listener.accept());
+            let client = client.expect("connect failed");
+
+            // Let everything settle first so the reply can't get sent along
+            // with anything else.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            while frames.try_recv().is_ok() {}
+
+            server.write_message(b"reply one").await.unwrap();
+            assert_eq!(read_exact(&client, 9).await, b"reply one");
+            server.write_message(b"reply two").await.unwrap();
+            assert_eq!(read_exact(&client, 9).await, b"reply two");
+            server.flush_data().await.unwrap();
+
+            let eom = tailtalk_packets::adsp::AdspPacket::FLAG_EOM;
+            let sent = adsp_data_packets(&mut frames, b.address().unwrap().node_number);
+            assert!(!sent.is_empty(), "no data packets seen");
+            assert!(
+                sent.iter().all(|&(d, len)| len > 0 && d & eom != 0),
+                "every reply one packet, flagged EOM: {sent:?}"
+            );
+        })
+        .await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn attentions_are_out_of_band_and_acknowledged() {
     LocalSet::new()
@@ -258,6 +325,40 @@ async fn desktop_client_talks_to_a_net_listener() {
             desktop_side.close().await.unwrap();
             let mut buf = [0u8; 1];
             assert_eq!(server.read_data(&mut buf).await, 0);
+        })
+        .await;
+}
+
+/// If the end of a message is marked after its data has already gone out,
+/// the flag travels in an empty packet. A byte stream reader needs to read
+/// past that instead of treating it as the end of the stream. InkTalk's
+/// control socket used to reply like this, which is how we found it.
+#[tokio::test]
+async fn a_bare_eom_is_not_end_of_stream_to_the_desktop() {
+    LocalSet::new()
+        .run_until(async {
+            let (desk, link) = desktop();
+            let net = start(0xBEEF, link);
+            let addr = settle(net, &desk).await;
+
+            let listener = AdspListener::bind(net, None).unwrap();
+            let target = AdspAddress {
+                network_number: addr.network_number,
+                node_number: addr.node_number,
+                socket_number: listener.socket(),
+            };
+            let (desktop_side, server) =
+                tokio::join!(Adsp::connect(&desk.ddp, target), listener.accept());
+            let mut desktop_side = desktop_side.expect("desktop connect failed");
+
+            (&server).write_all(b"one").await.unwrap();
+            server.flush_data().await.unwrap();
+            server.write_eom().unwrap();
+            (&server).write_all(b"two").await.unwrap();
+
+            let mut buf = [0u8; 6];
+            desktop_side.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"onetwo");
         })
         .await;
 }
