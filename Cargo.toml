@@ -17,6 +17,7 @@ members = [
   "tailtalk-gui",
   "tashtalk",
   "hfs-reader",
+  "InkTalk/inkproto",
 ]
 resolver = "3"
 
@@ -28,6 +29,7 @@ clap = { version = "^4.6.6", features = ["derive"] } #unified
 encoding_rs = { version = "^0.8.35", default-features = false } #unified
 futures = "^0.3.33" #unified
 hfs-reader = { path = "hfs-reader", version = "^0.1.1" } #unified
+inkproto = { path = "InkTalk/inkproto" }
 prost = "^0.14" #unified
 tailtalk = { path = "tailtalk" } #unified
 tailtalk-core = { path = "tailtalk-core", version = "^0.11" } #unified

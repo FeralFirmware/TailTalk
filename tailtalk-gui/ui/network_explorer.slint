@@ -21,6 +21,7 @@ export struct DeviceRow {
     is-stylewriter: bool,
     is-imagewriter: bool,
     is-laserwriter: bool,
+    is-inktalk: bool,
 }
 
 /// One line of the queried information panel. A section row renders as a
@@ -148,6 +149,12 @@ export component NetworkExplorerWindow inherits Window {
     in property <int> name-max: 31;                     // set per family from Rust
     in-out property <int> paper-index: 0;               // LaserWriter default paper
     in-out property <bool> startup-enabled: false;      // LaserWriter power-on test page
+    in-out property <int> inktalk-mode-index: 0;        // InkTalk emulated printer
+    in-out property <int> inktalk-baud: 57600;          // InkTalk printer port speed
+    // Set from Rust, which gets them from the same protocol crate the device
+    // uses.
+    in property <int> baud-min: 300;
+    in property <int> baud-max: 1000000;
 
     // ── Ping test ────────────────────────────────────────────────────────────
     in-out property <int> ping-count: 10;
@@ -171,7 +178,7 @@ export component NetworkExplorerWindow inherits Window {
         ? root.devices[root.selected]
         : { name: "", kind: "", address: "", icon: "", latency: "", latency-ok: false,
             has-settings: false, is-stylewriter: false, is-imagewriter: false,
-            is-laserwriter: false };
+            is-laserwriter: false, is-inktalk: false };
 
     callback refresh();
     callback query(int);
@@ -445,6 +452,56 @@ export component NetworkExplorerWindow inherits Window {
                                 // have to be wrapped.
                                 text: @markdown("Print a test page at power-on");
                             }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                }
+
+                // An InkTalk's new name takes effect right away, but a new
+                // printer or port speed restarts the device (the status line
+                // says so when that happens).
+                if root.sel.is-inktalk : VerticalBox {
+                    vertical-stretch: 0;
+                    padding: 0;
+
+                    HorizontalBox {
+                        vertical-stretch: 0;
+                        padding: 0;
+                        Text { text: "Name"; width: Layout.label-width; vertical-alignment: center; }
+                        LineEdit {
+                            text <=> root.edit-name;
+                            placeholder-text: "Printer name (1–\{root.name-max} characters)";
+                            enabled: root.detail-loaded && !root.busy;
+                            horizontal-stretch: 1;
+                            height: Layout.row-height;
+                        }
+                    }
+
+                    HorizontalBox {
+                        vertical-stretch: 0;
+                        padding: 0;
+                        Text { text: "Emulated Printer"; width: Layout.label-width; vertical-alignment: center; }
+                        ComboBox {
+                            // Index order must match `Mode::from_index` in inktalk.rs.
+                            model: ["Color StyleWriter", "ImageWriter"];
+                            current-index <=> root.inktalk-mode-index;
+                            enabled: root.detail-loaded && !root.busy;
+                            horizontal-stretch: 1;
+                            height: Layout.row-height;
+                        }
+                    }
+
+                    HorizontalBox {
+                        vertical-stretch: 0;
+                        padding: 0;
+                        Text { text: "Port Speed (baud)"; width: Layout.label-width; vertical-alignment: center; }
+                        NumberField {
+                            width: 120px;
+                            height: Layout.row-height;
+                            minimum: root.baud-min;
+                            maximum: root.baud-max;
+                            value <=> root.inktalk-baud;
+                            enabled: root.detail-loaded && !root.busy;
                         }
                         Rectangle { horizontal-stretch: 1; }
                     }

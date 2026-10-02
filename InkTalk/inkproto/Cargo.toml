@@ -1,0 +1,9 @@
+[package]
+name = "inkproto"
+version = "0.1.0"
+edition = "2024"
+license-file = "../../LICENSE"
+description = "The InkTalk control protocol: frames and tagged items over ADSP. no_std, shared by the firmware and the desktop."
+publish = false
+
+[dependencies]
