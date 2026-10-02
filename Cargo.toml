@@ -31,16 +31,16 @@ futures = "^0.3.33" #unified
 hfs-reader = { path = "hfs-reader", version = "^0.1.1" } #unified
 inkproto = { path = "InkTalk/inkproto" }
 prost = "^0.14" #unified
-tailtalk = { path = "tailtalk" } #unified
-tailtalk-core = { path = "tailtalk-core", version = "^0.11" } #unified
-tailtalk-net = { path = "tailtalk-net", version = "^0.11" } #unified
-tailtalk-packets = { path = "tailtalk-packets", version = "^0.11" } #unified
-tailtalk-proto = { path = "tailtalk-proto", version = "^0.11" } #unified
+tailtalk = { path = "tailtalk", version = "^0.12" } #unified
+tailtalk-core = { path = "tailtalk-core", version = "^0.12" } #unified
+tailtalk-net = { path = "tailtalk-net", version = "^0.12" } #unified
+tailtalk-packets = { path = "tailtalk-packets", version = "^0.12" } #unified
+tailtalk-proto = { path = "tailtalk-proto", version = "^0.12" } #unified
 tashtalk = { path = "tashtalk", version = "^0.3" } #unified
 thiserror = { version = "^2.0.19", default-features = false } #unified
 tokio = { version = "^1.53.1", features = ["full", "io-util"] } #unified
 tracing = "^0.1.44" #unified
 
 [workspace.package]
-version = "0.11.0"
+version = "0.12.0"
 rust-version = "1.90.0"

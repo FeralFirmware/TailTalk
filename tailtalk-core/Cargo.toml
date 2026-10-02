@@ -18,12 +18,14 @@ std = ["tailtalk-packets/std"]
 # dependency's default-features, and this crate must be able to drop them.
 # Dropping them loses std (the firmware has none) and afp (a file-server
 # protocol with no place on a printer bridge).
-tailtalk-packets = { path = "../tailtalk-packets", version = "^0.11", default-features = false }
+tailtalk-packets = { path = "../tailtalk-packets", version = "^0.12", default-features = false }
 
 # The desktop crate depends on this one, so this is a cycle - but only
 # through dev-dependencies, which cargo allows and resolves. It is what lets
 # tests/ check these state machines against the independently written
-# desktop implementations, each side an oracle for the other.
+# desktop implementations, each side an oracle for the other. Path only, no
+# version: cargo publish strips versionless dev-dependencies, which is what
+# lets this crate publish before tailtalk exists on crates.io.
 [dev-dependencies]
-tailtalk = { workspace = true }
+tailtalk = { path = "../tailtalk" }
 tokio = { workspace = true }
