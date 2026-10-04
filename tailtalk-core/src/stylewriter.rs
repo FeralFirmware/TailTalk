@@ -54,11 +54,35 @@ pub const ATTN_BUFFER_READY: u16 = 0x0006;
 /// connection the attention arrives on: a job's kill comes in on the data
 /// connection, a commit on a control connection.
 pub const ATTN_KILL: u16 = 0x0012;
-/// Opens the rename sequence. Despite the name, no name comes back: the
-/// answer is in-band 0x0000, and the client checks for exactly that.
-pub const ATTN_GET_NAME: u16 = 0x0011;
+/// The number of jobs on the printer, as an in-band u16 (lpstyl reads it
+/// as the queue length on a busy printer). The Mac driver asks while
+/// printing, and takes 0 to mean its job was deleted. The rename sequence
+/// also opens with it, on an idle printer, and checks for exactly 0x0000.
+pub const ATTN_JOB_COUNT: u16 = 0x0011;
 /// Carries the new name as a Pascal string. Answered with in-band 0x0000.
 pub const ATTN_SET_NAME: u16 = 0x0009;
+/// Status text for the printer to show (lpstyl `at_printer_setstatus`),
+/// sent on the data connection. lpstyl reads a two-byte reply and ignores
+/// it; we send 0x0000.
+pub const ATTN_SET_STATUS: u16 = 0x000A;
+/// Sent by the Mac's own driver, not lpstyl, on a second control connection
+/// once the reverse data connection is up. The payload repeats the print
+/// request's (data socket, user name). The driver waits on a two-byte
+/// in-band reply and stalls without one; the value is unverified, and
+/// 0x0000 is what this protocol answers success with everywhere else.
+pub const ATTN_JOB_CONFIRM: u16 = 0x000D;
+/// Who the current job belongs to. lpstyl asks when a printer is busy, and
+/// the Mac driver asks after [`ATTN_JOB_CONFIRM`]. Answered with 72 in-band
+/// bytes: lpstyl reads a Pascal user name at offset 6, which fits a 2-byte
+/// result ahead of the 70-byte print request (u32 port, Pascal user).
+pub const ATTN_JOB_USER: u16 = 0x000E;
+/// The printer's status text. lpstyl reads 259 in-band bytes with a Pascal
+/// string at offset 2, and like [`ATTN_JOB_USER`] it is asked for on a busy
+/// printer.
+pub const ATTN_JOB_STATUS: u16 = 0x0010;
+
+const JOB_USER_REPLY_LEN: usize = 72;
+const JOB_STATUS_REPLY_LEN: usize = 259;
 
 /// In-band print-request results (step 4).
 const RESULT_ACCEPTED: [u8; 2] = [0x00, 0x00];
@@ -192,6 +216,13 @@ pub struct StyleWriterRole {
     events: alloc::collections::VecDeque<StyleWriterEvent>,
     /// Name staged by [`ATTN_SET_NAME`], published when the commit arrives.
     pending_name: Option<Vec<u8>>,
+    /// The accepted print request's data socket and user name, for
+    /// [`ATTN_JOB_USER`]. Only meaningful while [`Self::busy`].
+    job_port: u8,
+    job_user: Vec<u8>,
+    /// The text from the job's last [`ATTN_SET_STATUS`], for
+    /// [`ATTN_JOB_STATUS`].
+    job_status: Vec<u8>,
 }
 
 impl StyleWriterRole {
@@ -204,7 +235,36 @@ impl StyleWriterRole {
             state_since: 0,
             events: alloc::collections::VecDeque::new(),
             pending_name: None,
+            job_port: 0,
+            job_user: Vec::new(),
+            job_status: Vec::new(),
         }
+    }
+
+    /// The [`ATTN_JOB_USER`] reply: a 0x0000 result, then the current job's
+    /// print request (u32 port, Pascal user), zero padded. All zero when no
+    /// job is active.
+    fn job_user_reply(&self) -> Vec<u8> {
+        let mut reply = RESULT_ACCEPTED.to_vec();
+        if self.busy() {
+            reply.extend_from_slice(&(self.job_port as u32).to_be_bytes());
+            reply.push(self.job_user.len() as u8);
+            reply.extend_from_slice(&self.job_user);
+        }
+        reply.resize(JOB_USER_REPLY_LEN, 0);
+        reply
+    }
+
+    /// The [`ATTN_JOB_STATUS`] reply: a 0x0000 result, then the status as a
+    /// Pascal string, zero padded. Empty when no job is active or the Mac has
+    /// not set one.
+    fn job_status_reply(&self) -> Vec<u8> {
+        let mut reply = RESULT_ACCEPTED.to_vec();
+        let text: &[u8] = if self.busy() { &self.job_status } else { &[] };
+        reply.push(text.len() as u8);
+        reply.extend_from_slice(text);
+        reply.resize(JOB_STATUS_REPLY_LEN, 0);
+        reply
     }
 
     /// Enter `state`, restarting the handshake timeout.
@@ -405,6 +465,9 @@ impl StyleWriterRole {
                 };
 
                 let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
+                self.job_port = data_socket;
+                self.job_user = user.clone();
+                self.job_status.clear();
                 self.enter(
                     State::AwaitingCtrlClose {
                         ctrl: conn,
@@ -445,8 +508,29 @@ impl StyleWriterRole {
                     let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
                 }
             }
-            ATTN_GET_NAME => {
+            ATTN_JOB_COUNT => {
+                let count = u16::from(self.busy());
+                let _ = self.endpoint.send(conn, &count.to_be_bytes(), false);
+            }
+            ATTN_JOB_CONFIRM => {
                 let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
+            }
+            ATTN_SET_STATUS => {
+                // lpstyl's record: 0x06 0x47, then the text as a Pascal
+                // string, zero padded to 257.
+                if let Some(&len) = data.get(2) {
+                    let text = &data[3..];
+                    self.job_status = text[..(len as usize).min(text.len())].to_vec();
+                }
+                let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
+            }
+            ATTN_JOB_USER => {
+                let reply = self.job_user_reply();
+                let _ = self.endpoint.send(conn, &reply, false);
+            }
+            ATTN_JOB_STATUS => {
+                let reply = self.job_status_reply();
+                let _ = self.endpoint.send(conn, &reply, false);
             }
             ATTN_SET_NAME => {
                 // Pascal string: one length byte, then MacRoman bytes. Staged
@@ -581,7 +665,7 @@ mod tests {
 
         let mut now = 100;
         for (code, payload) in [
-            (ATTN_GET_NAME, alloc::vec![0x00]),
+            (ATTN_JOB_COUNT, alloc::vec![0x00]),
             (ATTN_SET_NAME, pascal(b"Inky")),
             (ATTN_KILL, alloc::vec![0x00]),
         ] {
@@ -680,6 +764,51 @@ mod tests {
             }
             other => panic!("expected reverse Opened, got {other:?}"),
         };
+
+        // The Mac driver then opens a second control connection and repeats
+        // the request as 0x000D, and stalls until it is answered.
+        // lpstyl sets a status string on the data connection and reads a
+        // two-byte reply.
+        let mut status = alloc::vec![0x06, 0x47, 8];
+        status.extend_from_slice(b"Printing");
+        status.resize(257, 0);
+        mac.send_attention(data_conn, ATTN_SET_STATUS, &status, 240)
+            .unwrap();
+        shuttle(&mut role, &mut mac, mac_addr, 240);
+        assert_eq!(in_band(&mut mac, data_conn), [0x00, 0x00]);
+
+        // The Mac driver then opens a second control connection, repeats
+        // the request as 0x000D, and asks about the job, stalling on any
+        // attention left unanswered.
+        let ctrl2 = open_control(&mut role, &mut mac, mac_addr);
+        let mut now = 250;
+        let mut ask = |role: &mut StyleWriterRole, mac: &mut AdspEndpoint, code, payload: &[u8]| {
+            mac.send_attention(ctrl2, code, payload, now).unwrap();
+            shuttle(role, mac, mac_addr, now);
+            now += 10;
+            in_band(mac, ctrl2)
+        };
+        assert_eq!(
+            ask(&mut role, &mut mac, ATTN_JOB_CONFIRM, &print_request(70, b"Bob")),
+            [0x00, 0x00]
+        );
+        // One job, the Mac's own: 0 here makes the driver report the job deleted.
+        assert_eq!(ask(&mut role, &mut mac, ATTN_JOB_COUNT, &[0x00]), [0x00, 0x01]);
+
+        let user = ask(&mut role, &mut mac, ATTN_JOB_USER, &[0x00, 0x00]);
+        assert_eq!(user.len(), 72);
+        assert_eq!(user[..6], [0x00, 0x00, 0x00, 0x00, 0x00, 70]);
+        assert_eq!(user[6..10], *b"\x03Bob");
+        assert!(user[10..].iter().all(|&b| b == 0));
+
+        let job_status = ask(&mut role, &mut mac, ATTN_JOB_STATUS, &[0x00]);
+        assert_eq!(job_status.len(), 259);
+        assert_eq!(job_status[..3], [0x00, 0x00, 8]);
+        assert_eq!(job_status[3..11], *b"Printing");
+
+        mac.close(ctrl2);
+        shuttle(&mut role, &mut mac, mac_addr, 300);
+        assert!(role.busy(), "closing the second control conn keeps the job");
 
         // Step 7: bytes flow both ways verbatim.
         mac.send(data_conn, b"?", false).unwrap();
