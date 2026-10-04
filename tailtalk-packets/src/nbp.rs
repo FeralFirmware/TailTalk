@@ -328,12 +328,24 @@ impl EntityName {
             if matches!(pattern, [WILDCARD_EQUALS] | [WILDCARD_APPROX] | [WILDCARD_STAR]) {
                 return true;
             }
+            // Phase 2 NBP allows one `≈` inside a name, standing for zero or
+            // more characters. The Color StyleWriter 2400 driver looks up
+            // "ColorStyleWriter2400≈" this way.
+            if let Some(at) = pattern.iter().position(|&b| b == WILDCARD_APPROX) {
+                let (prefix, suffix) = (&pattern[..at], &pattern[at + 1..]);
+                return concrete.len() >= prefix.len() + suffix.len()
+                    && concrete[..prefix.len()].eq_ignore_ascii_case(prefix)
+                    && concrete[concrete.len() - suffix.len()..].eq_ignore_ascii_case(suffix);
+            }
             concrete.eq_ignore_ascii_case(pattern)
         };
 
         match_part(self.object.as_wire(), pattern.object.as_wire())
             && match_part(self.entity_type.as_wire(), pattern.entity_type.as_wire())
-            && match_part(self.zone.as_wire(), pattern.zone.as_wire())
+            // An empty zone means this zone, like "*". A Mac confirming a
+            // printer it found sends a directed LkUp with one.
+            && (pattern.zone.as_wire().is_empty()
+                || match_part(self.zone.as_wire(), pattern.zone.as_wire()))
     }
 
     pub fn fully_qualified(&self) -> bool {
@@ -414,5 +426,55 @@ mod tests {
         assert!(!name.matches(&"Bob:Workstation@Twilight".try_into().unwrap()));
 
         assert!(!name.matches(&"Steve:Printer@Twilight".try_into().unwrap()));
+    }
+
+    #[test]
+    fn test_matches_partial_approx() {
+        let name: EntityName = "Ink:ColorStyleWriter2400AT@*".try_into().unwrap();
+
+        // The LkUp a Mac sent for a Color StyleWriter 2400, as captured.
+        let mut wire = vec![0x01, b'='];
+        wire.push(0x15);
+        wire.extend_from_slice(b"ColorStyleWriter2400");
+        wire.push(WILDCARD_APPROX);
+        wire.extend_from_slice(&[0x01, b'*']);
+        let (captured, _) = EntityName::from_bytes(&wire).unwrap();
+        assert!(name.matches(&captured));
+
+        // Prefix, suffix, both sides, and an empty expansion.
+        assert!(name.matches(&"=:colorstylewriter≈@*".try_into().unwrap()));
+        assert!(name.matches(&"=:≈2400AT@*".try_into().unwrap()));
+        assert!(name.matches(&"=:Color≈AT@*".try_into().unwrap()));
+        assert!(name.matches(&"=:ColorStyleWriter2400AT≈@*".try_into().unwrap()));
+        assert!(name.matches(&"I≈k:=@*".try_into().unwrap()));
+
+        // Wrong prefix or suffix, and a prefix and suffix that overlap.
+        assert!(!name.matches(&"=:ColorStyleWriter2500≈@*".try_into().unwrap()));
+        assert!(!name.matches(&"=:≈2500AT@*".try_into().unwrap()));
+        assert!(!name.matches(&"=:ColorStyleWriter2400A≈400AT@*".try_into().unwrap()));
+    }
+
+    #[test]
+    fn test_matches_empty_zone() {
+        let name: EntityName = "InkTalk:ColorStyleWriter2400AT@*".try_into().unwrap();
+
+        // The directed LkUp a Mac sent to confirm the printer, as captured:
+        // an empty zone, which means this zone just like "*".
+        let mut wire = vec![0x07];
+        wire.extend_from_slice(b"InkTalk");
+        wire.push(0x16);
+        wire.extend_from_slice(b"ColorStyleWriter2400AT");
+        wire.push(0x00);
+        let (captured, _) = EntityName::from_bytes(&wire).unwrap();
+        assert!(name.matches(&captured));
+
+        // An empty zone still needs the object and type to match.
+        let mut wire = vec![0x07];
+        wire.extend_from_slice(b"InkTalk");
+        wire.push(0x14);
+        wire.extend_from_slice(b"ColorStyleWriter2400");
+        wire.push(0x00);
+        let (captured, _) = EntityName::from_bytes(&wire).unwrap();
+        assert!(!name.matches(&captured));
     }
 }
