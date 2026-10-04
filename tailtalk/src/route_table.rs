@@ -636,6 +636,23 @@ impl RouteTable {
         self.0.read().unwrap().has_router(Instant::now())
     }
 
+    /// Zone names tied to the cable `interface` sits on, as learned from ZIP
+    /// (or configured programmatically). Empty when no zone is known for it.
+    ///
+    /// NBP uses this to decide whether a LkUp naming a specific zone is
+    /// addressed to us: a name registered in "*" lives in our own zone.
+    pub fn zones_on(&self, interface: Interface) -> Vec<String> {
+        let inner = self.0.read().unwrap();
+        inner
+            .local_ranges
+            .iter()
+            .filter(|r| r.interface == interface)
+            .filter_map(|r| inner.zip.range_to_zones.get(&r.range))
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
     /// Return the router addresses that can forward NBP requests for `zone`.
     ///
     /// Derived from ZIP (zone → ranges) then RTMP (range → next-hop).

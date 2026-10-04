@@ -1,4 +1,4 @@
-use tailtalk_packets::limits::MAX_NAME_UTF8_LEN;
+use tailtalk_packets::limits::{MAX_NAME_UTF8_LEN, NbpName};
 use crate::{
     addressing::AddressingHandle,
     ddp::{DdpHandle, DdpSocket},
@@ -431,6 +431,37 @@ impl Nbp {
         }
     }
 
+    /// Whether a LkUp naming `zone`, heard on the `source` cable, is asking
+    /// about the zone we are in.
+    ///
+    /// Without a router every lookup uses "*" and this never matters. With
+    /// one, a requester's BrRq reaches us as a LkUp carrying the zone's real
+    /// name (Inside AppleTalk, ch. 7):
+    ///
+    /// * A nonextended network (LocalTalk, Phase 1 EtherTalk) has exactly one
+    ///   zone, so a LkUp arriving on it can only be for that zone and the
+    ///   zone field is not checked.
+    /// * An extended network can hold several zones sharing a multicast
+    ///   address, so the name must match a zone ZIP told us our cable is in.
+    ///   If we know no zone for the cable there is nothing to compare
+    ///   against, and we answer rather than stay invisible.
+    fn zone_is_ours(&self, zone: &NbpName, source: AddressSource) -> bool {
+        match source {
+            AddressSource::LocalTalk | AddressSource::EtherTalkPhase1 => true,
+            AddressSource::EtherTalkPhase2 => {
+                let ours = self.route_table.zones_on(Interface::from(source));
+                if ours.is_empty() {
+                    return true;
+                }
+                let mut buf = [0u8; MAX_NAME_UTF8_LEN];
+                match zone.decode(&mut buf) {
+                    Some(z) => ours.iter().any(|o| o.eq_ignore_ascii_case(z)),
+                    None => false,
+                }
+            }
+        }
+    }
+
     async fn generate_response(
         &self,
         nbp: &NbpPacket,
@@ -443,8 +474,26 @@ impl Nbp {
         let mut tuples = tailtalk_packets::heapless::Vec::new();
 
         for req_tuple in &nbp.tuples {
+            // A name registered in "*" lives in whatever zone our cable is in,
+            // but a LkUp a router forwards on behalf of a BrRq carries the
+            // real zone name. When that zone is ours, such names are matched
+            // as if the request had said "*". Names registered under an
+            // explicit zone keep the literal comparison.
+            let this_zone_pattern = self
+                .zone_is_ours(&req_tuple.entity_name.zone, source)
+                .then(|| EntityName {
+                    zone: "*".try_into().expect("literal fits"),
+                    ..req_tuple.entity_name.clone()
+                });
+
             for name in &self.registered_names {
-                if name.name.matches(&req_tuple.entity_name) {
+                let in_this_zone = name.name.zone.as_wire() == b"*";
+                let matched = name.name.matches(&req_tuple.entity_name)
+                    || (in_this_zone
+                        && this_zone_pattern
+                            .as_ref()
+                            .is_some_and(|p| name.name.matches(p)));
+                if matched {
                     let pushed = tuples.push(NbpTuple {
                         network_number: our_addr.network_number,
                         node_id: our_addr.node_number,
