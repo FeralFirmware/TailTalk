@@ -1763,6 +1763,62 @@ const GS_FALLBACK_PATHS: &[&str] = &[
     "/opt/local/bin/gs",          // MacPorts
 ];
 
+/// Ghostscript console executables under a Windows install root, newest
+/// version first.
+///
+/// The Artifex installer puts each release in its own directory,
+/// `<Program Files>\gs\gs10.04.0\bin\gswin64c.exe`, and does not add it to
+/// `PATH`, so a stock install is invisible to a by-name lookup. `root` is the
+/// `gs` directory itself. Kept free of `cfg(windows)` so the ordering can be
+/// tested anywhere.
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn gs_windows_installs(root: &std::path::Path, exe: &str) -> Vec<std::path::PathBuf> {
+    // "gs10.04.0" -> [10, 4, 0], so 10.x sorts above 9.x (a plain string
+    // sort would put "gs9.56.1" first).
+    fn version_key(dir_name: &str) -> Vec<u32> {
+        dir_name
+            .trim_start_matches(|c: char| !c.is_ascii_digit())
+            .split('.')
+            .map(|part| part.parse().unwrap_or(0))
+            .collect()
+    }
+
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(Vec<u32>, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let exe_path = entry.path().join("bin").join(exe);
+            exe_path
+                .is_file()
+                .then(|| (version_key(&entry.file_name().to_string_lossy()), exe_path))
+        })
+        .collect();
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|(_, path)| path).collect()
+}
+
+/// Where the Ghostscript installer puts things on Windows, 64-bit first.
+#[cfg(target_os = "windows")]
+fn gs_windows_fallbacks() -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    for (var, exe) in [
+        ("ProgramW6432", "gswin64c.exe"),
+        ("ProgramFiles", "gswin64c.exe"),
+        ("ProgramFiles(x86)", "gswin32c.exe"),
+    ] {
+        if let Some(base) = std::env::var_os(var) {
+            for path in gs_windows_installs(&std::path::Path::new(&base).join("gs"), exe) {
+                if !candidates.contains(&path) {
+                    candidates.push(path);
+                }
+            }
+        }
+    }
+    candidates
+}
+
 fn gs_works(candidate: &str) -> bool {
     std::process::Command::new(candidate)
         .arg("--version")
@@ -1774,8 +1830,10 @@ fn gs_works(candidate: &str) -> bool {
 }
 
 /// Locate a usable Ghostscript executable, checking `$PATH` first and then
-/// (on macOS) common install locations that a Finder-launched app's PATH
-/// won't include. Returns the name or full path to invoke it with.
+/// common install locations it won't include: Homebrew/MacPorts prefixes on
+/// macOS (a Finder-launched app gets a bare-minimum PATH), and the Artifex
+/// installer's `Program Files\gs` directory on Windows (the installer never
+/// touches PATH). Returns the name or full path to invoke it with.
 fn find_gs() -> Option<String> {
     #[cfg(target_os = "windows")]
     let path_candidates: &[&str] = &["gswin64c", "gswin32c", "gs"];
@@ -1792,6 +1850,15 @@ fn find_gs() -> Option<String> {
     for candidate in GS_FALLBACK_PATHS {
         if gs_works(candidate) {
             return Some((*candidate).to_string());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    for candidate in gs_windows_fallbacks() {
+        if let Some(candidate) = candidate.to_str()
+            && gs_works(candidate)
+        {
+            return Some(candidate.to_string());
         }
     }
 
@@ -2405,6 +2472,32 @@ fn parse_printer_error(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stock Windows install is found without PATH, the newest release wins
+    /// (numerically, not as a string), and directories without the console
+    /// executable are skipped.
+    #[test]
+    fn gs_windows_installs_prefers_newest_release() {
+        let root = std::env::temp_dir().join(format!("tailtalk-gs-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for version in ["gs9.56.1", "gs10.04.0", "gs10.3.1"] {
+            let bin = root.join(version).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("gswin64c.exe"), b"").unwrap();
+        }
+        // An install directory with no 64-bit console executable in it.
+        std::fs::create_dir_all(root.join("gs10.05.0").join("bin")).unwrap();
+
+        let found = gs_windows_installs(&root, "gswin64c.exe");
+        let versions: Vec<String> = found
+            .iter()
+            .map(|p| p.strip_prefix(&root).unwrap().iter().next().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(versions, ["gs10.04.0", "gs10.3.1", "gs9.56.1"]);
+
+        assert!(gs_windows_installs(&root.join("missing"), "gswin64c.exe").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A printer with a job on it must survive missed lookups for the whole
     /// job, however long that is, and for the grace period afterwards.
