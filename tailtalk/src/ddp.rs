@@ -6,6 +6,7 @@ use std::{
 use tailtalk_packets::{
     aarp::{AddressSource as AppleTalkAddressSource, AppleTalkAddress},
     ddp::{DdpPacket as DdpHeaders, DdpProtocolType},
+    nbp::{NbpOperation, NbpPacket},
 };
 use tokio::sync::{
     mpsc::{self, error::TrySendError},
@@ -330,6 +331,43 @@ impl DdpProcessor {
         }
     }
 
+    /// Learn the LocalTalk cable's network number and its router from
+    /// long-form DDP that a router put on the cable.
+    ///
+    /// RTMP and ZIP are the usual ways to learn both, but they fail when the
+    /// router's RTMP Data never arrives intact and it does not answer
+    /// GetNetInfo. Until something is learned, replies go out as short DDP
+    /// from network 0 straight to the requester's node number, which is not
+    /// on this cable, so services stay invisible to Macs on other networks.
+    ///
+    /// Two kinds of frame prove their LLAP sender is a router:
+    ///
+    /// * a frame whose source network is set and differs from its
+    ///   destination network, which came from another network; and
+    /// * an NBP LkUp the sender issued itself (source and destination network
+    ///   equal) on behalf of a requester on another network, which is how a
+    ///   router turns a Chooser's BrRq into lookups on each cable of a zone.
+    ///
+    /// In both cases the destination network is this cable's number.
+    async fn learn_router_from_forwarded(&self, headers: &DdpHeaders, payload: &[u8], llap_src: u8) {
+        let (src_net, cable) = (headers.src_network_num, headers.dest_network_num);
+        if src_net == 0 || cable == 0 {
+            return;
+        }
+        if src_net == cable && !is_lookup_for_other_network(headers, payload) {
+            return;
+        }
+        let router = AppleTalkAddress { network_number: cable, node_number: llap_src };
+        if self.route_table.note_forwarding_router(router, cable) {
+            tracing::info!(
+                "DDP: node {llap_src} routes traffic onto this LocalTalk cable; using it as the router, cable network {cable}"
+            );
+            if let Some(lt) = &self.lt_addressing {
+                lt.adopt_network_number(cable).await;
+            }
+        }
+    }
+
     fn new_sock(
         &mut self,
         protocol: DdpProtocolType,
@@ -368,6 +406,10 @@ impl DdpProcessor {
     }
 
     async fn handle_packet(&mut self, packet: DdpPacket) {
+        if let Some(llap_src) = packet.llap_src {
+            self.learn_router_from_forwarded(&packet.headers, &packet.payload, llap_src).await;
+        }
+
         // Auto-cache EtherTalk source addresses; LocalTalk is resolved directly by node number.
         let source_addr = AppleTalkAddress {
             network_number: packet.headers.src_network_num,
@@ -741,6 +783,23 @@ struct DdpPacket {
     payload: Box<[u8]>,
     source: AppleTalkAddressSource,
     source_mac: [u8; 6],
+    /// LLAP source node of a long-form DDP frame received on LocalTalk.
+    llap_src: Option<u8>,
+}
+
+/// Whether `payload` is an NBP LkUp naming a requester on a network other
+/// than the one the packet came from.
+fn is_lookup_for_other_network(headers: &DdpHeaders, payload: &[u8]) -> bool {
+    if headers.protocol_typ != DdpProtocolType::Nbp {
+        return false;
+    }
+    let Ok(nbp) = NbpPacket::from_bytes(payload) else {
+        return false;
+    };
+    matches!(nbp.operation, NbpOperation::Lookup)
+        && nbp.tuples.first().is_some_and(|t| {
+            t.network_number != 0 && t.network_number != headers.src_network_num
+        })
 }
 
 enum DdpCommand {
@@ -826,6 +885,22 @@ impl DdpHandle {
                 payload,
                 source,
                 source_mac,
+                llap_src: None,
+            }));
+        }
+    }
+
+    /// Deliver a long-form DDP packet that arrived on LocalTalk from LLAP node
+    /// `llap_src`. Unlike [`Self::received_parsed_pkt`] this keeps the LLAP
+    /// sender, which for forwarded traffic is the router it came through.
+    pub fn received_localtalk_long_pkt(&self, headers: DdpHeaders, payload: Box<[u8]>, llap_src: u8) {
+        if let DdpHandleInner::Local(command) = &self.inner {
+            let _ = command.try_send(DdpCommand::ReceivedPkt(DdpPacket {
+                headers,
+                payload,
+                source: AppleTalkAddressSource::LocalTalk,
+                source_mac: [0; 6],
+                llap_src: Some(llap_src),
             }));
         }
     }

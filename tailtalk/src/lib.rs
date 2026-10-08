@@ -457,11 +457,10 @@ impl PacketProcessor {
                                                         let end = (3 + headers.len).min(data.len());
                                                         let payload =
                                                             data[(3 + DdpPacket::LEN)..end].to_vec().into_boxed_slice();
-                                                        ddp_handle.received_parsed_pkt(
+                                                        ddp_handle.received_localtalk_long_pkt(
                                                             headers,
                                                             payload,
-                                                            aarp::AddressSource::LocalTalk,
-                                                            [0; 6],
+                                                            llap.src_node,
                                                         );
                                                     }
                                                 }

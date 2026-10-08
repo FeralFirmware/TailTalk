@@ -572,6 +572,31 @@ impl RouteTable {
         });
     }
 
+    /// Record `router` as the A-Router for a nonextended LocalTalk cable
+    /// numbered `cable`, learned from the router's forwarded traffic rather
+    /// than from its RTMP broadcasts. Returns `true` if no router was known
+    /// before. No-op (returning `false`) in [`LearningMode::Static`].
+    ///
+    /// A bridge whose RTMP Data never reaches us intact, or that sends none,
+    /// still forwards long-form DDP onto the cable, and that is enough to tell
+    /// us both the cable's network number and which node routes off it.
+    pub fn note_forwarding_router(&self, router: AppleTalkAddress, cable: u16) -> bool {
+        let mut inner = self.0.write().unwrap();
+        if matches!(inner.mode, LearningMode::Static) {
+            return false;
+        }
+        let first = !inner.has_router(Instant::now());
+        inner.default_router = Some(DefaultRouter {
+            addr: router,
+            interface: Interface::LocalTalk,
+            expires_at: Some(Instant::now() + RTMP_ROUTE_TTL),
+        });
+        if inner.upsert_local_range(Interface::LocalTalk, (cable, cable)) {
+            inner.publish(RouteChange::SetLocalRange((cable, cable)));
+        }
+        first
+    }
+
     /// Drop expired RTMP-learned routes and, if it has lapsed, the A-Router.
     /// Meant to be called periodically (the RTMP listener does this); reads
     /// already ignore expired entries, this just reclaims them.
