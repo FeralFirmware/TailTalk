@@ -12,7 +12,7 @@ use tailtalk::atp::{Atp, AtpAddress};
 use tailtalk::imagewriter::ImageWriter;
 use tailtalk::pap::PapClient;
 use tailtalk::stylewriter::StyleWriterSession;
-use tailtalk_net::printer::{Printer, PrinterEvent, RenameError, WINDOW};
+use tailtalk_net::printer::{FastClock, Printer, PrinterEvent, RenameError, WINDOW};
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 
@@ -53,7 +53,7 @@ async fn stylewriter_serves_a_desktop_session() {
             let net = start(0xC0FFEE, link);
             let addr = settle(net, &desk).await;
 
-            let printer = Printer::stylewriter(net, "Sty").unwrap();
+            let printer = Printer::stylewriter(net, "Sty", FastClock::Unsupported).unwrap();
             let socket = printer.socket();
             let (tx, rx) = port(StyleWriterModel::default());
             let mut events = serve(printer, tx, rx);
@@ -182,7 +182,7 @@ async fn name_handle_renames_while_the_printer_runs() {
             let net = start(0xF00D, link);
             settle(net, &desk).await;
 
-            let printer = Printer::stylewriter(net, "Inky").unwrap();
+            let printer = Printer::stylewriter(net, "Inky", FastClock::Unsupported).unwrap();
             let name = printer.name_handle();
             let (tx, rx) = port(Silent);
             let mut events = serve(printer, tx, rx);
@@ -209,10 +209,10 @@ async fn name_handle_outliving_its_printer_touches_no_other() {
             let net = start(0xFEED, link);
             settle(net, &desk).await;
 
-            let first = Printer::stylewriter(net, "First").unwrap();
+            let first = Printer::stylewriter(net, "First", FastClock::Unsupported).unwrap();
             let stale = first.name_handle();
             drop(first);
-            let second = Printer::stylewriter(net, "Second").unwrap();
+            let second = Printer::stylewriter(net, "Second", FastClock::Unsupported).unwrap();
 
             assert_eq!(stale.get(), None);
             assert_eq!(stale.set("Hijacked"), Err(RenameError::Gone));

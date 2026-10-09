@@ -28,7 +28,7 @@ use tailtalk::{
     route_table::{LearningMode, RouteTable},
     stylewriter::StyleWriterSession,
 };
-use tailtalk_core::stylewriter::{StyleWriterEvent, StyleWriterRole};
+use tailtalk_core::stylewriter::{FastClock, StyleWriterEvent, StyleWriterRole};
 use tailtalk_packets::aarp::{AddressSource, AppleTalkAddress};
 use tailtalk_packets::ddp::{DdpPacket as DdpHeaders, DdpProtocolType};
 use tailtalk_packets::nbp::ServiceAddress;
@@ -96,7 +96,7 @@ fn spawn_printer(
 ) -> mpsc::UnboundedReceiver<StyleWriterEvent> {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        let mut role = StyleWriterRole::new(PRINTER_CTRL_SOCKET, 0xC0FFEE);
+        let mut role = StyleWriterRole::new(PRINTER_CTRL_SOCKET, 0xC0FFEE, FastClock::Unsupported);
         let mut sim = PrinterSim::default();
         let start = tokio::time::Instant::now();
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(20));
