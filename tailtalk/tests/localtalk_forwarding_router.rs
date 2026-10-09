@@ -106,7 +106,7 @@ fn inject_router_lookup(ddp: &DdpHandle, requester: AppleTalkAddress) {
 
     let router = AppleTalkAddress { network_number: CABLE, node_number: ROUTER_NODE };
     let headers = long_headers(router, CABLE, 255, DdpProtocolType::Nbp, len);
-    ddp.received_localtalk_long_pkt(headers, buf[..len].into(), ROUTER_NODE);
+    ddp.received_localtalk_long_pkt(headers, buf[..len].into(), ROUTER_NODE, 255);
 }
 
 /// Collect the NBP LookupReply frames the stack sent.
@@ -164,7 +164,7 @@ async fn forwarded_packet_teaches_the_router() {
     let s = stack().await;
 
     let headers = long_headers(REQUESTER, CABLE, LT_NODE, DdpProtocolType::Atp, 0);
-    s.ddp.received_localtalk_long_pkt(headers, Box::new([]), ROUTER_NODE);
+    s.ddp.received_localtalk_long_pkt(headers, Box::new([]), ROUTER_NODE, LT_NODE);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert_eq!(
@@ -181,11 +181,40 @@ async fn local_long_ddp_is_not_taken_for_a_router() {
 
     let neighbour = AppleTalkAddress { network_number: CABLE, node_number: 22 };
     let headers = long_headers(neighbour, CABLE, LT_NODE, DdpProtocolType::Atp, 0);
-    s.ddp.received_localtalk_long_pkt(headers, Box::new([]), neighbour.node_number);
+    s.ddp.received_localtalk_long_pkt(headers, Box::new([]), neighbour.node_number, LT_NODE);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert!(!s.route_table.has_router());
     assert_eq!(s.lt.addr().await.unwrap().network_number, 0);
+}
+
+/// A neighbour answering a Mac behind the router sends long DDP from our
+/// cable to that Mac's network, LLAP-addressed to the router. The TashTalk
+/// hands us that frame too. It must not make us take the neighbour for the
+/// router or its destination network for our cable — on the Banana laptop
+/// that flipped the cable to 38 and sent every reply to 38.207 straight to a
+/// node 207 that is not on this cable.
+#[tokio::test]
+async fn neighbour_talking_to_the_router_teaches_nothing() {
+    let mut s = stack().await;
+
+    // The real router relays a lookup first, so we know the cable is 35
+    // and node 1 is the router.
+    inject_router_lookup(&s.ddp, REQUESTER);
+    let _ = replies(&mut s.out_rx).await;
+    let router = AppleTalkAddress { network_number: CABLE, node_number: ROUTER_NODE };
+    assert_eq!(s.route_table.route_for(REQUESTER.network_number), Some(router));
+
+    // Node 22 (the LC III+) answers the requester through the router.
+    let neighbour = AppleTalkAddress { network_number: CABLE, node_number: 22 };
+    let headers = long_headers(neighbour, REQUESTER.network_number, REQUESTER.node_number, DdpProtocolType::Nbp, 0);
+    s.ddp.received_localtalk_long_pkt(headers, Box::new([]), neighbour.node_number, ROUTER_NODE);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(!s.route_table.is_local(REQUESTER.network_number), "38 was taken for our cable");
+    assert!(s.route_table.is_local(CABLE));
+    assert_eq!(s.route_table.route_for(REQUESTER.network_number), Some(router));
+    assert_eq!(s.lt.addr().await.unwrap().network_number, CABLE);
 }
 
 /// A static table is only ever filled programmatically.

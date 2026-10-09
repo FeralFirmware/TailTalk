@@ -349,7 +349,28 @@ impl DdpProcessor {
     ///   router turns a Chooser's BrRq into lookups on each cable of a zone.
     ///
     /// In both cases the destination network is this cable's number.
-    async fn learn_router_from_forwarded(&self, headers: &DdpHeaders, payload: &[u8], llap_src: u8) {
+    async fn learn_router_from_forwarded(
+        &self,
+        headers: &DdpHeaders,
+        payload: &[u8],
+        llap_src: u8,
+        llap_dst: u8,
+    ) {
+        // Only a frame delivered *onto* this cable — to us or to everyone —
+        // says anything about our cable. The TashTalk also hands us frames a
+        // neighbour sends *to* the router (LLAP destination = the router's
+        // node): their DDP destination network is someone else's cable, and
+        // taking it for ours made every reply to that network go out
+        // addressed straight to a node that isn't here.
+        if llap_dst != 255 {
+            let ours = match &self.lt_addressing {
+                Some(lt) => lt.addr().await.ok().map(|a| a.node_number),
+                None => None,
+            };
+            if ours != Some(llap_dst) {
+                return;
+            }
+        }
         let (src_net, cable) = (headers.src_network_num, headers.dest_network_num);
         if src_net == 0 || cable == 0 {
             return;
@@ -406,8 +427,9 @@ impl DdpProcessor {
     }
 
     async fn handle_packet(&mut self, packet: DdpPacket) {
-        if let Some(llap_src) = packet.llap_src {
-            self.learn_router_from_forwarded(&packet.headers, &packet.payload, llap_src).await;
+        if let (Some(llap_src), Some(llap_dst)) = (packet.llap_src, packet.llap_dst) {
+            self.learn_router_from_forwarded(&packet.headers, &packet.payload, llap_src, llap_dst)
+                .await;
         }
 
         // Auto-cache EtherTalk source addresses; LocalTalk is resolved directly by node number.
@@ -602,6 +624,15 @@ impl DdpProcessor {
                 None => (dest, None),
             }
         };
+        if dest.network_number != 0 {
+            tracing::debug!(
+                "DDP: next hop for {}.{} is {}.{} on {:?}; route table: {}",
+                dest.network_number, dest.node_number,
+                hop.network_number, hop.node_number,
+                route_iface,
+                self.route_table.debug_summary(),
+            );
+        }
 
         let dest_node = match route_iface {
             Some(Interface::LocalTalk) if self.lt_addressing.is_some() => {
@@ -785,6 +816,9 @@ struct DdpPacket {
     source_mac: [u8; 6],
     /// LLAP source node of a long-form DDP frame received on LocalTalk.
     llap_src: Option<u8>,
+    /// LLAP destination node of that frame: us, 255 (broadcast), or — since
+    /// the TashTalk hands over every frame on the cable — some other node.
+    llap_dst: Option<u8>,
 }
 
 /// Whether `payload` is an NBP LkUp naming a requester on a network other
@@ -886,6 +920,7 @@ impl DdpHandle {
                 source,
                 source_mac,
                 llap_src: None,
+                llap_dst: None,
             }));
         }
     }
@@ -893,7 +928,13 @@ impl DdpHandle {
     /// Deliver a long-form DDP packet that arrived on LocalTalk from LLAP node
     /// `llap_src`. Unlike [`Self::received_parsed_pkt`] this keeps the LLAP
     /// sender, which for forwarded traffic is the router it came through.
-    pub fn received_localtalk_long_pkt(&self, headers: DdpHeaders, payload: Box<[u8]>, llap_src: u8) {
+    pub fn received_localtalk_long_pkt(
+        &self,
+        headers: DdpHeaders,
+        payload: Box<[u8]>,
+        llap_src: u8,
+        llap_dst: u8,
+    ) {
         if let DdpHandleInner::Local(command) = &self.inner {
             let _ = command.try_send(DdpCommand::ReceivedPkt(DdpPacket {
                 headers,
@@ -901,6 +942,7 @@ impl DdpHandle {
                 source: AppleTalkAddressSource::LocalTalk,
                 source_mac: [0; 6],
                 llap_src: Some(llap_src),
+                llap_dst: Some(llap_dst),
             }));
         }
     }
