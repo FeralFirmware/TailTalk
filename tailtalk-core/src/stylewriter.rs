@@ -49,6 +49,18 @@ pub const NBP_TYPE: &str = "ColorStyleWriter2400AT";
 pub const ATTN_PRINT_REQUEST: u16 = 0x000B;
 /// Buffer-ready query, answered with in-band 0xFFFF.
 pub const ATTN_BUFFER_READY: u16 = 0x0006;
+/// Sent by the Mac driver on the data connection once it has set the
+/// printer up ('D', status and buffer queries), before any raster; it then
+/// waits on a two-byte in-band reply. Not in lpstyl, and the name and
+/// reply value are guesses: 0x0000, as for the other unverified codes. If
+/// the Mac balks right after it, 0xFFFF (the [`ATTN_BUFFER_READY`] answer)
+/// is the next thing to try.
+pub const ATTN_PAGE_START: u16 = 0x0005;
+/// Serial port options for the adapter, forwarded by the Mac driver like
+/// its serial driver's csCode 16. It sends 0x40 right after switching the
+/// printer to its fast mode: bit 6, clock the port from the printer's HSKi.
+/// Always answered with 0x0000; see [`FastClock`] for the rest.
+pub const ATTN_SERIAL_OPTIONS: u16 = 0x0004;
 /// Kill/teardown attention (lpstyl `at_printer_kill`). The rename sequence
 /// reuses this code as its commit step, so the two are told apart by which
 /// connection the attention arrives on: a job's kill comes in on the data
@@ -92,6 +104,30 @@ const RESULT_BUSY: [u8; 2] = [0x00, 0x01];
 /// eject-and-reset bytes (null then `FF FF FF 'I'`), so paper does not sit
 /// in the feed path until the next job. Silent: the printer does not reply.
 pub const PRINTER_RESET: &[u8] = &[0x00, 0xFF, 0xFF, 0xFF, b'I'];
+
+/// Puts a Color StyleWriter into its fast mode. The Mac driver sends it as a
+/// message of its own, then [`ATTN_SERIAL_OPTIONS`] for the adapter to follow
+/// the printer's clock. See [`FastClock`].
+const FAST_CLOCK: u8 = b'x';
+
+/// [`ATTN_SERIAL_OPTIONS`] bit: clock the port from the printer's HSKi.
+const SERIAL_EXTERNAL_CLOCK: u8 = 0x40;
+
+/// Whether the hardware behind a [`StyleWriterRole`] can follow a Color
+/// StyleWriter into its fast mode. There the printer clocks the serial link
+/// itself at close to 1 Mbit/s on HSKi (lpstyl's protocol notes), and the
+/// port has to take its clock from that line instead of its own baud rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastClock {
+    /// The client's switch to fast mode goes to the printer, and the role
+    /// reports [`StyleWriterEvent::FastClockEnable`] when the port has to
+    /// follow the printer's clock, and [`StyleWriterEvent::FastClockDisable`]
+    /// when it can go back to its own.
+    Supported,
+    /// The role keeps the switch from the printer, so the printer stays at
+    /// its usual speed, and reports nothing.
+    Unsupported,
+}
 
 /// The identify command. The printer answers with its model string,
 /// terminated by a carriage return. lpstyl only sends it after a reset and a
@@ -172,6 +208,15 @@ pub enum StyleWriterEvent {
     /// across a power cycle and re-registers itself, so a client looking the
     /// printer up shortly afterwards expects to find the new name.
     Rename(Vec<u8>),
+    /// From here on, clock the printer port from the printer's HSKi: the
+    /// printer is in its fast mode. Comes after the bytes that switched it.
+    /// Only with [`FastClock::Supported`].
+    FastClockEnable,
+    /// Go back to clocking the printer port at its own baud rate: the client
+    /// switched fast mode off, or the job ended. Comes after any bytes the
+    /// printer still has to hear at the fast clock, such as the reset for a
+    /// client that vanished. Only after [`StyleWriterEvent::FastClockEnable`].
+    FastClockDisable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,10 +268,17 @@ pub struct StyleWriterRole {
     /// The text from the job's last [`ATTN_SET_STATUS`], for
     /// [`ATTN_JOB_STATUS`].
     job_status: Vec<u8>,
+    /// Whether the next data packet starts an ADSP message, i.e. the last
+    /// one ended with EOM. [`FAST_CLOCK`] only counts as a whole message,
+    /// never as a byte inside raster data.
+    data_msg_start: bool,
+    fast_clock: FastClock,
+    /// Whether the port has been told to follow the printer's clock.
+    fast_clock_on: bool,
 }
 
 impl StyleWriterRole {
-    pub fn new(control_socket: u8, seed: u32) -> Self {
+    pub fn new(control_socket: u8, seed: u32, fast_clock: FastClock) -> Self {
         let mut endpoint = AdspEndpoint::new(control_socket, seed);
         endpoint.set_listening(true);
         Self {
@@ -238,6 +290,21 @@ impl StyleWriterRole {
             job_port: 0,
             job_user: Vec::new(),
             job_status: Vec::new(),
+            data_msg_start: true,
+            fast_clock,
+            fast_clock_on: false,
+        }
+    }
+
+    /// Tell the embedder to switch the port's clock, if that changes it.
+    fn follow_printer_clock(&mut self, on: bool) {
+        if on != self.fast_clock_on {
+            self.fast_clock_on = on;
+            self.events.push_back(if on {
+                StyleWriterEvent::FastClockEnable
+            } else {
+                StyleWriterEvent::FastClockDisable
+            });
         }
     }
 
@@ -377,6 +444,7 @@ impl StyleWriterRole {
                 // that notification.
                 if !inbound && matches!(self.state, State::Connecting { .. } | State::Piping { .. })
                 {
+                    self.data_msg_start = true;
                     self.enter(
                         State::Piping {
                             conn,
@@ -389,11 +457,19 @@ impl StyleWriterRole {
             AdspEvent::Attention { conn, code, data } => {
                 self.handle_attention(conn, code, &data, now);
             }
-            AdspEvent::Data { conn, data, .. } => {
+            AdspEvent::Data { conn, data, eom } => {
                 if let State::Piping { conn: dc, .. } = self.state
                     && conn == dc
                     && !data.is_empty()
                 {
+                    let whole_message = self.data_msg_start && eom;
+                    self.data_msg_start = eom;
+                    if whole_message
+                        && data == [FAST_CLOCK]
+                        && self.fast_clock == FastClock::Unsupported
+                    {
+                        return;
+                    }
                     self.events.push_back(StyleWriterEvent::ToPrinter(data));
                 }
             }
@@ -422,6 +498,7 @@ impl StyleWriterRole {
                         self.events
                             .push_back(StyleWriterEvent::ToPrinter(PRINTER_RESET.to_vec()));
                     }
+                    self.follow_printer_clock(false);
                     self.events
                         .push_back(StyleWriterEvent::JobEnded { clean: kill_seen });
                     self.enter(State::Idle, now);
@@ -512,8 +589,15 @@ impl StyleWriterRole {
                 let count = u16::from(self.busy());
                 let _ = self.endpoint.send(conn, &count.to_be_bytes(), false);
             }
-            ATTN_JOB_CONFIRM => {
+            ATTN_JOB_CONFIRM | ATTN_PAGE_START => {
                 let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
+            }
+            ATTN_SERIAL_OPTIONS => {
+                let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
+                if self.fast_clock == FastClock::Supported {
+                    let external = data.first().is_some_and(|o| o & SERIAL_EXTERNAL_CLOCK != 0);
+                    self.follow_printer_clock(external);
+                }
             }
             ATTN_SET_STATUS => {
                 // lpstyl's record: 0x06 0x47, then the text as a Pascal
@@ -544,7 +628,13 @@ impl StyleWriterRole {
                 }
                 let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
             }
-            _ => {}
+            _ => {
+                // Every attention seen so far, from lpstyl and the Mac
+                // driver alike, is followed by a read of an in-band reply,
+                // and the Mac hangs for good if none comes. A guessed 0x0000
+                // fails visibly instead, and the code is in the RX log.
+                let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
+            }
         }
     }
 }
@@ -658,7 +748,7 @@ mod tests {
     #[test]
     fn a_rename_is_answered_at_each_step_and_published_on_commit() {
         let mac_addr = addr(10, 70);
-        let mut role = StyleWriterRole::new(129, 42);
+        let mut role = StyleWriterRole::new(129, 42, FastClock::Unsupported);
         let mut mac = AdspEndpoint::new(70, 77);
         mac.set_listening(true);
         let ctrl = open_control(&mut role, &mut mac, mac_addr);
@@ -690,7 +780,7 @@ mod tests {
     #[test]
     fn a_staged_name_without_a_commit_is_not_published() {
         let mac_addr = addr(10, 70);
-        let mut role = StyleWriterRole::new(129, 42);
+        let mut role = StyleWriterRole::new(129, 42, FastClock::Unsupported);
         let mut mac = AdspEndpoint::new(70, 77);
         mac.set_listening(true);
         let ctrl = open_control(&mut role, &mut mac, mac_addr);
@@ -710,7 +800,7 @@ mod tests {
     #[test]
     fn full_handshake_and_byte_pipe() {
         let mac_addr = addr(10, 70);
-        let mut role = StyleWriterRole::new(129, 42);
+        let mut role = StyleWriterRole::new(129, 42, FastClock::Unsupported);
         // One endpoint on the Mac side plays both the control client and
         // the data listener (both live on node 10).
         let mut mac = AdspEndpoint::new(70, 77);
@@ -811,7 +901,8 @@ mod tests {
         assert!(role.busy(), "closing the second control conn keeps the job");
 
         // Step 7: bytes flow both ways verbatim.
-        mac.send(data_conn, b"?", false).unwrap();
+        // Every command is a message of its own, EOM set, as the Mac sends it.
+        mac.send(data_conn, b"?", true).unwrap();
         shuttle(&mut role, &mut mac, mac_addr, 300);
         assert_eq!(
             role.poll_event(),
@@ -842,6 +933,40 @@ mod tests {
         };
         assert_eq!(br, [0xFF, 0xFF]);
 
+        // The Mac driver's 0x0005 before the first raster, and any code we
+        // have not met yet, still get a reply rather than hanging the Mac.
+        for (at, code) in [(510, ATTN_PAGE_START), (520, 0x0042)] {
+            mac.send_attention(data_conn, code, &[0x00], at).unwrap();
+            shuttle(&mut role, &mut mac, mac_addr, at);
+            assert_eq!(in_band(&mut mac, data_conn), [0x00, 0x00], "{code:#06x}");
+        }
+
+        // Without fast clock support, the switch to fast mode never reaches
+        // the printer, and the port options after it are answered and
+        // nothing more.
+        mac.send(data_conn, &[FAST_CLOCK], true).unwrap();
+        shuttle(&mut role, &mut mac, mac_addr, 530);
+        mac.send_attention(data_conn, ATTN_SERIAL_OPTIONS, &[0x40], 540)
+            .unwrap();
+        shuttle(&mut role, &mut mac, mac_addr, 540);
+        assert_eq!(in_band(&mut mac, data_conn), [0x00, 0x00]);
+        assert_eq!(role.poll_event(), None, "nothing for the embedder");
+
+        // An 'x' that is data rather than a command still goes through:
+        // inside a longer message, or ending one an earlier packet started.
+        for (at, bytes, eom) in [
+            (550, &b"xx"[..], true),
+            (560, &b"ab"[..], false),
+            (570, &b"x"[..], true),
+        ] {
+            mac.send(data_conn, bytes, eom).unwrap();
+            shuttle(&mut role, &mut mac, mac_addr, at);
+            assert_eq!(
+                role.poll_event(),
+                Some(StyleWriterEvent::ToPrinter(bytes.to_vec()))
+            );
+        }
+
         // Step 8: kill attention then close = clean end, no reset injected.
         mac.send_attention(data_conn, ATTN_KILL, &[0x00], 600)
             .unwrap();
@@ -871,7 +996,7 @@ mod tests {
     #[test]
     fn vanished_client_resets_the_printer() {
         let mac_addr = addr(10, 70);
-        let mut role = StyleWriterRole::new(129, 1);
+        let mut role = StyleWriterRole::new(129, 1, FastClock::Unsupported);
         let mut mac = AdspEndpoint::new(70, 2);
         mac.set_listening(true);
 
@@ -923,6 +1048,69 @@ mod tests {
         assert!(!role.busy());
     }
 
+    /// With fast clock support the switch reaches the printer, and the port
+    /// follows the printer's clock until the client switches it back or the
+    /// job ends, after any reset the printer still has to hear at its speed.
+    #[test]
+    fn supported_fast_clock_follows_the_client_and_the_job() {
+        use StyleWriterEvent::{FastClockDisable, FastClockEnable, JobEnded, ToPrinter};
+        let mac_addr = addr(10, 70);
+        let mut role = StyleWriterRole::new(129, 3, FastClock::Supported);
+        let mut mac = AdspEndpoint::new(70, 4);
+        mac.set_listening(true);
+        let ctrl = open_control(&mut role, &mut mac, mac_addr);
+        mac.send_attention(ctrl, ATTN_PRINT_REQUEST, &print_request(70, b"Fay"), 100)
+            .unwrap();
+        shuttle(&mut role, &mut mac, mac_addr, 100);
+        mac.close(ctrl);
+        shuttle(&mut role, &mut mac, mac_addr, 200);
+        let data_conn = loop {
+            match mac.poll_event() {
+                Some(AdspEvent::Opened { conn, .. }) => break conn,
+                Some(_) => continue,
+                None => panic!("no data connection"),
+            }
+        };
+        assert!(matches!(role.poll_event(), Some(StyleWriterEvent::JobStarted { .. })));
+
+        mac.send(data_conn, &[FAST_CLOCK], true).unwrap();
+        shuttle(&mut role, &mut mac, mac_addr, 300);
+        let mut expected = alloc::vec![ToPrinter(alloc::vec![FAST_CLOCK])];
+        for (at, options, event) in [
+            (310, 0x40, Some(FastClockEnable)),
+            (320, 0x40, None),
+            (330, 0x00, Some(FastClockDisable)),
+            (340, 0x40, Some(FastClockEnable)),
+        ] {
+            mac.send_attention(data_conn, ATTN_SERIAL_OPTIONS, &[options], at)
+                .unwrap();
+            shuttle(&mut role, &mut mac, mac_addr, at);
+            assert_eq!(in_band(&mut mac, data_conn), [0x00, 0x00]);
+            expected.extend(event);
+            assert_eq!(role_events(&mut role), expected, "options {options:#04x}");
+            expected.clear();
+        }
+
+        // The client vanishes mid-job, as in vanished_client_resets_the_printer.
+        role.printer_input(b"status byte");
+        while role.poll_transmit().is_some() {}
+        while let Some(now) = role.next_deadline() {
+            role.poll(now);
+            while role.poll_transmit().is_some() {}
+            if !role.busy() {
+                break;
+            }
+        }
+        assert_eq!(
+            role_events(&mut role),
+            [
+                ToPrinter(PRINTER_RESET.to_vec()),
+                FastClockDisable,
+                JobEnded { clean: false },
+            ]
+        );
+    }
+
     /// A client that vanishes between the accept and the control close
     /// must not pin the role busy forever. Before the handshake timeout
     /// existed, one abandoned attempt made the printer answer "busy" to
@@ -931,7 +1119,7 @@ mod tests {
     #[test]
     fn abandoned_handshake_releases_the_role() {
         let mac_addr = addr(10, 70);
-        let mut role = StyleWriterRole::new(129, 5);
+        let mut role = StyleWriterRole::new(129, 5, FastClock::Unsupported);
         let mut mac = AdspEndpoint::new(70, 6);
         mac.set_listening(true);
 
@@ -972,7 +1160,7 @@ mod tests {
     #[test]
     fn second_request_while_busy_gets_busy_result() {
         let mac_addr = addr(10, 70);
-        let mut role = StyleWriterRole::new(129, 9);
+        let mut role = StyleWriterRole::new(129, 9, FastClock::Unsupported);
         let mut mac = AdspEndpoint::new(70, 8);
         mac.set_listening(true);
 
