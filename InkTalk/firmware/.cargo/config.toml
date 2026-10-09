@@ -1,0 +1,24 @@
+# Per-crate cargo config: applies whenever cargo is invoked from inside the
+# `firmware/` directory tree. Builds for the RP2040's M0+ core.
+
+[build]
+target = "thumbv6m-none-eabi"
+
+[target.thumbv6m-none-eabi]
+rustflags = [
+  "-C", "link-arg=--nmagic",
+  "-C", "link-arg=-Tlink.x",
+  "-C", "link-arg=-Tdefmt.x",
+]
+# `cargo run` flashes with picotool, so the board has to be in BOOTSEL
+# first: hold BOOT while plugging it in, or send `b` in the debug shell.
+#
+# Flags:
+#   -u  update (skip unchanged sectors, faster)
+#   -v  verify after writing
+#   -x  execute (reboot into the application) after loading
+#   -t elf  the input file is an ELF, not a UF2
+runner = "picotool load -u -v -x -t elf"
+
+[env]
+DEFMT_LOG = "info"

@@ -1,0 +1,73 @@
+# InkTalk firmware. Its own workspace, excluded from the TailTalk root
+# workspace and pinned to thumbv6m-none-eabi via .cargo/config.toml.
+[workspace]
+members = ["localtalk"]
+
+[workspace.package]
+edition = "2024"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/feralfirmware/tailtalk"
+
+[profile.release]
+debug = 2
+lto = "fat"
+opt-level = "z"
+overflow-checks = false
+codegen-units = 1
+
+[profile.dev]
+debug = 2
+opt-level = 1
+overflow-checks = true
+codegen-units = 1
+
+[package]
+name = "inktalk-firmware"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "InkTalk: LocalTalk-to-serial printer adapter firmware for the RP2040."
+
+[[bin]]
+name = "inktalk"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+# The wire codec, in its own crate so it can be tested on a host: the
+# firmware itself only builds for thumbv6m.
+localtalk = { path = "localtalk", features = ["defmt"] }
+# The control protocol. The desktop explorer uses it too, so it lives in the
+# root workspace and its host tests run from there (`cargo test -p inkproto`).
+inkproto = { path = "../inkproto" }
+
+tailtalk-core = { path = "../../tailtalk-core", default-features = false }
+tailtalk-net = { path = "../../tailtalk-net" }
+tailtalk-packets = { path = "../../tailtalk-packets", default-features = false }
+
+# Embassy versions pinned to a known-good set; upgrade deliberately.
+embassy-executor = { version = "0.6", features = ["arch-cortex-m", "executor-thread", "defmt", "integrated-timers", "task-arena-size-65536"] }
+embassy-time = { version = "0.3", features = ["defmt", "defmt-timestamp-uptime"] }
+embassy-rp = { version = "0.2", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rt"] }
+embassy-usb = { version = "0.3", features = ["defmt"] }
+embassy-sync = { version = "0.6", features = ["defmt"] }
+embassy-futures = "0.1"
+
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+
+defmt = "0.3"
+defmt-rtt = "0.4"
+# main.rs has its own panic handler, which reboots to BOOTSEL, so no
+# panic-probe.
+
+embedded-alloc = "0.6"
+static_cell = "2"
+heapless = "0.8"
+portable-atomic = { version = "1", features = ["critical-section"] }
+fixed = "1"
+pio = "0.2"
+pio-proc = "0.2"
+embedded-io-async = "0.6"
