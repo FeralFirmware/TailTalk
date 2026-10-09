@@ -1,0 +1,7 @@
+[toolchain]
+# Stable Rust with the RP2040 thumb target. If you installed Rust via
+# Homebrew rather than rustup, you'll need to install rustup separately and
+# then run `rustup target add thumbv6m-none-eabi`.
+channel = "stable"
+targets = ["thumbv6m-none-eabi"]
+components = ["llvm-tools"]

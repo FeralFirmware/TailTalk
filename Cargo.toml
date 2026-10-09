@@ -19,6 +19,9 @@ members = [
   "hfs-reader",
   "InkTalk/inkproto",
 ]
+# The firmware is its own workspace pinned to thumbv6m-none-eabi; building it
+# as part of the root workspace would break host `cargo test`.
+exclude = ["InkTalk/firmware"]
 resolver = "3"
 
 [workspace.dependencies]
