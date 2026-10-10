@@ -354,7 +354,7 @@ impl Model for ImageWriterModel {
     }
 }
 
-/// A serial Color StyleWriter 2400: answers `?` with "CS\r" and the
+/// A serial Color StyleWriter 2200: answers `?` with "CS\r" and the
 /// `FF FF FF <q>` status queries with what a healthy printer shows.
 #[derive(Default)]
 pub struct StyleWriterModel {
@@ -373,7 +373,7 @@ impl Model for StyleWriterModel {
                     && self.buf[i + 2] == 0xFF =>
                 {
                     match self.buf[i + 3] {
-                        b'p' => out.push(0x01), // CS submodel: 2400
+                        b'p' => out.push(0x02), // CS submodel: 2200
                         b'H' => out.push(0x81), // colour cartridge installed
                         b'1' => out.push(0x00),
                         b'2' => out.push(0x80), // nothing wrong

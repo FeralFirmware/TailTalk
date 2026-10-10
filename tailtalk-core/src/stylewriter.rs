@@ -172,6 +172,40 @@ pub fn ready_after_reset(status: Option<u8>, error: Option<u8>, buffer: Option<u
     }
 }
 
+/// Which Color StyleWriter a printer that identified as [`COLOR_FAMILY`] is,
+/// from its [`QUERY_SUBMODEL`] reply. The codes are lpstyl's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorModel {
+    Cs1500,
+    Cs2200,
+    Cs2400,
+    Cs2500,
+    /// No reply to [`QUERY_SUBMODEL`], or one lpstyl does not know.
+    Unknown,
+}
+
+impl ColorModel {
+    pub fn from_submodel(submodel: Option<u8>) -> Self {
+        match submodel {
+            Some(0x01) => ColorModel::Cs2400,
+            Some(0x02) => ColorModel::Cs2200,
+            Some(0x04) => ColorModel::Cs1500,
+            Some(0x05) => ColorModel::Cs2500,
+            _ => ColorModel::Unknown,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ColorModel::Cs1500 => "Apple Color StyleWriter 1500",
+            ColorModel::Cs2200 => "Apple Color StyleWriter 2200",
+            ColorModel::Cs2400 => "Apple Color StyleWriter 2400",
+            ColorModel::Cs2500 => "Apple Color StyleWriter 2500",
+            ColorModel::Unknown => "Apple Color StyleWriter",
+        }
+    }
+}
+
 /// The model an identify string names, using lpstyl's tables, with the
 /// [`QUERY_SUBMODEL`] reply for a Color StyleWriter. `None` for a string
 /// lpstyl does not know.
@@ -180,13 +214,7 @@ pub fn model_name(identity: &[u8], submodel: Option<u8>) -> Option<&'static str>
         b"IJ10" => "Apple StyleWriter",
         b"SW" => "Apple StyleWriter II",
         b"SW3" => "Apple StyleWriter 1200",
-        COLOR_FAMILY => match submodel {
-            Some(0x01) => "Apple Color StyleWriter 2400",
-            Some(0x02) => "Apple Color StyleWriter 2200",
-            Some(0x04) => "Apple Color StyleWriter 1500",
-            Some(0x05) => "Apple Color StyleWriter 2500",
-            _ => "Apple Color StyleWriter",
-        },
+        COLOR_FAMILY => ColorModel::from_submodel(submodel).name(),
         _ => return None,
     })
 }
@@ -738,6 +766,21 @@ mod tests {
         // Any other answer is ready, and silence never is.
         assert!(ready_after_reset(Some(0x80), None, None));
         assert!(!ready_after_reset(None, Some(0x00), Some(0xA0)));
+    }
+
+    /// lpstyl's identify strings and Color StyleWriter submodels.
+    #[test]
+    fn identify_strings_name_lpstyls_models() {
+        assert_eq!(model_name(b"IJ10", None), Some("Apple StyleWriter"));
+        assert_eq!(model_name(b"SW", None), Some("Apple StyleWriter II"));
+        assert_eq!(model_name(b"SW3", None), Some("Apple StyleWriter 1200"));
+        assert_eq!(model_name(b"CS", Some(0x01)), Some("Apple Color StyleWriter 2400"));
+        assert_eq!(model_name(b"CS", Some(0x02)), Some("Apple Color StyleWriter 2200"));
+        assert_eq!(model_name(b"CS", Some(0x04)), Some("Apple Color StyleWriter 1500"));
+        assert_eq!(model_name(b"CS", Some(0x05)), Some("Apple Color StyleWriter 2500"));
+        assert_eq!(model_name(b"CS", Some(0x03)), Some("Apple Color StyleWriter"));
+        assert_eq!(model_name(b"CS", None), Some("Apple Color StyleWriter"));
+        assert_eq!(model_name(b"XY", None), None);
     }
 
     /// The three-attention rename: query, set, commit.

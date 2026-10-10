@@ -688,9 +688,9 @@ async fn discover(
 }
 
 /// Fallback caps when a StyleWriter is discovered but its info query fails.
-/// Assume color: a color job on a black cartridge is refused cleanly at
-/// setup time ('H' check), whereas advertising mono-only would permanently
-/// hide a working color printer.
+/// Assume a Color StyleWriter of unknown model: a color job on a black
+/// cartridge is refused cleanly at setup time ('H' check), whereas
+/// advertising mono-only would permanently hide a working color printer.
 fn default_stylewriter_caps() -> PrinterCaps {
     PrinterCaps {
         dpi: SW_DPI,
@@ -698,7 +698,7 @@ fn default_stylewriter_caps() -> PrinterCaps {
         model: "Apple Color StyleWriter".to_string(),
         media_default: "na_letter_8.5x11in".to_string(),
         tray_sources: vec!["main".into()],
-        sw_family: StyleWriterFamily::Color,
+        sw_family: StyleWriterFamily::default(),
     }
 }
 
@@ -2472,6 +2472,9 @@ fn parse_printer_error(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tailtalk::stylewriter::ColorModel;
+
+    const SW2200: StyleWriterFamily = StyleWriterFamily::Color(ColorModel::Cs2200);
 
     /// A stock Windows install is found without PATH, the newest release wins
     /// (numerically, not as a string), and directories without the console
@@ -2688,7 +2691,7 @@ mod tests {
         let mut bits = vec![0u8; row_bytes * h as usize];
         let printable_row = SW_TOP_MARGIN_ROWS;
         bits[printable_row * row_bytes + 9] = 0xAB;
-        let rows = pbm_page_to_planar(w, h, &bits, StyleWriterFamily::Color);
+        let rows = pbm_page_to_planar(w, h, &bits, SW2200);
         assert_eq!(rows.len(), 2); // h - (top + bottom + 1)
         assert_eq!(rows[0].len(), 1); // single K plane
         assert_eq!(rows[0][0].len(), 365);
@@ -2714,11 +2717,16 @@ mod tests {
     #[test]
     fn test_stylewriter_margins_follow_family() {
         let letter_w = 21590; // 8.5 in, in hundredths of a mm
-        let (cl, _, ct, cb) = stylewriter_margins_hmm(letter_w, StyleWriterFamily::Color);
+        let (cl, _, ct, cb) = stylewriter_margins_hmm(letter_w, SW2200);
         let (ol, _, ot, ob) = stylewriter_margins_hmm(letter_w, StyleWriterFamily::Original);
         assert_eq!(cl, 508); // 72 px
         assert_eq!(ol, 677); // 96 px
         assert_eq!((ct, cb), (ot, ob));
+        // The StyleWriter II shares the original StyleWriter's printable area.
+        assert_eq!(
+            stylewriter_margins_hmm(letter_w, StyleWriterFamily::StyleWriterII),
+            stylewriter_margins_hmm(letter_w, StyleWriterFamily::Original)
+        );
     }
 
     #[test]
@@ -2728,14 +2736,14 @@ mod tests {
         // Pure black page: every C/M/Y bit inside the printable window must
         // be set (composite black), and the K plane must stay empty.
         let black = vec![0u8; (w * h * 3) as usize];
-        let rows = pbm_like_bits(&ppm_page_to_planar(w, h, &black, StyleWriterFamily::Color), w as usize);
+        let rows = pbm_like_bits(&ppm_page_to_planar(w, h, &black, SW2200), w as usize);
         for (c, m, y, k) in rows {
             assert!(c && m && y, "black page must dither to solid CMY");
             assert!(!k, "K plane must stay empty in color mode");
         }
         // Pure white page: no ink anywhere.
         let white = vec![255u8; (w * h * 3) as usize];
-        for planes in ppm_page_to_planar(w, h, &white, StyleWriterFamily::Color) {
+        for planes in ppm_page_to_planar(w, h, &white, SW2200) {
             for plane in planes {
                 assert!(plane.iter().all(|&b| b == 0));
             }
@@ -2745,7 +2753,7 @@ mod tests {
     /// Collapse a dithered page to per-plane "any ink missing / any ink present"
     /// flags over the printable pixel span (ignores byte padding bits).
     fn pbm_like_bits(page: &PlanarPage, w: usize) -> Vec<(bool, bool, bool, bool)> {
-        let family = StyleWriterFamily::Color;
+        let family = SW2200;
         let print_w = (w - family.left_margin_px()).min(family.print_width());
         page.iter()
             .map(|planes| {
