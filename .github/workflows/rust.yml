@@ -68,13 +68,15 @@ jobs:
       # No feature flags: this crate has no std side to switch off.
       run: cargo build -p tailtalk-net --target thumbv6m-none-eabi
 
+  # The release jobs skip inktalk-* tags: those are firmware releases, which
+  # inktalk.yml builds and attaches on their own schedule.
   release:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
     needs: build
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && !startsWith(github.event.release.tag_name, 'inktalk-')
     steps:
     - uses: actions/checkout@v4
     - name: Install dependencies (Linux)
@@ -129,7 +131,7 @@ jobs:
       matrix:
         target: [x86_64-apple-darwin, aarch64-apple-darwin]
     needs: build
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && !startsWith(github.event.release.tag_name, 'inktalk-')
     steps:
     - uses: actions/checkout@v4
     - name: Install dependencies
@@ -155,7 +157,7 @@ jobs:
   macos-package:
     runs-on: macos-latest
     needs: macos-build
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && !startsWith(github.event.release.tag_name, 'inktalk-')
     steps:
     - uses: actions/checkout@v4
     - name: Install dependencies

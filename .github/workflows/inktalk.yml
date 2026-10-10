@@ -1,0 +1,106 @@
+name: InkTalk firmware
+
+# Builds the firmware on every change that can affect it.
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "InkTalk/firmware/**"
+      - "InkTalk/inkproto/**"
+      - "tailtalk-core/**"
+      - "tailtalk-net/**"
+      - "tailtalk-packets/**"
+      # The path crates above inherit their version and dependencies from it.
+      - "Cargo.toml"
+      - ".github/workflows/inktalk.yml"
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - "InkTalk/firmware/**"
+      - "InkTalk/inkproto/**"
+      - "tailtalk-core/**"
+      - "tailtalk-net/**"
+      - "tailtalk-packets/**"
+      - "Cargo.toml"
+      - ".github/workflows/inktalk.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: InkTalk/firmware
+    outputs:
+      build_id: ${{ steps.id.outputs.build_id }}
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install the embedded target
+      run: rustup target add thumbv6m-none-eabi
+    - name: Install elf2uf2-rs
+      # The default `serial` feature is only for flashing over a serial port,
+      # and it needs libudev-dev. Conversion works without it.
+      run: cargo install elf2uf2-rs --version 2.2.0 --locked --no-default-features
+    - name: Run host tests
+      run: cargo test --locked --target x86_64-unknown-linux-gnu -p localtalk
+    - name: Build firmware
+      run: cargo build --release --locked
+    - name: Check the build is not marked dirty
+      # build.rs appends "+" to BUILD_ID when the tree differs from HEAD. If
+      # it is clean now, it was clean when build.rs ran.
+      run: git diff --exit-code HEAD
+    - name: Record build ID
+      id: id
+      # Same command build.rs uses, so the release name matches what the
+      # board reports in its banner and control-protocol hello.
+      run: echo "build_id=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+    - name: Package
+      run: |
+        mkdir -p target/dist
+        elf2uf2-rs target/thumbv6m-none-eabi/release/inktalk target/dist/inktalk.uf2
+        cp target/thumbv6m-none-eabi/release/inktalk target/dist/inktalk.elf
+        cd target/dist
+        sha256sum inktalk.uf2 inktalk.elf > SHA256SUMS
+        cat SHA256SUMS
+    - name: Upload firmware
+      uses: actions/upload-artifact@v4
+      with:
+        name: inktalk-firmware
+        path: InkTalk/firmware/target/dist/
+        if-no-files-found: error
+
+  dev-release:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download firmware
+      uses: actions/download-artifact@v4
+      with:
+        name: inktalk-firmware
+    - name: Create prerelease
+      env:
+        GH_TOKEN: ${{ github.token }}
+        BUILD_ID: ${{ needs.build.outputs.build_id }}
+        COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+      run: |
+        cat > notes.md <<EOF
+        Development build of the InkTalk firmware from $COMMIT_URL. Expect breaking changes between builds.
+
+        **To flash:** hold BOOTSEL while plugging the board in, then copy \`inktalk.uf2\` onto the RPI-RP2 drive.
+        EOF
+        gh release create "inktalk-dev-$(date -u +%Y%m%d)-$BUILD_ID" \
+          --repo "$GITHUB_REPOSITORY" \
+          --target "$GITHUB_SHA" \
+          --prerelease \
+          --title "InkTalk $(date -u +%F) Dev ($BUILD_ID)" \
+          --notes-file notes.md \
+          inktalk.uf2 inktalk.elf SHA256SUMS
