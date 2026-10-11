@@ -17,7 +17,7 @@
 //! Topology: a desktop stack with one EtherTalk-style interface at 1.5, and
 //! the embedded role playing a printer at 1.77 socket 129. A bridge task
 //! shuttles DDP payloads between the desktop's outbound queue and the role,
-//! and simulates a serial StyleWriter (identity "CS", submodel 2400, color
+//! and simulates a serial StyleWriter (identity "CS", submodel 2200, color
 //! cartridge) behind the role's UART events.
 
 use tailtalk::{
@@ -46,7 +46,7 @@ const PRINTER_CTRL_SOCKET: u8 = 129;
 const DESKTOP_MAC: [u8; 6] = [2, 0, 0, 0, 0, 5];
 const PRINTER_MAC: [u8; 6] = [2, 0, 0, 0, 0, 77];
 
-/// A minimal serial Color StyleWriter 2400: answers `?` with "CS\r" and the
+/// A minimal serial Color StyleWriter 2200: answers `?` with "CS\r" and the
 /// `FF FF FF <q>` status queries with the values a healthy printer shows.
 /// Everything else (mode strings, 'D', 'L', raster, resets) is swallowed.
 #[derive(Default)]
@@ -66,7 +66,7 @@ impl PrinterSim {
                     && self.buf[i + 2] == 0xFF =>
                 {
                     match self.buf[i + 3] {
-                        b'p' => out.push(0x01), // CS submodel: 2400
+                        b'p' => out.push(0x02), // CS submodel: 2200
                         b'H' => out.push(0x81), // color cartridge installed
                         b'1' => out.push(0x00),
                         b'2' => out.push(0x80), // nothing wrong
@@ -215,7 +215,7 @@ async fn embedded_stylewriter_serves_desktop_session() {
     // Identify the simulated printer through the byte pipe.
     let info = session.query_info().await.expect("query_info failed");
     assert_eq!(info.identity, "CS");
-    assert_eq!(info.model_name(), "Apple Color StyleWriter 2400");
+    assert_eq!(info.model_name(), "Apple Color StyleWriter 2200");
     assert!(info.color_capable());
     assert!(!info.out_of_paper());
     assert_eq!(info.buffer_idle(), Some(true));

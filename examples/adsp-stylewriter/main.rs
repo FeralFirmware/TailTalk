@@ -4,7 +4,7 @@ use tailtalk::{
     TalkStack,
     adsp::AdspAddress,
     stylewriter::{
-        MAX_BATCH_BYTES, PrintQuality, StyleWriterEncoder, StyleWriterFamily, StyleWriterSession,
+        ColorModel, MAX_BATCH_BYTES, PrintQuality, StyleWriterEncoder, StyleWriterFamily, StyleWriterSession,
         chunky_to_mono_plane, chunky_to_planes, encode_page_batches,
     },
 };
@@ -50,11 +50,13 @@ struct Args {
     #[arg(short, long, default_value = "normal")]
     quality: String,
 
-    /// The printer is an original StyleWriter (identifies as "IJ10"): black
-    /// only, its own page setup and width, rows not delta-encoded. Implies
-    /// --mono.
-    #[arg(long)]
-    original: bool,
+    /// Which StyleWriter is attached, which picks its lpstyl print path:
+    /// "color" (a Color StyleWriter of unknown model), "1500", "2200",
+    /// "2400", "2500", "ii" (the StyleWriter II, also "1200"), or "original"
+    /// (identifies as "IJ10"). Only the Color StyleWriters print color, so
+    /// the others imply --mono.
+    #[arg(long, default_value = "color")]
+    model: String,
 }
 
 #[tokio::main]
@@ -62,12 +64,21 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().init();
 
     let mut args = Args::parse();
-    let family = if args.original {
-        args.mono = true;
-        StyleWriterFamily::Original
-    } else {
-        StyleWriterFamily::Color
+    let family = match args.model.as_str() {
+        "color" => StyleWriterFamily::Color(ColorModel::Unknown),
+        "1500" => StyleWriterFamily::Color(ColorModel::Cs1500),
+        "2200" => StyleWriterFamily::Color(ColorModel::Cs2200),
+        "2400" => StyleWriterFamily::Color(ColorModel::Cs2400),
+        "2500" => StyleWriterFamily::Color(ColorModel::Cs2500),
+        "ii" | "1200" => StyleWriterFamily::StyleWriterII,
+        "original" => StyleWriterFamily::Original,
+        other => anyhow::bail!(
+            "Unknown model '{other}' (expected color, 1500, 2200, 2400, 2500, ii, 1200 or original)"
+        ),
     };
+    if !family.can_print_color() {
+        args.mono = true;
+    }
 
     let quality = match args.quality.as_str() {
         "normal" => PrintQuality::Normal,
