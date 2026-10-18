@@ -1,18 +1,21 @@
-//! Asking the attached StyleWriter which model it is.
+//! Asking the attached StyleWriter which model it is. It is reset and given
+//! time to settle, then sent `?`, and a Color StyleWriter is also asked for
+//! its submodel with `p`. The reset is not optional. An original StyleWriter
+//! left idle ignores `?` until it has been reset, and it needs longer to
+//! settle than the others, so a printer that does not answer is reset again
+//! and given that longer.
 //!
-//! The sequence is lpstyl's `printerSetup()`, and close to what Apple's
-//! EtherTalk adapter does at power-up: reset, wait for a ready status, send
-//! `?`, and ask a Color StyleWriter for its submodel with `p`. The reset is not optional: an original StyleWriter left idle ignores
-//! `?` until it has been reset.
-//!
-//! The answer is for people, not for the protocol: it is logged, shown by
-//! `s`, and reported in the control protocol's INFO reply. The printer stays
-//! registered as a Color StyleWriter 2400 whatever it turns out to be.
+//! The answer is logged, shown by `s`, and reported in the control
+//! protocol's INFO reply. It also decides the NBP type the printer is
+//! registered under, the one a Mac looks up for that model (see
+//! [`sw::nbp_type_for`]). A printer that does not answer keeps the type it
+//! had, a Color StyleWriter's to begin with.
 //!
 //! The printer task runs this once at boot, before it starts serving, and
-//! again whenever [`REPROBE`] is signalled with no job in progress. It owns
-//! the printer port's receive half, so it is the only task that can read
-//! the replies.
+//! again between jobs whenever [`REPROBE`] is signalled or [`retry_due`]
+//! says a printer that has not answered is worth asking again. It owns the
+//! printer port's receive half, so it is the only task that can read the
+//! replies.
 
 use core::cell::RefCell;
 
@@ -27,19 +30,24 @@ use tailtalk_core::stylewriter as sw;
 use crate::printer::{self, PortRx, PortTx};
 use crate::tt_log;
 
-/// lpstyl sleeps this long after the reset before it asks anything.
+/// How long a printer needs after the reset before it is asked anything.
 const RESET_SETTLE: Duration = Duration::from_secs(2);
 
-/// How long to keep polling for a ready status after the reset, and how
-/// long to wait for the handshake line before sending anything at all.
+/// The same for an original StyleWriter.
+const LONG_RESET_SETTLE: Duration = Duration::from_secs(8);
+
+/// How long to wait for the handshake line before sending anything at all.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a status query or a byte of the identify string may take. Every
 /// reply seen on hardware so far arrived within a few milliseconds.
 const REPLY_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// Between rounds of status queries while the printer is still busy.
+/// Between looks at the handshake line while the printer is off.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long a printer that never answered is left before it is asked again.
+const SILENT_RETRY: Duration = Duration::from_secs(60);
 
 /// Longest identify string kept. The known ones are at most four bytes.
 pub type IdString = heapless::Vec<u8, 15>;
@@ -56,8 +64,16 @@ pub enum Found {
 }
 
 impl Found {
-    /// The model name, or for an identify string lpstyl does not know, the
-    /// string itself. Empty unless a printer answered.
+    /// The NBP type the printer belongs under, once it has answered.
+    pub fn nbp_type(&self) -> Option<&'static str> {
+        match self {
+            Found::Printer { id, submodel } => Some(sw::nbp_type_for(id, *submodel)),
+            Found::Pending | Found::Silent => None,
+        }
+    }
+
+    /// The model name, or for an identify string no StyleWriter is known to
+    /// send, the string itself. Empty unless a printer answered.
     pub fn model(&self) -> heapless::String<31> {
         let mut s = heapless::String::new();
         if let Found::Printer { id, submodel } = self {
@@ -85,6 +101,20 @@ pub fn found() -> Found {
     FOUND.lock(|f| f.borrow().clone())
 }
 
+/// Resolves when the printer should be identified again unprompted, which never
+/// happens once it has answered. One that has not answered is asked again a
+/// minute later, as soon as its ready line is up. While the line is down the
+/// printer is off, and asking would only keep clients waiting.
+pub async fn retry_due() {
+    if !matches!(found(), Found::Silent) {
+        return core::future::pending().await;
+    }
+    Timer::after(SILENT_RETRY).await;
+    while printer::handshake_gating() && !printer::handshake_high() {
+        Timer::after(POLL_INTERVAL).await;
+    }
+}
+
 /// Whether this board identifies its printer at all.
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
@@ -108,7 +138,7 @@ pub async fn run(tx: &mut PortTx, rx: &mut PortRx) {
                 None => tt_log!("PRINTER: identified {} (id {})", model.as_str(), model_id(id).as_str()),
             }
         }
-        Found::Silent => tt_log!("PRINTER: no answer to identify ('q' retries)"),
+        Found::Silent => tt_log!("PRINTER: no answer to identify, asking again once it is on"),
         Found::Pending => {}
     }
     FOUND.lock(|f| *f.borrow_mut() = found);
@@ -127,46 +157,34 @@ async fn probe(tx: &mut PortTx, rx: &mut PortRx) -> Found {
         Timer::after(POLL_INTERVAL).await;
     }
 
-    let _ = tx.write_all(sw::PRINTER_RESET).await;
-    Timer::after(RESET_SETTLE).await;
-
-    let deadline = Instant::now() + READY_TIMEOUT;
-    loop {
-        let status = query(tx, rx, sw::QUERY_STATUS).await;
-        let error = query(tx, rx, sw::QUERY_ERROR).await;
-        let buffer = query(tx, rx, sw::QUERY_BUFFER).await;
-        if sw::ready_after_reset(status, error, buffer) {
-            break;
+    for settle in [RESET_SETTLE, LONG_RESET_SETTLE] {
+        let _ = tx.write_all(sw::PRINTER_RESET).await;
+        Timer::after(settle).await;
+        if let Some(id) = identify(tx, rx).await {
+            let submodel = if id.as_slice() == sw::COLOR_FAMILY {
+                query(tx, rx, sw::QUERY_SUBMODEL).await
+            } else {
+                None
+            };
+            return Found::Printer { id, submodel };
         }
-        if Instant::now() >= deadline {
-            // lpstyl would wait forever here. Asking anyway costs a
-            // quarter of a second and might still get an answer.
-            tt_log!("PRINTER: no ready status after reset, asking anyway");
-            break;
-        }
-        Timer::after(POLL_INTERVAL).await;
+        tt_log!("PRINTER: no answer to identify after the reset");
     }
+    Found::Silent
+}
 
+/// Send `?` and read the identify string, which ends at a carriage return.
+/// One that stops short still counts. `None` when the printer says nothing.
+async fn identify(tx: &mut PortTx, rx: &mut PortRx) -> Option<IdString> {
     drain(rx).await;
     let _ = tx.write_all(&[sw::IDENTIFY]).await;
     let mut id = IdString::new();
-    // lpstyl stops at the carriage return or at a read that times out, and
-    // uses whatever it has; so do we.
     while let Some(b) = read_byte(rx).await {
         if b == 0x0D || id.push(b).is_err() {
             break;
         }
     }
-    if id.is_empty() {
-        return Found::Silent;
-    }
-
-    let submodel = if id.as_slice() == sw::COLOR_FAMILY {
-        query(tx, rx, sw::QUERY_SUBMODEL).await
-    } else {
-        None
-    };
-    Found::Printer { id, submodel }
+    (!id.is_empty()).then_some(id)
 }
 
 /// Send status query `q` and return its one-byte reply.

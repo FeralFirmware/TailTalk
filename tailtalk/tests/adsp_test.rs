@@ -670,7 +670,7 @@ async fn test_adsp_stylewriter_name_change() {
 // ── Inbound attention delivery ────────────────────────────────────────────────
 //
 // The InkTalk adapter emulation is the receiving side of the StyleWriter
-// attention protocol (print request 0x000b, status 0x0010, buffer-ready
+// attention protocol (print request 0x000b, status 0x0010, output drained
 // 0x0006, ...), so attention messages must reach the application rather than
 // only being acked by the actor.
 
@@ -799,7 +799,7 @@ async fn test_adsp_attention_receive() {
     stream_b
         .send_attention(0x0006, &[0x00])
         .await
-        .expect("failed to send buffer-ready attention");
+        .expect("failed to send output-drained attention");
 
     let mut select_buf = [0u8; 32];
     let selected = tokio::time::timeout(Duration::from_secs(5), async {

@@ -143,6 +143,9 @@ export component NetworkExplorerWindow inherits Window {
     in-out property <string> status-text: "";
     // True once a query has populated the editable controls below.
     in property <bool> detail-loaded: false;
+    // Whether the selected printer cleans its ink cartridge on command. That is
+    // any StyleWriter but the original, on the network or behind an InkTalk.
+    in property <bool> can-clean: false;
 
     // Editable fields. Which apply depends on the selected device's kind.
     in-out property <string> edit-name;                 // rename (printer families)
@@ -183,6 +186,7 @@ export component NetworkExplorerWindow inherits Window {
     callback refresh();
     callback query(int);
     callback save(int);
+    callback clean-cartridge(int, bool);                // StyleWriter or InkTalk, index and super clean
     callback run-ping-test(int);
     callback stop-ping-test();
 
@@ -393,8 +397,8 @@ export component NetworkExplorerWindow inherits Window {
                 // ── Editable settings (printer families only) ────────────────
                 if root.sel.has-settings : Text { text: "Settings"; font-weight: 700; }
 
-                // StyleWriter and ImageWriter both expose the name and nothing
-                // else, and both cap it at 31 characters.
+                // StyleWriter and ImageWriter both expose the name, and both
+                // cap it at 31 characters.
                 if root.sel.is-stylewriter || root.sel.is-imagewriter : HorizontalBox {
                     vertical-stretch: 0;
                     padding: 0;
@@ -505,6 +509,27 @@ export component NetworkExplorerWindow inherits Window {
                         }
                         Rectangle { horizontal-stretch: 1; }
                     }
+                }
+
+                // Every StyleWriter but the original cleans its cartridge's
+                // nozzles on command, whether it is on the network itself or
+                // behind an InkTalk. Super clean is for when a clean does not
+                // help.
+                if root.can-clean : HorizontalBox {
+                    vertical-stretch: 0;
+                    padding: 0;
+                    Text { text: "Ink Cartridge"; width: Layout.label-width; vertical-alignment: center; }
+                    Button {
+                        text: "Clean";
+                        enabled: root.detail-loaded && !root.busy;
+                        clicked => { root.clean-cartridge(root.selected, false); }
+                    }
+                    Button {
+                        text: "Super Clean";
+                        enabled: root.detail-loaded && !root.busy;
+                        clicked => { root.clean-cartridge(root.selected, true); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
                 }
 
                 // ── Ping test (every device answers AEP, printer or not) ─────

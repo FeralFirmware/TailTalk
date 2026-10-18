@@ -375,8 +375,8 @@ impl Model for StyleWriterModel {
                     match self.buf[i + 3] {
                         b'p' => out.push(0x02), // CS submodel: 2200
                         b'H' => out.push(0x81), // colour cartridge installed
-                        b'1' => out.push(0x00),
-                        b'2' => out.push(0x80), // nothing wrong
+                        b'1' => out.push(0x08), // everything printed
+                        b'2' => out.push(0x00), // nothing wrong
                         b'B' => out.push(0xA3), // idle, paper loaded
                         _ => {}                 // 'I', 'S': no reply
                     }

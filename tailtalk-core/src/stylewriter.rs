@@ -1,40 +1,19 @@
-//! StyleWriter printer role: the printer side of the two-connection ADSP
-//! handshake.
-//!
-//! No published spec covers this exchange. The sequence below comes from
-//! the client half in `tailtalk/src/stylewriter.rs`, which is verified
-//! against real hardware, and from lpstyl's `at_printer_open`.
-//!
-//! Sequence, as the printer:
-//!
-//! 1. The role's [`AdspEndpoint`] listens on the control socket, registered
-//!    in NBP as `<name>:ColorStyleWriter2400AT@*` (registration is the
-//!    embedder's job; the role only owns the endpoint).
-//! 2. The Mac opens an ADSP connection to the control socket.
-//! 3. It sends attention 0x000B with a 70-byte payload: u32 BE data socket
-//!    number, then a Pascal string (up to 64 bytes) of user name, zero
-//!    padded to 70.
-//! 4. We reply IN BAND on the control connection with two bytes: 0x0000
-//!    accepted, 0xFFFF rejected, anything else "busy, retry later".
-//! 5. The Mac closes the control connection.
-//! 6. We open a REVERSE ADSP connection to the Mac's node, at the data
-//!    socket from step 3.
-//! 7. The data connection is then a bidirectional byte pipe to the printer
-//!    UART, carried verbatim: `?` identify, `\xFF\xFF\xFF<q>` status
-//!    queries, mode strings, rect+G raster - none of it is interpreted
-//!    here. lpstyl drives a serial StyleWriter with the same command
-//!    language, so the bytes can be piped to a UART unchanged.
-//! 8. Teardown: the driver sends in-band 0x00 + `\xFF\xFF\xFF I`, then
-//!    attention 0x0012 and reads a 2-byte reply, then closes. Getting this
-//!    wrong makes the printer try to reopen a connection to the original
-//!    control socket.
-//!
-//! Attention replies: a native Mac driver capture shows attention 0x0006
-//! ("buffer ready?") answered with two IN-BAND bytes 0xFF 0xFF. The reply to
-//! the 0x0012 kill attention is also two in-band bytes; the client discards
-//! the value, and no capture of a real printer's value exists yet, so we
-//! send 0xFF 0xFF there too. If hardware disagrees, the hardware is right -
-//! update this and the comment.
+//! The printer side of a StyleWriter's AppleTalk adapter: the role that takes
+//! print jobs over ADSP and hands their bytes to a serial StyleWriter.
+//! 
+//! Most of the knowledge here is from a mixture of lpstyl, my own hacking, and
+//! decompiling Apples 1500 and 2500 drivers to see how exactly it did everything
+//! and what it all meant.
+//! 
+//! The adapter can be thought of as a pipe to the printer's serial port reachable
+//! as an ADSP socket, with some queuing and commands built around it. Regular data
+//! received is interpreted as "send this directly to the printer", and messages meant
+//! for the adapter itself (Like what is your name, who is printing, and so on) are
+//! handled via ADSP attention codes.
+//! 
+//! By default the adapter and printer boot up using 57600 baud, but most models support
+//! a way to have the adapter be clocked via the HSKi pin which allows it to better saturate
+//! the LocalTalk link.
 
 use alloc::vec::Vec;
 use tailtalk_packets::nbp::ServiceAddress;
@@ -42,106 +21,202 @@ use tailtalk_packets::nbp::ServiceAddress;
 use crate::Micros;
 use crate::adsp::{AdspEndpoint, AdspEvent};
 
-/// NBP type the Mac's Color StyleWriter 2400 driver looks up.
+/// The NBP type the EtherTalk/LocalTalk adapter will use if it is connected to
+/// a 2200, 2400 or 2500 Colour StyleWriter.
 pub const NBP_TYPE: &str = "ColorStyleWriter2400AT";
 
-/// The print-request attention (lpstyl `at_printer_open`).
-pub const ATTN_PRINT_REQUEST: u16 = 0x000B;
-/// Buffer-ready query, answered with in-band 0xFFFF.
-pub const ATTN_BUFFER_READY: u16 = 0x0006;
-/// Sent by the Mac driver on the data connection once it has set the
-/// printer up ('D', status and buffer queries), before any raster; it then
-/// waits on a two-byte in-band reply. Not in lpstyl, and the name and
-/// reply value are guesses: 0x0000, as for the other unverified codes. If
-/// the Mac balks right after it, 0xFFFF (the [`ATTN_BUFFER_READY`] answer)
-/// is the next thing to try.
-pub const ATTN_PAGE_START: u16 = 0x0005;
-/// Serial port options for the adapter, forwarded by the Mac driver like
-/// its serial driver's csCode 16. It sends 0x40 right after switching the
-/// printer to its fast mode: bit 6, clock the port from the printer's HSKi.
-/// Always answered with 0x0000; see [`FastClock`] for the rest.
+/// The NBP type the other StyleWriters use - this includes the original, II, 1200
+/// and 1500.
+pub const NBP_TYPE_1200: &str = "StyleWriter1200AT";
+
+// The following are ADSP attention codes that are handled directly by the LocalTalk/
+// EtherTalk adapter rather than getting fed to the printer.
+
+/// Send a BREAK to the printer (`SerSetBrk` then `SerClrBrk`). I dont think the original
+/// driver sends this, but its a holdover from the QuickDraw LaserWriters which do use it.
+pub const ATTN_SEND_BREAK: u16 = 0x0001;
+/// Same as above - signifies back towards the Mac that a break was received.
+pub const ATTN_BREAK_RECEIVED: u16 = 0x0002;
+/// Instructs the adapter to use this serial config when talking to the printer.
+pub const ATTN_SERIAL_CONFIG: u16 = 0x0003;
+/// The [`ATTN_SERIAL_CONFIG`] word for 57600 baud, 8N1. 
+pub const SERIAL_CONFIG_57600: u16 = 0x4C00;
+/// Sent by a Mac after it has switched a Color StyleWriter to fast mode with
+/// `x`. A payload of 0x40 tells the adapter to clock the port from the
+/// printer's HSKi from now on, and 0x00 switches it back to its own clock. The
+/// Mac only sends this once its earlier data has been acknowledged, and only if
+/// [`ATTN_FAST_CLOCK_QUERY`] said yes. Always answered with 0x0000.
 pub const ATTN_SERIAL_OPTIONS: u16 = 0x0004;
-/// Kill/teardown attention (lpstyl `at_printer_kill`). The rename sequence
-/// reuses this code as its commit step, so the two are told apart by which
-/// connection the attention arrives on: a job's kill comes in on the data
-/// connection, a commit on a control connection.
-pub const ATTN_KILL: u16 = 0x0012;
-/// The number of jobs on the printer, as an in-band u16 (lpstyl reads it
-/// as the queue length on a busy printer). The Mac driver asks while
-/// printing, and takes 0 to mean its job was deleted. The rename sequence
-/// also opens with it, on an idle printer, and checks for exactly 0x0000.
-pub const ATTN_JOB_COUNT: u16 = 0x0011;
-/// Carries the new name as a Pascal string. Answered with in-band 0x0000.
+/// Asks whether the adapter can follow a Color StyleWriter's fast clock. A low
+/// byte of 0 means yes. On anything else the Mac never sends `x` or
+/// [`ATTN_SERIAL_OPTIONS`].
+pub const ATTN_FAST_CLOCK_QUERY: u16 = 0x0005;
+/// Asks whether every byte the Mac has sent has actually been written to the
+/// printer. A non-zero low byte means yes. The Mac polls this before every
+/// raster band for up to 10 seconds, and treats a printer that stays busy that
+/// long as a communication error.
+pub const ATTN_OUTPUT_DRAINED: u16 = 0x0006;
+/// Sent by Macs to signal the adapter to start or stop using the clock fed 
+/// by the printer on HSKi. This is sent _ater_ it has already instructed the printer
+/// to start generating the clock.
+pub const ATTN_SERIAL_CONTROL_JF: u16 = 0x0007;
+/// Some special stuff for Quadras? Here only for posterity but we dont particularly care
+/// about it.
+pub const ATTN_SERIAL_CONTROL_LOWER_JF: u16 = 0x0008;
+
+/// Asks the adapter to change its name broadcasted via NBP. Name is passed as a Pascal string.
 pub const ATTN_SET_NAME: u16 = 0x0009;
-/// Status text for the printer to show (lpstyl `at_printer_setstatus`),
-/// sent on the data connection. lpstyl reads a two-byte reply and ignores
-/// it; we send 0x0000.
+/// Asks the adapter to set the status message that other Macs can query to see 
+/// what it is currently up to. It starts with a u16 which is the STR# resource num,
+/// then a human readable message padded to 257 bytes.
 pub const ATTN_SET_STATUS: u16 = 0x000A;
-/// Sent by the Mac's own driver, not lpstyl, on a second control connection
-/// once the reverse data connection is up. The payload repeats the print
-/// request's (data socket, user name). The driver waits on a two-byte
-/// in-band reply and stalls without one; the value is unverified, and
-/// 0x0000 is what this protocol answers success with everywhere else.
-pub const ATTN_JOB_CONFIRM: u16 = 0x000D;
-/// Who the current job belongs to. lpstyl asks when a printer is busy, and
-/// the Mac driver asks after [`ATTN_JOB_CONFIRM`]. Answered with 72 in-band
-/// bytes: lpstyl reads a Pascal user name at offset 6, which fits a 2-byte
-/// result ahead of the 70-byte print request (u32 port, Pascal user).
+/// Request by a Mac to start a new print job. This takes the following args:
+/// 
+/// Bytes:
+/// 0 - 3: socket number
+/// 4 - 36: The user's name as a 32 character Pascal string.
+/// 37 - 69: Padding? I honestly dont know why its padded out this much.
+/// 
+/// Note that only the socket number is explicitly required. The rest can be whatever, its
+/// really just for Macs. The only note is that a job withdrawal must repeat the same data.
+pub const ATTN_PRINT_REQUEST: u16 = 0x000B;
+/// Asks the adapter to drop a queued print request. This is matched by the request blob 
+/// sent in [`ATTN_PRINT_REQUEST`].
+pub const ATTN_WITHDRAW: u16 = 0x000C;
+/// Where the client is in the queue, returned as a u16 value where 1 is "You are next".
+pub const ATTN_QUEUE_POSITION: u16 = 0x000D;
+/// Who we are currently processing a job for. Returns the blob sent in [`ATTN_PRINT_REQUEST`]
+/// if we are processing for anyone.
 pub const ATTN_JOB_USER: u16 = 0x000E;
-/// The printer's status text. lpstyl reads 259 in-band bytes with a Pascal
-/// string at offset 2, and like [`ATTN_JOB_USER`] it is asked for on a busy
-/// printer.
+/// Returns the status (if any) previously set by [`ATTN_SET_STATUS`].
 pub const ATTN_JOB_STATUS: u16 = 0x0010;
+/// The number of pending jobs in our queue as a u16. If a Mac is waiting for its job to be
+/// printed and this query returns 0 it will consider that the job was dropped.
+pub const ATTN_JOB_COUNT: u16 = 0x0011;
+/// Ends the current session.
+pub const ATTN_END_SESSION: u16 = 0x0012;
 
-const JOB_USER_REPLY_LEN: usize = 72;
-const JOB_STATUS_REPLY_LEN: usize = 259;
+/// Mac sized value for [`ATTN_PRINT_REQUEST`]. We could probably make this bigger but Macs
+/// seem to get upsetti spaghetti if we deviate from it.
+pub const PRINT_REQUEST_LEN: usize = 70;
+/// The max name length as part of the print request above.
+pub const USER_NAME_MAX: usize = 32;
 
-/// In-band print-request results (step 4).
+/// The length of a status set request [`ATTN_SET_STATUS`] payload or a
+/// [`ATTN_JOB_STATUS`] reply.
+pub const JOB_STATUS_TEXT_LEN: usize = 255;
+
 const RESULT_ACCEPTED: [u8; 2] = [0x00, 0x00];
 const RESULT_BUSY: [u8; 2] = [0x00, 0x01];
+/// The answer to a print request that cannot be called back, such as one too
+/// short to name a socket. Any result but 0x0000 turns the Mac away.
+const RESULT_REJECTED: [u8; 2] = [0xFF, 0xFF];
 
-/// Sent to the serial printer when a client disappears mid-job: lpstyl's
-/// eject-and-reset bytes (null then `FF FF FF 'I'`), so paper does not sit
-/// in the feed path until the next job. Silent: the printer does not reply.
-pub const PRINTER_RESET: &[u8] = &[0x00, 0xFF, 0xFF, 0xFF, b'I'];
+const OUTPUT_DRAINED: [u8; 2] = [0xFF, 0xFF];
+const OUTPUT_PENDING: [u8; 2] = [0x00, 0x00];
 
-/// Puts a Color StyleWriter into its fast mode. The Mac driver sends it as a
-/// message of its own, then [`ATTN_SERIAL_OPTIONS`] for the adapter to follow
-/// the printer's clock. See [`FastClock`].
-const FAST_CLOCK: u8 = b'x';
+/// If an adapter is unable to be externally clocked this is what it should
+/// return so a Mac does not try and enable it.
+const FAST_CLOCK_UNAVAILABLE: [u8; 2] = [0x00, 0xEF];
+
+/// Largely the same as the above - tells the asking Mac that we cannot enable
+/// fast clock mode.
+const SERIAL_CONTROL_REFUSED: [u8; 2] = (-17i16).to_be_bytes();
+
+/// Puts the printer back in to a known state, including ejecting paper if 
+/// still present in its feed. This can also pull the printer out of fast mode
+/// if enabled and we are not aware (i.e power cycled).
+pub const PRINTER_RESET: &[u8] = &[0x00, 0xFF, 0xFF, 0xFF, QUERY_RESET];
+
+/// Command sent to the actual printer itself to direct it to enable fast clock mode
+pub const FAST_CLOCK: u8 = b'x';
+
+/// Puts a StyleWriter II or 1200 into fast clock mode.
+pub const FAST_CLOCK_SW: u8 = b'h';
 
 /// [`ATTN_SERIAL_OPTIONS`] bit: clock the port from the printer's HSKi.
-const SERIAL_EXTERNAL_CLOCK: u8 = 0x40;
+pub const SERIAL_EXTERNAL_CLOCK: u8 = 0x40;
 
-/// Whether the hardware behind a [`StyleWriterRole`] can follow a Color
-/// StyleWriter into its fast mode. There the printer clocks the serial link
-/// itself at close to 1 Mbit/s on HSKi (lpstyl's protocol notes), and the
-/// port has to take its clock from that line instead of its own baud rate.
+/// Allows an adapter implementation to decide if it does or does not support 
+/// externally clocking its UART via the HSKi pin. If [`FastClock::Supported`]` is 
+/// chosen, [`StyleWriterEvent::FastClockEnable`] and [`StyleWriterEvent::FastClockDisable`]
+/// will be passed on the event handler to instruct the adapter when it should 
+/// reconfigure its UART.
+/// 
+/// If [`FastClock::Unsupported`] is chosen these events will not occur and we 
+/// will report back to the Mac to not attempt to enable fast clock mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FastClock {
-    /// The client's switch to fast mode goes to the printer, and the role
-    /// reports [`StyleWriterEvent::FastClockEnable`] when the port has to
-    /// follow the printer's clock, and [`StyleWriterEvent::FastClockDisable`]
-    /// when it can go back to its own.
     Supported,
-    /// The role keeps the switch from the printer, so the printer stays at
-    /// its usual speed, and reports nothing.
     Unsupported,
 }
 
 /// The identify command. The printer answers with its model string,
-/// terminated by a carriage return. lpstyl only sends it after a reset and a
-/// ready status, and that order matters: an original StyleWriter left idle
-/// ignores it until it has been reset (confirmed on hardware).
+/// terminated by a carriage return.
 pub const IDENTIFY: u8 = b'?';
 
 /// Status queries, sent as `FF FF FF <q>` and each answered with one byte.
-/// The meanings are lpstyl's README.protocol.
+/// See [`status1`] and [`status2`] for what the bits mean.
 pub const QUERY_STATUS: u8 = b'1';
-/// Error status: 0x00 and 0x80 mean nothing wrong, 0x04 out of paper.
+/// Error status. See [`status2`] for what the bits mean.
 pub const QUERY_ERROR: u8 = b'2';
-/// Buffer gauge, scaled differently on every model.
+/// Free space in the printer's buffer, counted in 256-byte units (64-byte
+/// units on an original StyleWriter) less 2 KB, so it reads highest when
+/// empty.
 pub const QUERY_BUFFER: u8 = b'B';
+/// Asks the printer what cartridge it has installed. 0x01 is a black cartridge,
+/// 0x80 is a colour cartridge, and 0x81 is both.
+pub const QUERY_CARTRIDGE: u8 = b'H';
+/// Status query only used on a 2200, 2400 or 2500 with the black cartridge in. When
+/// printing a black and white page at Best quality on plain paper or transparencies, a Mac
+/// asks for this and sends `N` if it is below [`QUERY_R_FINE_LIMIT`], or `s` otherwise.
+/// Grayscale pages always get `s`. A reply of 0 means the printer has no reading.
+pub const QUERY_R: u8 = b'R';
+/// See [`QUERY_R`].
+pub const QUERY_R_FINE_LIMIT: u8 = 0x7E;
+/// Asks the printer to reset itself. There is no reply.
+pub const QUERY_RESET: u8 = b'I';
+/// Asks the printer to resume a job after it hit an error, like a paper jam or
+/// an out of paper error. There is no reply.
+pub const QUERY_RESUME: u8 = b'S';
+
+/// Bits in the reply to [`QUERY_STATUS`].
+pub mod status1 {
+    /// The printer is busy, such as just after a reset or while it cleans.
+    pub const BUSY: u8 = 0x01;
+    /// Something is wrong with the printer. The original, II, 1200 and 1500
+    /// don't say what, and clear it on their own.
+    pub const PRINTER_ERROR: u8 = 0x02;
+    /// Hardware error - usually something blocking the cartridge carriage.
+    pub const HARDWARE_ERROR: u8 = 0x04;
+    /// Everything sent so far has been printed.
+    pub const PRINTED: u8 = 0x08;
+    pub const DOOR_OPEN: u8 = 0x40;
+    pub const WASTE_INK_FULL: u8 = 0x80;
+}
+
+/// Bits in the reply to [`QUERY_ERROR`]. Sending [`QUERY_RESUME`] clears all of
+/// them apart from out of paper.
+pub mod status2 {
+    pub const CARTRIDGE_JAMMED: u8 = 0x01;
+    /// An ink tank or the cartridge needs replacing. Only the 2200, 2400 and 2500
+    /// mean this - the original, II, 1200 and 1500 set it without saying why.
+    pub const INK_OUT: u8 = 0x02;
+    /// Out of paper. The original StyleWriter also needs its Ready button pressed
+    /// once paper is loaded.
+    pub const OUT_OF_PAPER: u8 = 0x04;
+    pub const PAPER_JAM: u8 = 0x08;
+    /// Something is wrong with the printer, often a loose connection.
+    pub const PRINTER_ERROR: u8 = 0x10;
+    /// The cartridge is missing or not seated properly.
+    pub const CARTRIDGE_MISSING: u8 = 0x20;
+    /// The paper is smaller than the page being printed.
+    pub const PAPER_TOO_SMALL: u8 = 0x40;
+    /// Another printer error bit, handled the same as [`PRINTER_ERROR`]. 2400s and
+    /// 2500s have been seen setting this with nothing wrong.
+    pub const PRINTER_ERROR_HIGH: u8 = 0x80;
+}
+
 /// Color StyleWriter submodel. Only ask a printer that identified as
 /// [`COLOR_FAMILY`]: a StyleWriter given a code it does not know ejects the
 /// page and resets.
@@ -156,31 +231,14 @@ pub const fn status_query(q: u8) -> [u8; 4] {
     [0xFF, 0xFF, 0xFF, q]
 }
 
-/// Whether a printer that was just reset is ready to be identified, given
-/// its replies to [`QUERY_STATUS`], [`QUERY_ERROR`] and [`QUERY_BUFFER`]
-/// (`None` where it did not answer).
-///
-/// This is lpstyl's post-reset loop (`printerSetup()`), which waits while
-/// status `1` is 0x01 or unanswered, except that an original StyleWriter
-/// shows readiness as `1` = 0x01, `2` = 0x00 and `B` = 0xA0. That reading is
-/// confirmed on hardware.
-pub fn ready_after_reset(status: Option<u8>, error: Option<u8>, buffer: Option<u8>) -> bool {
-    match status {
-        None => false,
-        Some(0x01) => error == Some(0x00) && buffer == Some(0xA0),
-        Some(_) => true,
-    }
-}
-
-/// Which Color StyleWriter a printer that identified as [`COLOR_FAMILY`] is,
-/// from its [`QUERY_SUBMODEL`] reply. The codes are lpstyl's.
+/// Which Colour StyleWriter a "CS" printer is, going by its [`QUERY_SUBMODEL`] reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorModel {
     Cs1500,
     Cs2200,
     Cs2400,
     Cs2500,
-    /// No reply to [`QUERY_SUBMODEL`], or one lpstyl does not know.
+    /// No reply to [`QUERY_SUBMODEL`], or a value we don't recognise.
     Unknown,
 }
 
@@ -206,9 +264,8 @@ impl ColorModel {
     }
 }
 
-/// The model an identify string names, using lpstyl's tables, with the
-/// [`QUERY_SUBMODEL`] reply for a Color StyleWriter. `None` for a string
-/// lpstyl does not know.
+/// The model name for an identify string, using the [`QUERY_SUBMODEL`] reply for
+/// Colour StyleWriters. Returns `None` if we don't recognise the string.
 pub fn model_name(identity: &[u8], submodel: Option<u8>) -> Option<&'static str> {
     Some(match identity {
         b"IJ10" => "Apple StyleWriter",
@@ -219,6 +276,17 @@ pub fn model_name(identity: &[u8], submodel: Option<u8>) -> Option<&'static str>
     })
 }
 
+/// The NBP type the adapter should register under for the printer it found. The
+/// original, II, 1200 and 1500 get [`NBP_TYPE_1200`], and everything else gets
+/// [`NBP_TYPE`], including a printer that never answered.
+pub fn nbp_type_for(identity: &[u8], submodel: Option<u8>) -> &'static str {
+    match identity {
+        b"IJ10" | b"SW" | b"SW3" => NBP_TYPE_1200,
+        COLOR_FAMILY if ColorModel::from_submodel(submodel) == ColorModel::Cs1500 => NBP_TYPE_1200,
+        _ => NBP_TYPE,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StyleWriterEvent {
     /// A job was accepted; the user name is the raw Pascal-string bytes from
@@ -226,8 +294,8 @@ pub enum StyleWriterEvent {
     JobStarted { user: Vec<u8> },
     /// Bytes for the printer UART.
     ToPrinter(Vec<u8>),
-    /// The job ended. `clean` distinguishes the driver's kill sequence from
-    /// a vanished client; on an unclean end a reset was already queued as a
+    /// The job ended. `clean` is true if the Mac ended it properly, and false if
+    /// the client vanished - in that case a reset has already been queued as a
     /// `ToPrinter` event.
     JobEnded { clean: bool },
     /// The client committed a new NBP name, as raw MacRoman bytes. The
@@ -250,8 +318,8 @@ pub enum StyleWriterEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Idle,
-    /// Accepted a print request on this control connection; waiting for the
-    /// Mac to close it (step 5) before dialing back.
+    /// Accepted a print request on this control connection, and waiting for the
+    /// Mac to close it before calling back.
     AwaitingCtrlClose {
         ctrl: u16,
         mac_node: ServiceAddress,
@@ -271,9 +339,9 @@ enum State {
 /// How long a half-finished handshake may sit before the role gives up and
 /// makes itself available again.
 ///
-/// Steps 4 to 6 are back-to-back on a healthy client: it reads our two-byte
-/// accept, closes the control connection, and we dial back. A client that
-/// dies in between - or whose close never reaches us - would otherwise pin
+/// A healthy client reads the two-byte accept and closes the control
+/// connection straight away, and the role calls back at once. A client that
+/// dies in between, or whose close never reaches us, would otherwise pin
 /// the role in a non-idle state forever, and every later print request gets
 /// answered "busy" by a printer that is doing nothing at all. Generous
 /// enough to cover the ADSP open retry budget on the reverse connection.
@@ -287,18 +355,25 @@ pub struct StyleWriterRole {
     /// deadline of its own and ends when the connection does.
     state_since: Micros,
     events: alloc::collections::VecDeque<StyleWriterEvent>,
-    /// Name staged by [`ATTN_SET_NAME`], published when the commit arrives.
-    pending_name: Option<Vec<u8>>,
-    /// The accepted print request's data socket and user name, for
-    /// [`ATTN_JOB_USER`]. Only meaningful while [`Self::busy`].
-    job_port: u8,
-    job_user: Vec<u8>,
-    /// The text from the job's last [`ATTN_SET_STATUS`], for
+    /// Name staged by [`ATTN_SET_NAME`] and the connection it came on. Only
+    /// that connection's [`ATTN_END_SESSION`] publishes it, and it is
+    /// dropped if that connection closes first.
+    pending_name: Option<(u16, Vec<u8>)>,
+    /// The accepted print request as the Mac sent it, zero padded, for
+    /// [`ATTN_JOB_USER`] and to recognise its [`ATTN_WITHDRAW`]. Only
+    /// meaningful while [`Self::busy`].
+    job_request: [u8; PRINT_REQUEST_LEN],
+    /// The message ID and text from the job's last [`ATTN_SET_STATUS`], for
     /// [`ATTN_JOB_STATUS`].
+    job_status_id: u16,
     job_status: Vec<u8>,
+    /// Whether every byte of the job so far has gone out to the printer, for
+    /// [`ATTN_OUTPUT_DRAINED`]. The embedder keeps it current with
+    /// [`Self::set_printer_drained`].
+    printer_drained: bool,
     /// Whether the next data packet starts an ADSP message, i.e. the last
-    /// one ended with EOM. [`FAST_CLOCK`] only counts as a whole message,
-    /// never as a byte inside raster data.
+    /// one ended with EOM. The fast mode switches only count as whole
+    /// messages, never as bytes inside raster data.
     data_msg_start: bool,
     fast_clock: FastClock,
     /// Whether the port has been told to follow the printer's clock.
@@ -315,9 +390,10 @@ impl StyleWriterRole {
             state_since: 0,
             events: alloc::collections::VecDeque::new(),
             pending_name: None,
-            job_port: 0,
-            job_user: Vec::new(),
+            job_request: [0; PRINT_REQUEST_LEN],
+            job_status_id: 0,
             job_status: Vec::new(),
+            printer_drained: true,
             data_msg_start: true,
             fast_clock,
             fast_clock_on: false,
@@ -336,29 +412,33 @@ impl StyleWriterRole {
         }
     }
 
-    /// The [`ATTN_JOB_USER`] reply: a 0x0000 result, then the current job's
-    /// print request (u32 port, Pascal user), zero padded. All zero when no
+    /// The [`ATTN_JOB_USER`] reply. This is the current job's 70-byte print
+    /// request followed by a 0x0000 result, with the request all zero when no
     /// job is active.
     fn job_user_reply(&self) -> Vec<u8> {
-        let mut reply = RESULT_ACCEPTED.to_vec();
-        if self.busy() {
-            reply.extend_from_slice(&(self.job_port as u32).to_be_bytes());
-            reply.push(self.job_user.len() as u8);
-            reply.extend_from_slice(&self.job_user);
-        }
-        reply.resize(JOB_USER_REPLY_LEN, 0);
+        let mut reply = if self.busy() {
+            self.job_request.to_vec()
+        } else {
+            alloc::vec![0; PRINT_REQUEST_LEN]
+        };
+        reply.extend_from_slice(&RESULT_ACCEPTED);
         reply
     }
 
-    /// The [`ATTN_JOB_STATUS`] reply: a 0x0000 result, then the status as a
-    /// Pascal string, zero padded. Empty when no job is active or the Mac has
-    /// not set one.
+    /// The [`ATTN_JOB_STATUS`] reply. This is the status message ID, the text
+    /// as a Pascal string zero padded to 255 bytes, then a 0x0000 result. The
+    /// ID and text are empty when no job is active or the Mac has not set one.
     fn job_status_reply(&self) -> Vec<u8> {
-        let mut reply = RESULT_ACCEPTED.to_vec();
-        let text: &[u8] = if self.busy() { &self.job_status } else { &[] };
+        let (id, text): (u16, &[u8]) = if self.busy() {
+            (self.job_status_id, &self.job_status)
+        } else {
+            (0, &[])
+        };
+        let mut reply = id.to_be_bytes().to_vec();
         reply.push(text.len() as u8);
         reply.extend_from_slice(text);
-        reply.resize(JOB_STATUS_REPLY_LEN, 0);
+        reply.resize(2 + JOB_STATUS_TEXT_LEN, 0);
+        reply.extend_from_slice(&RESULT_ACCEPTED);
         reply
     }
 
@@ -384,6 +464,13 @@ impl StyleWriterRole {
     pub fn set_printer_credit(&mut self, bytes: usize) {
         self.endpoint
             .set_recv_window(bytes.min(u16::MAX as usize) as u16);
+    }
+
+    /// Tells the role whether every byte of the job so far has actually been
+    /// written to the printer. This is what we answer [`ATTN_OUTPUT_DRAINED`]
+    /// with. Defaults to true.
+    pub fn set_printer_drained(&mut self, drained: bool) {
+        self.printer_drained = drained;
     }
 
     /// Bytes the printer produced (UART RX): forward down the data pipe.
@@ -460,16 +547,15 @@ impl StyleWriterRole {
     fn handle_adsp_event(&mut self, ev: AdspEvent, now: Micros) {
         match ev {
             AdspEvent::Opened { conn, inbound, .. } => {
-                // A printer role has at most one outbound connect in flight,
-                // so any completing outbound connection is the reverse data
-                // pipe (step 6 done). Inbound ones are control connections;
+                // A printer role has at most one outbound connect in flight, so
+                // any completing outbound connection is the data pipe it called
+                // back on. Inbound ones are control connections, and there is
                 // nothing to do until their print-request attention arrives.
                 //
-                // Piping is accepted here as well as Connecting: the
-                // endpoint re-announces the pipe if the peer answered a
-                // retransmitted open with a second connection and moved to
-                // it, and latching onto the new key is the whole point of
-                // that notification.
+                // Piping is accepted here as well as Connecting. The endpoint
+                // re-announces the pipe if the peer answered a retransmitted
+                // open with a second connection and moved to it, and latching
+                // onto the new key is the whole point of that notification.
                 if !inbound && matches!(self.state, State::Connecting { .. } | State::Piping { .. })
                 {
                     self.data_msg_start = true;
@@ -492,47 +578,49 @@ impl StyleWriterRole {
                 {
                     let whole_message = self.data_msg_start && eom;
                     self.data_msg_start = eom;
-                    if whole_message
-                        && data == [FAST_CLOCK]
-                        && self.fast_clock == FastClock::Unsupported
-                    {
+                    let fast_mode_switch = data == [FAST_CLOCK] || data == [FAST_CLOCK_SW];
+                    if whole_message && fast_mode_switch && self.fast_clock == FastClock::Unsupported {
                         return;
                     }
                     self.events.push_back(StyleWriterEvent::ToPrinter(data));
                 }
             }
-            AdspEvent::Closed { conn } => match self.state {
-                State::AwaitingCtrlClose {
-                    ctrl,
-                    mac_node,
-                    data_socket,
-                } if conn == ctrl => {
-                    // Step 6: dial the Mac's data socket.
-                    let dest = ServiceAddress {
-                        network_number: mac_node.network_number,
-                        node_number: mac_node.node_number,
-                        socket_number: data_socket,
-                    };
-                    let pending = self.endpoint.connect(dest, now);
-                    self.enter(State::Connecting { conn: pending }, now);
+            AdspEvent::Closed { conn } => {
+                if self.pending_name.as_ref().is_some_and(|(c, _)| *c == conn) {
+                    self.pending_name = None;
                 }
-                State::Piping {
-                    conn: dc,
-                    kill_seen,
-                } if conn == dc => {
-                    if !kill_seen {
-                        // Client vanished mid-job: eject and reset so paper
-                        // is not left in the feed path.
-                        self.events
-                            .push_back(StyleWriterEvent::ToPrinter(PRINTER_RESET.to_vec()));
+                match self.state {
+                    State::AwaitingCtrlClose {
+                        ctrl,
+                        mac_node,
+                        data_socket,
+                    } if conn == ctrl => {
+                        let dest = ServiceAddress {
+                            network_number: mac_node.network_number,
+                            node_number: mac_node.node_number,
+                            socket_number: data_socket,
+                        };
+                        let pending = self.endpoint.connect(dest, now);
+                        self.enter(State::Connecting { conn: pending }, now);
                     }
-                    self.follow_printer_clock(false);
-                    self.events
-                        .push_back(StyleWriterEvent::JobEnded { clean: kill_seen });
-                    self.enter(State::Idle, now);
+                    State::Piping {
+                        conn: dc,
+                        kill_seen,
+                    } if conn == dc => {
+                        if !kill_seen {
+                            // Client vanished mid-job: eject and reset so paper
+                            // is not left in the feed path.
+                            self.events
+                                .push_back(StyleWriterEvent::ToPrinter(PRINTER_RESET.to_vec()));
+                        }
+                        self.follow_printer_clock(false);
+                        self.events
+                            .push_back(StyleWriterEvent::JobEnded { clean: kill_seen });
+                        self.enter(State::Idle, now);
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             AdspEvent::AttentionAcked { .. } | AdspEvent::AttentionFailed { .. } => {
                 // The printer role only ever answers attentions, in band;
                 // it sends none of its own, so neither outcome concerns it.
@@ -549,29 +637,31 @@ impl StyleWriterRole {
     fn handle_attention(&mut self, conn: u16, code: u16, data: &[u8], now: Micros) {
         match code {
             ATTN_PRINT_REQUEST => {
-                // printRequest { u32 be port; pascal string user; } zero
-                // padded to 70, as lpstyl builds it.
+                // Two zero bytes, a zero byte and the data socket, then the
+                // user name as a Pascal string, zero padded to 70 bytes.
                 if data.len() < 5 {
+                    let _ = self.endpoint.send(conn, &RESULT_REJECTED, false);
                     return;
                 }
                 if self.busy() {
                     let _ = self.endpoint.send(conn, &RESULT_BUSY, false);
                     return;
                 }
-                let data_socket = data[3]; // u32 be, but a socket is one byte
-                let name_len = (data[4] as usize).min(64).min(data.len() - 5);
+                let data_socket = data[3];
+                let name_len = (data[4] as usize).min(USER_NAME_MAX).min(data.len() - 5);
                 let user = data[5..5 + name_len].to_vec();
 
                 // We do not know the Mac's address from the attention alone;
                 // AdspEvent::Opened carried it. Look it up from the
                 // connection the attention arrived on.
                 let Some(remote) = self.endpoint.remote_of(conn) else {
+                    let _ = self.endpoint.send(conn, &RESULT_REJECTED, false);
                     return;
                 };
 
                 let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
-                self.job_port = data_socket;
-                self.job_user = user.clone();
+                self.job_request = print_request_block(data);
+                self.job_status_id = 0;
                 self.job_status.clear();
                 self.enter(
                     State::AwaitingCtrlClose {
@@ -583,18 +673,43 @@ impl StyleWriterRole {
                 );
                 self.events.push_back(StyleWriterEvent::JobStarted { user });
             }
-            ATTN_BUFFER_READY => {
-                // Two in-band 0xFF bytes, per a native Mac driver capture.
-                let _ = self.endpoint.send(conn, &[0xFF, 0xFF], false);
+            ATTN_WITHDRAW => {
+                // Only a job still waiting to be called back can be withdrawn,
+                // as it has not reached the printer yet.
+                let waiting = match self.state {
+                    State::AwaitingCtrlClose { .. } => None,
+                    State::Connecting { conn: pending } => Some(pending),
+                    State::Idle | State::Piping { .. } => {
+                        let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
+                        return;
+                    }
+                };
+                let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
+                if print_request_block(data) == self.job_request {
+                    if let Some(pending) = waiting {
+                        self.endpoint.abandon_open(pending);
+                    }
+                    self.events
+                        .push_back(StyleWriterEvent::JobEnded { clean: true });
+                    self.enter(State::Idle, now);
+                }
             }
-            ATTN_KILL => {
-                // Kill on the data connection, rename commit anywhere else;
-                // see ATTN_KILL.
+            ATTN_OUTPUT_DRAINED => {
+                let reply = if self.printer_drained {
+                    OUTPUT_DRAINED
+                } else {
+                    OUTPUT_PENDING
+                };
+                let _ = self.endpoint.send(conn, &reply, false);
+            }
+            ATTN_END_SESSION => {
+                // On the data connection this ends the job. On any other
+                // connection it ends whatever exchange was made there.
                 if let State::Piping { conn: dc, .. } = self.state
                     && conn == dc
                 {
-                    // Two in-band reply bytes; value unverified on hardware,
-                    // see the module docs. Then expect the peer to close.
+                    // The Mac discards the two reply bytes. Then expect it to
+                    // close.
                     let _ = self.endpoint.send(conn, &[0xFF, 0xFF], false);
                     self.enter(
                         State::Piping {
@@ -604,10 +719,12 @@ impl StyleWriterRole {
                         now,
                     );
                 } else {
-                    // Commit: publish whatever SET_NAME staged. A commit with
-                    // nothing staged is still answered, because the client
-                    // waits on the reply either way.
-                    if let Some(name) = self.pending_name.take() {
+                    // Publish whatever SET_NAME staged on this connection.
+                    // A session with nothing staged is still answered,
+                    // because the client waits on the reply either way.
+                    if self.pending_name.as_ref().is_some_and(|(c, _)| *c == conn)
+                        && let Some((_, name)) = self.pending_name.take()
+                    {
                         self.events.push_back(StyleWriterEvent::Rename(name));
                     }
                     let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
@@ -617,8 +734,18 @@ impl StyleWriterRole {
                 let count = u16::from(self.busy());
                 let _ = self.endpoint.send(conn, &count.to_be_bytes(), false);
             }
-            ATTN_JOB_CONFIRM | ATTN_PAGE_START => {
-                let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
+            ATTN_QUEUE_POSITION => {
+                // There is no queue behind the job in hand, so a Mac waiting
+                // on it is next.
+                let position = u16::from(self.busy());
+                let _ = self.endpoint.send(conn, &position.to_be_bytes(), false);
+            }
+            ATTN_FAST_CLOCK_QUERY => {
+                let reply = match self.fast_clock {
+                    FastClock::Supported => RESULT_ACCEPTED,
+                    FastClock::Unsupported => FAST_CLOCK_UNAVAILABLE,
+                };
+                let _ = self.endpoint.send(conn, &reply, false);
             }
             ATTN_SERIAL_OPTIONS => {
                 let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
@@ -628,11 +755,13 @@ impl StyleWriterRole {
                 }
             }
             ATTN_SET_STATUS => {
-                // lpstyl's record: 0x06 0x47, then the text as a Pascal
-                // string, zero padded to 257.
+                // A u16 message ID, then the text as a Pascal string, kept to
+                // what fits the 255-byte field of the ATTN_JOB_STATUS reply.
                 if let Some(&len) = data.get(2) {
+                    self.job_status_id = u16::from_be_bytes([data[0], data[1]]);
                     let text = &data[3..];
-                    self.job_status = text[..(len as usize).min(text.len())].to_vec();
+                    let len = (len as usize).min(text.len()).min(JOB_STATUS_TEXT_LEN - 1);
+                    self.job_status = text[..len].to_vec();
                 }
                 let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
             }
@@ -645,26 +774,55 @@ impl StyleWriterRole {
                 let _ = self.endpoint.send(conn, &reply, false);
             }
             ATTN_SET_NAME => {
-                // Pascal string: one length byte, then MacRoman bytes. Staged
-                // rather than published, because the client only treats the
-                // rename as done once its commit is answered.
+                // A Pascal string of one length byte, then MacRoman bytes. It
+                // is staged rather than published, because the client only
+                // treats the rename as done once its session ends.
                 if let Some(&len) = data.first()
                     && len > 0
                     && data.len() > len as usize
                 {
-                    self.pending_name = Some(data[1..1 + len as usize].to_vec());
+                    self.pending_name = Some((conn, data[1..1 + len as usize].to_vec()));
                 }
                 let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
             }
+            ATTN_SERIAL_CONTROL_JF => match self.fast_clock {
+                FastClock::Supported => {
+                    let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
+                    let fast = data.get(..2).is_some_and(|arg| arg != [0, 0]);
+                    self.follow_printer_clock(fast);
+                }
+                FastClock::Unsupported => {
+                    let _ = self.endpoint.send(conn, &SERIAL_CONTROL_REFUSED, false);
+                }
+            },
+            ATTN_SERIAL_CONFIG => {
+                // Only ever the printer's usual 57600 baud, which the port
+                // runs at whenever it is not following the printer's clock.
+                let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
+                self.follow_printer_clock(false);
+            }
+            ATTN_SEND_BREAK | ATTN_BREAK_RECEIVED | ATTN_SERIAL_CONTROL_LOWER_JF => {
+                // Nothing for the port to do. For ATTN_BREAK_RECEIVED, 0x0000
+                // means no break has arrived.
+                let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
+            }
             _ => {
-                // Every attention seen so far, from lpstyl and the Mac
-                // driver alike, is followed by a read of an in-band reply,
+                // Every attention is followed by a read of an in-band reply,
                 // and the Mac hangs for good if none comes. A guessed 0x0000
                 // fails visibly instead, and the code is in the RX log.
                 let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
             }
         }
     }
+}
+
+/// A print request as kept for [`ATTN_JOB_USER`], which is its first 70 bytes,
+/// zero padded.
+fn print_request_block(data: &[u8]) -> [u8; PRINT_REQUEST_LEN] {
+    let mut block = [0; PRINT_REQUEST_LEN];
+    let n = data.len().min(PRINT_REQUEST_LEN);
+    block[..n].copy_from_slice(&data[..n]);
+    block
 }
 
 #[cfg(test)]
@@ -755,41 +913,30 @@ mod tests {
         core::iter::from_fn(|| role.poll_event()).collect()
     }
 
-    /// An original StyleWriter after a reset answered 01 / 00 / A0 on
-    /// hardware, and only then answered `?`.
     #[test]
-    fn an_original_stylewriter_is_ready_on_its_own_status_pattern() {
-        assert!(ready_after_reset(Some(0x01), Some(0x00), Some(0xA0)));
-        // 0x01 on its own is lpstyl's "still busy" for everyone else.
-        assert!(!ready_after_reset(Some(0x01), Some(0x00), Some(0xF8)));
-        assert!(!ready_after_reset(Some(0x01), None, None));
-        // Any other answer is ready, and silence never is.
-        assert!(ready_after_reset(Some(0x80), None, None));
-        assert!(!ready_after_reset(None, Some(0x00), Some(0xA0)));
+    fn identify_strings_name_the_model_and_its_nbp_type() {
+        for (identity, submodel, name, nbp_type) in [
+            (&b"IJ10"[..], None, Some("Apple StyleWriter"), NBP_TYPE_1200),
+            (b"SW", None, Some("Apple StyleWriter II"), NBP_TYPE_1200),
+            (b"SW3", None, Some("Apple StyleWriter 1200"), NBP_TYPE_1200),
+            (b"CS", Some(0x04), Some("Apple Color StyleWriter 1500"), NBP_TYPE_1200),
+            (b"CS", Some(0x02), Some("Apple Color StyleWriter 2200"), NBP_TYPE),
+            (b"CS", Some(0x01), Some("Apple Color StyleWriter 2400"), NBP_TYPE),
+            (b"CS", Some(0x05), Some("Apple Color StyleWriter 2500"), NBP_TYPE),
+            (b"CS", None, Some("Apple Color StyleWriter"), NBP_TYPE),
+            (b"XY", None, None, NBP_TYPE),
+        ] {
+            assert_eq!(model_name(identity, submodel), name, "{identity:?} {submodel:?}");
+            assert_eq!(nbp_type_for(identity, submodel), nbp_type, "{identity:?} {submodel:?}");
+        }
     }
 
-    /// lpstyl's identify strings and Color StyleWriter submodels.
+    /// A rename takes three attentions, which are the job count, the new name
+    /// and then the end of the session, each answered in band. The name is only
+    /// published by the end of the session on the connection that sent it, so
+    /// one left behind by a client that went away is never published.
     #[test]
-    fn identify_strings_name_lpstyls_models() {
-        assert_eq!(model_name(b"IJ10", None), Some("Apple StyleWriter"));
-        assert_eq!(model_name(b"SW", None), Some("Apple StyleWriter II"));
-        assert_eq!(model_name(b"SW3", None), Some("Apple StyleWriter 1200"));
-        assert_eq!(model_name(b"CS", Some(0x01)), Some("Apple Color StyleWriter 2400"));
-        assert_eq!(model_name(b"CS", Some(0x02)), Some("Apple Color StyleWriter 2200"));
-        assert_eq!(model_name(b"CS", Some(0x04)), Some("Apple Color StyleWriter 1500"));
-        assert_eq!(model_name(b"CS", Some(0x05)), Some("Apple Color StyleWriter 2500"));
-        assert_eq!(model_name(b"CS", Some(0x03)), Some("Apple Color StyleWriter"));
-        assert_eq!(model_name(b"CS", None), Some("Apple Color StyleWriter"));
-        assert_eq!(model_name(b"XY", None), None);
-    }
-
-    /// The three-attention rename: query, set, commit.
-    ///
-    /// Each step is answered with in-band 0x0000, and the client blocks on
-    /// that reply before sending the next - so an unanswered step stalls the
-    /// rename rather than failing it.
-    #[test]
-    fn a_rename_is_answered_at_each_step_and_published_on_commit() {
+    fn a_rename_is_published_only_by_its_own_session_end() {
         let mac_addr = addr(10, 70);
         let mut role = StyleWriterRole::new(129, 42, FastClock::Unsupported);
         let mut mac = AdspEndpoint::new(70, 77);
@@ -800,43 +947,65 @@ mod tests {
         for (code, payload) in [
             (ATTN_JOB_COUNT, alloc::vec![0x00]),
             (ATTN_SET_NAME, pascal(b"Inky")),
-            (ATTN_KILL, alloc::vec![0x00]),
+            (ATTN_END_SESSION, alloc::vec![0x00]),
         ] {
             mac.send_attention(ctrl, code, &payload, now).unwrap();
             shuttle(&mut role, &mut mac, mac_addr, now);
             assert_eq!(
                 in_band(&mut mac, ctrl),
                 alloc::vec![0x00, 0x00],
-                "step {code:#06x} must be answered"
+                "{code:#06x} must be answered"
             );
             now += 100;
         }
-
         assert_eq!(
             role_events(&mut role),
             alloc::vec![StyleWriterEvent::Rename(b"Inky".to_vec())]
         );
+
+        let staged = open_control(&mut role, &mut mac, mac_addr);
+        mac.send_attention(staged, ATTN_SET_NAME, &pascal(b"Never"), 400)
+            .unwrap();
+        shuttle(&mut role, &mut mac, mac_addr, 400);
+        assert_eq!(in_band(&mut mac, staged), [0x00, 0x00]);
+        mac.close(staged);
+        shuttle(&mut role, &mut mac, mac_addr, 500);
+
+        let next = open_control(&mut role, &mut mac, mac_addr);
+        mac.send_attention(next, ATTN_END_SESSION, &[0x00], 600)
+            .unwrap();
+        shuttle(&mut role, &mut mac, mac_addr, 600);
+        assert_eq!(in_band(&mut mac, next), [0x00, 0x00]);
+        assert!(role_events(&mut role).is_empty(), "an abandoned name is never published");
     }
 
-    /// A name arriving with no commit behind it is never published: the
-    /// client has not been told the rename took.
+    /// A print request too short to name a socket is refused, as the Mac waits
+    /// for a reply to every attention. In a full one the user name field holds
+    /// 32 characters, and anything past that belongs to the second string.
     #[test]
-    fn a_staged_name_without_a_commit_is_not_published() {
+    fn print_requests_are_read_within_their_fields() {
         let mac_addr = addr(10, 70);
         let mut role = StyleWriterRole::new(129, 42, FastClock::Unsupported);
         let mut mac = AdspEndpoint::new(70, 77);
         mac.set_listening(true);
         let ctrl = open_control(&mut role, &mut mac, mac_addr);
 
-        mac.send_attention(ctrl, ATTN_SET_NAME, &pascal(b"Never"), 100)
+        mac.send_attention(ctrl, ATTN_PRINT_REQUEST, &[0x00, 0x00, 0x00, 70], 100)
             .unwrap();
         shuttle(&mut role, &mut mac, mac_addr, 100);
+        assert_eq!(in_band(&mut mac, ctrl), [0xFF, 0xFF]);
+        assert!(!role.busy());
 
-        assert!(
-            !role_events(&mut role)
-                .iter()
-                .any(|e| matches!(e, StyleWriterEvent::Rename(_))),
-            "nothing is published until the commit"
+        let mut request = alloc::vec![0, 0, 0, 70, 40];
+        request.extend_from_slice(&[b'u'; 40]);
+        request.resize(70, 0);
+        mac.send_attention(ctrl, ATTN_PRINT_REQUEST, &request, 200)
+            .unwrap();
+        shuttle(&mut role, &mut mac, mac_addr, 200);
+        assert_eq!(in_band(&mut mac, ctrl), [0x00, 0x00]);
+        assert_eq!(
+            role.poll_event(),
+            Some(StyleWriterEvent::JobStarted { user: alloc::vec![b'u'; USER_NAME_MAX] })
         );
     }
 
@@ -849,7 +1018,6 @@ mod tests {
         let mut mac = AdspEndpoint::new(70, 77);
         mac.set_listening(true);
 
-        // Step 2: Mac opens the control connection.
         let printer = addr(130, 129);
         let ctrl = mac.connect(printer, 0);
         shuttle(&mut role, &mut mac, mac_addr, 0);
@@ -859,7 +1027,7 @@ mod tests {
         };
         let _ = ctrl;
 
-        // Step 3: print request naming data socket 70 (same endpoint here).
+        // Its print request names data socket 70, on the same endpoint here.
         mac.send_attention(
             ctrl_conn,
             ATTN_PRINT_REQUEST,
@@ -876,7 +1044,7 @@ mod tests {
             })
         );
 
-        // Step 4: two-byte accept arrives in band on the control conn.
+        // The two-byte accept arrives in band on the control connection.
         let accept = loop {
             match mac.poll_event() {
                 Some(AdspEvent::Data { conn, data, .. }) if conn == ctrl_conn => break data,
@@ -886,8 +1054,8 @@ mod tests {
         };
         assert_eq!(accept, [0x00, 0x00]);
 
-        // Step 5: Mac closes the control connection; step 6: the role dials
-        // back to the data socket.
+        // The Mac closes the control connection, and the role calls back on
+        // the data socket.
         mac.close(ctrl_conn);
         shuttle(&mut role, &mut mac, mac_addr, 200);
         let data_conn = match mac.poll_event() {
@@ -898,10 +1066,8 @@ mod tests {
             other => panic!("expected reverse Opened, got {other:?}"),
         };
 
-        // The Mac driver then opens a second control connection and repeats
-        // the request as 0x000D, and stalls until it is answered.
-        // lpstyl sets a status string on the data connection and reads a
-        // two-byte reply.
+        // The Mac mirrors its status message on the data connection, as the
+        // message ID followed by the text.
         let mut status = alloc::vec![0x06, 0x47, 8];
         status.extend_from_slice(b"Printing");
         status.resize(257, 0);
@@ -910,9 +1076,8 @@ mod tests {
         shuttle(&mut role, &mut mac, mac_addr, 240);
         assert_eq!(in_band(&mut mac, data_conn), [0x00, 0x00]);
 
-        // The Mac driver then opens a second control connection, repeats
-        // the request as 0x000D, and asks about the job, stalling on any
-        // attention left unanswered.
+        // A Mac waiting in the queue polls it on a fresh control
+        // connection, stalling on any attention left unanswered.
         let ctrl2 = open_control(&mut role, &mut mac, mac_addr);
         let mut now = 250;
         let mut ask = |role: &mut StyleWriterRole, mac: &mut AdspEndpoint, code, payload: &[u8]| {
@@ -921,29 +1086,35 @@ mod tests {
             now += 10;
             in_band(mac, ctrl2)
         };
+        // Next in line ("You will be next"), behind the one job there is.
         assert_eq!(
-            ask(&mut role, &mut mac, ATTN_JOB_CONFIRM, &print_request(70, b"Bob")),
-            [0x00, 0x00]
+            ask(&mut role, &mut mac, ATTN_QUEUE_POSITION, &print_request(70, b"Bob")),
+            [0x00, 0x01]
         );
-        // One job, the Mac's own: 0 here makes the driver report the job deleted.
+        // There is one job, the Mac's own. A count of 0 would make the Mac
+        // report it deleted.
         assert_eq!(ask(&mut role, &mut mac, ATTN_JOB_COUNT, &[0x00]), [0x00, 0x01]);
 
+        // The request as it came, then the result. The Mac reads the user name
+        // at offset 4.
         let user = ask(&mut role, &mut mac, ATTN_JOB_USER, &[0x00, 0x00]);
         assert_eq!(user.len(), 72);
-        assert_eq!(user[..6], [0x00, 0x00, 0x00, 0x00, 0x00, 70]);
-        assert_eq!(user[6..10], *b"\x03Bob");
-        assert!(user[10..].iter().all(|&b| b == 0));
+        assert_eq!(user[..70], print_request(70, b"Bob")[..]);
+        assert_eq!(user[4..8], *b"\x03Bob");
+        assert_eq!(user[70..], [0x00, 0x00]);
 
+        // The message ID and text the Mac set, then the result.
         let job_status = ask(&mut role, &mut mac, ATTN_JOB_STATUS, &[0x00]);
         assert_eq!(job_status.len(), 259);
-        assert_eq!(job_status[..3], [0x00, 0x00, 8]);
+        assert_eq!(job_status[..3], [0x06, 0x47, 8]);
         assert_eq!(job_status[3..11], *b"Printing");
+        assert!(job_status[11..].iter().all(|&b| b == 0));
 
         mac.close(ctrl2);
         shuttle(&mut role, &mut mac, mac_addr, 300);
         assert!(role.busy(), "closing the second control conn keeps the job");
 
-        // Step 7: bytes flow both ways verbatim.
+        // Bytes flow both ways verbatim.
         // Every command is a message of its own, EOM set, as the Mac sends it.
         mac.send(data_conn, b"?", true).unwrap();
         shuttle(&mut role, &mut mac, mac_addr, 300);
@@ -963,25 +1134,24 @@ mod tests {
         };
         assert_eq!(reply, b"CS\r");
 
-        // Attention 0x0006 is answered with in-band 0xFFFF.
-        mac.send_attention(data_conn, ATTN_BUFFER_READY, &[0x00], 500)
-            .unwrap();
-        shuttle(&mut role, &mut mac, mac_addr, 500);
-        let br = loop {
-            match mac.poll_event() {
-                Some(AdspEvent::Data { conn, data, .. }) if conn == data_conn => break data,
-                Some(_) => continue,
-                None => panic!("no buffer-ready reply"),
-            }
-        };
-        assert_eq!(br, [0xFF, 0xFF]);
+        // Attention 0x0006 says whether the printer has had every byte. It
+        // answers 0xFFFF when it has, and 0x0000 while the embedder still holds
+        // some.
+        for (at, drained, expect) in [(500, true, [0xFF, 0xFF]), (505, false, [0x00, 0x00])] {
+            role.set_printer_drained(drained);
+            mac.send_attention(data_conn, ATTN_OUTPUT_DRAINED, &[0x00], at)
+                .unwrap();
+            shuttle(&mut role, &mut mac, mac_addr, at);
+            assert_eq!(in_band(&mut mac, data_conn), expect, "drained {drained}");
+        }
 
-        // The Mac driver's 0x0005 before the first raster, and any code we
-        // have not met yet, still get a reply rather than hanging the Mac.
-        for (at, code) in [(510, ATTN_PAGE_START), (520, 0x0042)] {
+        // The port cannot follow the fast clock, which the Mac reads in the
+        // low byte. An unknown code still gets a reply, so the Mac does not
+        // hang.
+        for (at, code, expect) in [(510, ATTN_FAST_CLOCK_QUERY, [0x00, 0xEF]), (520, 0x0042, [0x00, 0x00])] {
             mac.send_attention(data_conn, code, &[0x00], at).unwrap();
             shuttle(&mut role, &mut mac, mac_addr, at);
-            assert_eq!(in_band(&mut mac, data_conn), [0x00, 0x00], "{code:#06x}");
+            assert_eq!(in_band(&mut mac, data_conn), expect, "{code:#06x}");
         }
 
         // Without fast clock support, the switch to fast mode never reaches
@@ -1010,8 +1180,8 @@ mod tests {
             );
         }
 
-        // Step 8: kill attention then close = clean end, no reset injected.
-        mac.send_attention(data_conn, ATTN_KILL, &[0x00], 600)
+        // Ending the session, then closing, is a clean end with no reset.
+        mac.send_attention(data_conn, ATTN_END_SESSION, &[0x00], 600)
             .unwrap();
         shuttle(&mut role, &mut mac, mac_addr, 600);
         mac.close(data_conn);
@@ -1098,23 +1268,13 @@ mod tests {
     fn supported_fast_clock_follows_the_client_and_the_job() {
         use StyleWriterEvent::{FastClockDisable, FastClockEnable, JobEnded, ToPrinter};
         let mac_addr = addr(10, 70);
-        let mut role = StyleWriterRole::new(129, 3, FastClock::Supported);
-        let mut mac = AdspEndpoint::new(70, 4);
-        mac.set_listening(true);
-        let ctrl = open_control(&mut role, &mut mac, mac_addr);
-        mac.send_attention(ctrl, ATTN_PRINT_REQUEST, &print_request(70, b"Fay"), 100)
+        let (mut role, mut mac, data_conn) = job_in_progress(FastClock::Supported);
+
+        // The Mac asks first, and only switches on a yes.
+        mac.send_attention(data_conn, ATTN_FAST_CLOCK_QUERY, &[0x00], 250)
             .unwrap();
-        shuttle(&mut role, &mut mac, mac_addr, 100);
-        mac.close(ctrl);
-        shuttle(&mut role, &mut mac, mac_addr, 200);
-        let data_conn = loop {
-            match mac.poll_event() {
-                Some(AdspEvent::Opened { conn, .. }) => break conn,
-                Some(_) => continue,
-                None => panic!("no data connection"),
-            }
-        };
-        assert!(matches!(role.poll_event(), Some(StyleWriterEvent::JobStarted { .. })));
+        shuttle(&mut role, &mut mac, mac_addr, 250);
+        assert_eq!(in_band(&mut mac, data_conn), [0x00, 0x00]);
 
         mac.send(data_conn, &[FAST_CLOCK], true).unwrap();
         shuttle(&mut role, &mut mac, mac_addr, 300);
@@ -1152,6 +1312,68 @@ mod tests {
                 JobEnded { clean: false },
             ]
         );
+    }
+
+    /// A role with a job in progress, and the Mac's end of its data
+    /// connection, with the job's start already read off the role.
+    fn job_in_progress(fast_clock: FastClock) -> (StyleWriterRole, AdspEndpoint, u16) {
+        let mac_addr = addr(10, 70);
+        let mut role = StyleWriterRole::new(129, 5, fast_clock);
+        let mut mac = AdspEndpoint::new(70, 6);
+        mac.set_listening(true);
+        let ctrl = open_control(&mut role, &mut mac, mac_addr);
+        mac.send_attention(ctrl, ATTN_PRINT_REQUEST, &print_request(70, b"Ann"), 100)
+            .unwrap();
+        shuttle(&mut role, &mut mac, mac_addr, 100);
+        mac.close(ctrl);
+        shuttle(&mut role, &mut mac, mac_addr, 200);
+        let data_conn = loop {
+            match mac.poll_event() {
+                Some(AdspEvent::Opened { conn, .. }) => break conn,
+                Some(_) => continue,
+                None => panic!("no data connection"),
+            }
+        };
+        assert!(matches!(role.poll_event(), Some(StyleWriterEvent::JobStarted { .. })));
+        (role, mac, data_conn)
+    }
+
+    /// Send attention `code` with `arg` and return its in-band answer.
+    fn ask(role: &mut StyleWriterRole, mac: &mut AdspEndpoint, conn: u16, code: u16, arg: &[u8], now: Micros) -> Vec<u8> {
+        mac.send_attention(conn, code, arg, now).unwrap();
+        shuttle(role, mac, addr(10, 70), now);
+        in_band(mac, conn)
+    }
+
+    /// A StyleWriter II goes fast only where the port can follow. A port that
+    /// cannot refuses the Mac's call, so the printer stays at 57600 baud, and a
+    /// stray `h` is kept from the printer. One that can passes the switch on,
+    /// follows once the Mac moves it, and goes back when the Mac puts it at
+    /// 57600 baud again.
+    #[test]
+    fn a_stylewriter_ii_goes_fast_only_where_the_port_can_follow() {
+        use StyleWriterEvent::{FastClockDisable, FastClockEnable, ToPrinter};
+        let (mut role, mut mac, data) = job_in_progress(FastClock::Unsupported);
+        assert_eq!(ask(&mut role, &mut mac, data, ATTN_SERIAL_CONTROL_JF, &[0, 0], 250), [0xFF, 0xEF]);
+        assert_eq!(ask(&mut role, &mut mac, data, ATTN_SERIAL_CONFIG, &[0x4C, 0x00], 260), [0, 0]);
+        // Only a lone `h` is the switch. Inside data it is just a byte.
+        mac.send(data, &[FAST_CLOCK_SW], true).unwrap();
+        shuttle(&mut role, &mut mac, addr(10, 70), 270);
+        assert_eq!(role.poll_event(), None);
+        mac.send(data, b"hh", true).unwrap();
+        shuttle(&mut role, &mut mac, addr(10, 70), 280);
+        assert_eq!(role.poll_event(), Some(ToPrinter(b"hh".to_vec())));
+
+        let (mut role, mut mac, data) = job_in_progress(FastClock::Supported);
+        assert_eq!(ask(&mut role, &mut mac, data, ATTN_SERIAL_CONTROL_JF, &[0, 0], 250), [0, 0]);
+        assert_eq!(ask(&mut role, &mut mac, data, ATTN_SERIAL_CONTROL_LOWER_JF, &[0x01, 0x01], 260), [0, 0]);
+        assert_eq!(role_events(&mut role), []);
+        mac.send(data, &[FAST_CLOCK_SW], true).unwrap();
+        shuttle(&mut role, &mut mac, addr(10, 70), 270);
+        assert_eq!(ask(&mut role, &mut mac, data, ATTN_SERIAL_CONTROL_JF, &[0, 1], 280), [0, 0]);
+        assert_eq!(role_events(&mut role), [ToPrinter(vec![FAST_CLOCK_SW]), FastClockEnable]);
+        assert_eq!(ask(&mut role, &mut mac, data, ATTN_SERIAL_CONFIG, &[0x4C, 0x00], 290), [0, 0]);
+        assert_eq!(role_events(&mut role), [FastClockDisable]);
     }
 
     /// A client that vanishes between the accept and the control close
@@ -1274,4 +1496,95 @@ mod tests {
         assert_ne!(result, [0x00, 0x00]);
         assert_ne!(result, [0xFF, 0xFF]);
     }
+
+    /// Move traffic between the role and `ep` (node `node`) until quiescent,
+    /// dropping whatever the role sends to any other node.
+    fn exchange_only(role: &mut StyleWriterRole, ep: &mut AdspEndpoint, node: u8, now: Micros) {
+        let printer = addr(130, role.control_socket());
+        loop {
+            let mut progressed = false;
+            while let Some((_, p)) = ep.poll_transmit() {
+                role.handle_datagram(addr(node, 70), &p, now);
+                progressed = true;
+            }
+            while let Some((dest, p)) = role.poll_transmit() {
+                if dest.node_number == node {
+                    ep.handle_datagram(printer, &p, now);
+                }
+                progressed = true;
+            }
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    /// A role that has accepted `request` from node 10 and is still dialing
+    /// back, with an open that never gets an answer.
+    fn role_calling_back(request: &[u8]) -> StyleWriterRole {
+        let mut role = StyleWriterRole::new(129, 21, FastClock::Unsupported);
+        let mut mac = AdspEndpoint::new(70, 22);
+        let _c = mac.connect(addr(130, 129), 0);
+        exchange_only(&mut role, &mut mac, 10, 0);
+        let ctrl = match mac.poll_event() {
+            Some(AdspEvent::Opened { conn, .. }) => conn,
+            other => panic!("{other:?}"),
+        };
+        mac.send_attention(ctrl, ATTN_PRINT_REQUEST, request, 100)
+            .unwrap();
+        exchange_only(&mut role, &mut mac, 10, 100);
+        mac.close(ctrl);
+        // The close reaches the role, which dials back, but nothing answers.
+        exchange_only(&mut role, &mut mac, 99, 200);
+        while role.poll_event().is_some() {}
+        assert!(role.busy());
+        role
+    }
+
+    /// Withdraw `request` over a control connection from node 11, an endpoint
+    /// seeded with `seed`, returning the in-band reply.
+    fn withdraw(role: &mut StyleWriterRole, request: &[u8], seed: u32) -> Vec<u8> {
+        let mut mac = AdspEndpoint::new(70, seed);
+        let _c = mac.connect(addr(130, 129), 300);
+        exchange_only(role, &mut mac, 11, 300);
+        let ctrl = match mac.poll_event() {
+            Some(AdspEvent::Opened { conn, .. }) => conn,
+            other => panic!("{other:?}"),
+        };
+        mac.send_attention(ctrl, ATTN_WITHDRAW, request, 400).unwrap();
+        exchange_only(role, &mut mac, 11, 400);
+        in_band(&mut mac, ctrl)
+    }
+
+    /// A job still waiting to be called back can be withdrawn, but only with
+    /// its own request. Nothing has reached the printer, so it ends cleanly,
+    /// with no reset, and the role stops dialing.
+    #[test]
+    fn a_withdrawn_request_releases_the_role() {
+        let request = print_request(70, b"Hal");
+        let mut role = role_calling_back(&request);
+        assert_eq!(withdraw(&mut role, &print_request(71, b"Ivy"), 23), [0x00, 0x00]);
+        assert!(role.busy(), "another Mac's request keeps the job");
+        assert!(role_events(&mut role).is_empty());
+
+        assert_eq!(withdraw(&mut role, &request, 24), [0x00, 0x00]);
+        assert_eq!(
+            role_events(&mut role),
+            alloc::vec![StyleWriterEvent::JobEnded { clean: true }]
+        );
+        assert!(!role.busy());
+
+        // The abandoned open is not retried.
+        for _ in 0..20 {
+            match role.next_deadline() {
+                Some(d) => role.poll(d),
+                None => break,
+            }
+        }
+        assert!(
+            core::iter::from_fn(|| role.poll_transmit()).all(|(dest, _)| dest.node_number != 10),
+            "no more opens toward the Mac"
+        );
+    }
+
 }

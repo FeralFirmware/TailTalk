@@ -117,6 +117,10 @@ enum ActorCmd {
         conn_id: u16,
         reply: oneshot::Sender<io::Result<()>>,
     },
+    Unacknowledged {
+        conn_id: u16,
+        reply: oneshot::Sender<usize>,
+    },
 }
 
 // ── Adsp actor ────────────────────────────────────────────────────────────────
@@ -349,6 +353,9 @@ impl Adsp {
                 }
                 self.outbound_key.retain(|_, key| *key != conn_id);
                 let _ = reply.send(Ok(()));
+            }
+            ActorCmd::Unacknowledged { conn_id, reply } => {
+                let _ = reply.send(self.endpoint.tx_backlog(conn_id));
             }
         }
     }
@@ -823,6 +830,19 @@ impl AdspStream {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "adsp actor dead"))?;
         rx.await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "adsp actor dead"))?
+    }
+
+    /// How many bytes written so far the peer has not yet acknowledged,
+    /// counting those still waiting for room in its window. This is the Mac's
+    /// `dspStatus` `sendQPending`. Zero once everything written has arrived.
+    pub async fn unacknowledged(&self) -> io::Result<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ActorCmd::Unacknowledged { conn_id: self.conn_id, reply: tx })
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "adsp actor dead"))?;
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "adsp actor dead"))
     }
 
     /// Send a CloseAdvice and shut down the connection.
