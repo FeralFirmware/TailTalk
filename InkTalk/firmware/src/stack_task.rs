@@ -185,6 +185,13 @@ async fn serve_printer(
     let mut rx = printer::PortRx::default();
     let identifies = role == Role::StyleWriter;
     if identifies {
+        // Most printers I have seen have the HSKi line always tied high / ready, but some like the
+        // II as reported by a 68KMLA user do not. The original Apple driver does not enable handshake
+        // gating so we should be safe to disable it too.
+        // What it uses instead is buffer queries where it will limit the amount of data sent so it does
+        // not overrun the printer.
+        printer::set_handshake_gating(false);
+
         identify::set_enabled();
         // The printer is already registered, so a client that turns up now
         // is accepted and its bytes wait in the window until this is done.
