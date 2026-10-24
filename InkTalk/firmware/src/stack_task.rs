@@ -15,7 +15,7 @@
 use core::sync::atomic::Ordering;
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either3, select3};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::once_lock::OnceLock;
@@ -195,16 +195,16 @@ async fn serve_printer(
         identify::set_enabled();
         // The printer is already registered, so a client that turns up now
         // is accepted and its bytes wait in the window until this is done.
-        identify::run(&mut tx, &mut rx).await;
+        identify_and_register(&served, &mut tx, &mut rx).await;
     }
     loop {
         // A re-identify may only interrupt `run` between jobs: a write it
         // abandons is lost, and mid-job that would be a client's raster.
         let result = if identifies && !JOB_ACTIVE.load(Ordering::Relaxed) {
-            match select(served.run(&mut tx, &mut rx), identify::REPROBE.wait()).await {
-                Either::First(r) => r,
-                Either::Second(()) => {
-                    identify::run(&mut tx, &mut rx).await;
+            match select3(served.run(&mut tx, &mut rx), identify::REPROBE.wait(), identify::retry_due()).await {
+                Either3::First(r) => r,
+                Either3::Second(()) | Either3::Third(()) => {
+                    identify_and_register(&served, &mut tx, &mut rx).await;
                     continue;
                 }
             }
@@ -242,6 +242,19 @@ async fn serve_printer(
                 Timer::after_millis(100).await;
             }
         }
+    }
+}
+
+/// Identify the printer, then register it under the NBP type a Mac looks up
+/// for that model.
+async fn identify_and_register(served: &Printer<'static, InkTalk>, tx: &mut printer::PortTx, rx: &mut printer::PortRx) {
+    identify::run(tx, rx).await;
+    let Some(nbp_type) = identify::found().nbp_type() else {
+        return;
+    };
+    match served.name_handle().set_type(nbp_type) {
+        Ok(()) => tt_log!("STACK: registered as {}", nbp_type),
+        Err(e) => tt_log!("STACK: cannot register as {}: {:?}", nbp_type, e),
     }
 }
 

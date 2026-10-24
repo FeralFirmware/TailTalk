@@ -124,6 +124,9 @@ impl Role for StyleWriterRole {
 
     fn set_credit(&mut self, bytes: usize, _now: Micros) {
         self.set_printer_credit(bytes);
+        // The whole window free means every job byte taken has been written
+        // to the port.
+        self.set_printer_drained(bytes >= WINDOW);
     }
 
     fn printer_input(&mut self, data: &[u8], _now: Micros) {
@@ -326,11 +329,13 @@ pub struct Printer<'a, P: Platform> {
 }
 
 impl<'a, P: Platform> Printer<'a, P> {
-    /// A Color StyleWriter 2400 with a LocalTalk adapter, registered as
-    /// `<name>:ColorStyleWriter2400AT@*`. The port speaks the StyleWriter's
-    /// serial command language, which passes through untouched, apart from
-    /// the printer's fast mode: `fast_clock` says whether the port can
-    /// follow it, see [`FastClock`].
+    /// A StyleWriter with a LocalTalk adapter, registered as
+    /// `<name>:ColorStyleWriter2400AT@*` until [`PrinterName::set_type`] moves
+    /// it to the type a Mac looks up for its model (see
+    /// [`stylewriter::nbp_type_for`]). The port speaks the StyleWriter's serial
+    /// command language, which passes through untouched apart from the
+    /// printer's fast mode. `fast_clock` says whether the port can follow a
+    /// Color StyleWriter into it (see [`FastClock`]).
     pub fn stylewriter(net: Net<'a, P>, name: &str, fast_clock: FastClock) -> Result<Self, BindError> {
         Self::bind(net, name, stylewriter::NBP_TYPE, 1, |inner, sockets| {
             // ADSP connection IDs want to differ across boots, so a Mac does
@@ -519,10 +524,12 @@ impl<'a, P: Platform> Printer<'a, P> {
     }
 }
 
-/// Why [`PrinterName::set`] did not rename the printer. The old name stands.
+/// Why [`PrinterName::set`] or [`PrinterName::set_type`] did not re-register
+/// the printer. The old registration stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenameError {
-    /// The name is empty, too long, or carries an NBP delimiter or wildcard.
+    /// The name or type is empty, too long, or carries an NBP delimiter or
+    /// wildcard.
     BadName,
     /// The printer this handle came from has been dropped.
     Gone,
@@ -562,13 +569,37 @@ impl<P: Platform> PrinterName<'_, P> {
     /// name stays registered. Unlike a client's rename, [`Printer::run`]
     /// doesn't report this one, since the caller already knows about it.
     pub fn set(&self, name: &str) -> Result<(), RenameError> {
+        self.reregister(Some(name), None)
+    }
+
+    /// The NBP type the printer is registered under, or `None` once it has
+    /// been dropped.
+    pub fn nbp_type(&self) -> Option<String> {
+        self.net.with(|inner| {
+            inner
+                .try_get::<PortState>(self.id, self.generation)
+                .map(|s| s.nbp_type.clone())
+        })
+    }
+
+    /// Re-register the printer under `nbp_type`, keeping its name. For a
+    /// StyleWriter this is the type a Mac looks up for the model it turned out
+    /// to be. If that fails the old registration stays.
+    pub fn set_type(&self, nbp_type: &str) -> Result<(), RenameError> {
+        self.reregister(None, Some(nbp_type))
+    }
+
+    /// Register under a new name, a new type, or both, in place of the
+    /// current registration.
+    fn reregister(&self, name: Option<&str>, nbp_type: Option<&str>) -> Result<(), RenameError> {
         let (id, generation) = (self.id, self.generation);
         self.net.with(|inner| {
             let (socket, new_entity, old) = {
                 let s = inner
                     .try_get::<PortState>(id, generation)
                     .ok_or(RenameError::Gone)?;
-                let new_entity = entity_name(name, &s.nbp_type).ok_or(RenameError::BadName)?;
+                let new_entity = entity_name(name.unwrap_or(&s.name), nbp_type.unwrap_or(&s.nbp_type))
+                    .ok_or(RenameError::BadName)?;
                 (s.socket, new_entity, s.registered.clone())
             };
             if let Some(old) = &old {
@@ -585,7 +616,12 @@ impl<P: Platform> PrinterName<'_, P> {
             }
             let s = inner.get::<PortState>(id);
             s.registered = Some(new_entity);
-            s.name = name.to_string();
+            if let Some(name) = name {
+                s.name = name.to_string();
+            }
+            if let Some(nbp_type) = nbp_type {
+                s.nbp_type = nbp_type.to_string();
+            }
             Ok(())
         })
     }
@@ -626,12 +662,11 @@ impl<P: Platform> Drop for WriteGuard<'_, P> {
     }
 }
 
-/// `<name>:<nbp_type>@*`, or `None` if `name` cannot be one: empty, too
-/// long, or carrying a delimiter that would split it.
-/// `name:nbp_type@*`, if NBP will register it: no delimiters, no wildcards,
-/// and short enough.
+/// `<name>:<nbp_type>@*`, if NBP will register it. Neither part can be empty or
+/// hold delimiters or wildcards, and the whole has to be short enough.
 fn entity_name(name: &str, nbp_type: &str) -> Option<EntityName> {
-    if name.is_empty() || name.contains([':', '@']) {
+    let unusable = |part: &str| part.is_empty() || part.contains([':', '@']);
+    if unusable(name) || unusable(nbp_type) {
         return None;
     }
     EntityName::try_from(format!("{name}:{nbp_type}@*").as_str())
@@ -650,6 +685,10 @@ mod tests {
         assert!(entity_name("a:b", "ImageWriter").is_none());
         assert!(entity_name("a@b", "ImageWriter").is_none());
         assert!(entity_name(&"x".repeat(33), "ImageWriter").is_none());
+        // The type is held to the same rules.
+        assert!(entity_name("Inky", "").is_none());
+        assert!(entity_name("Inky", "Image:Writer").is_none());
+        assert!(entity_name("Inky", "Image@Writer").is_none());
     }
 
     #[test]

@@ -12,8 +12,6 @@ members = [
   "examples/pap-capture",
   "examples/iw-print",
   "examples/afp-server",
-  "examples/adsp-stylewriter",
-  "examples/sw-rename",
   "tailtalk-gui",
   "tashtalk",
   "hfs-reader",

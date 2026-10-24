@@ -7,7 +7,9 @@
 //! Printers are the one family the explorer can also configure, and each has its
 //! own way in:
 //!
-//!   * StyleWriter — rename, over the ADSP management socket (`sw-rename`).
+//!   * StyleWriter. It can be renamed (`sw-rename`), and every model but the
+//!     original can have its ink cartridge cleaned or super cleaned, both over
+//!     the socket it takes print jobs on.
 //!   * LaserWriter — rename, default paper size and power-on startup page, as
 //!     PostScript over PAP (`pap-print`).
 //!   * ImageWriter — rename, as the option card's `ESC b` command over PAP.
@@ -15,6 +17,8 @@
 //!   * InkTalk: name, emulated printer and port speed, over its own ADSP
 //!     control socket (`inktalk.rs`). An InkTalk also registers the printer
 //!     it's emulating, but we hide that one so the device only shows up once.
+//!     When that printer is a StyleWriter that cleans its cartridge, the
+//!     clean goes to its print socket, as for a StyleWriter of its own.
 //!
 //! Everything else is listed, described from its NBP registration and pinged,
 //! but has no protocol we can query or configure it with.
@@ -38,7 +42,7 @@ use tailtalk::{
     echo::{EchoHandle, MAX_ECHO_DATA},
     imagewriter::{self, ImageWriter, ImageWriterStatus},
     pap::{PapClient, PapStatusHandle},
-    stylewriter::StyleWriterSession,
+    stylewriter::{Cleaning, StyleWriterSession},
 };
 use tailtalk_packets::aarp::AppleTalkAddress;
 use tailtalk_packets::nbp::EntityName;
@@ -88,8 +92,9 @@ fn to_model(lines: Vec<Line>) -> slint::ModelRc<InfoRow> {
 enum DeviceKind {
     /// PostScript printer driven over PAP (NBP type "LaserWriter").
     LaserWriter,
-    /// Color StyleWriter behind an EtherTalk adapter, driven over ADSP
-    /// (NBP type "ColorStyleWriter2400AT").
+    /// StyleWriter behind an AppleTalk adapter, driven over ADSP. NBP type
+    /// "ColorStyleWriter2400AT" for a Color StyleWriter 2200, 2400 or 2500,
+    /// "StyleWriter1200AT" for the printers the Color SW 1500 driver drives.
     StyleWriter,
     /// Apple ImageWriter II/LQ behind a LocalTalk Option Card, queried over PAP
     /// (NBP type "ImageWriter").
@@ -102,8 +107,9 @@ enum DeviceKind {
     Generic,
 }
 
-/// ADSP management socket — fixed at 129 on StyleWriter adapters (see `sw-rename`).
-const SW_MGMT_SOCKET: u8 = 129;
+/// How long a StyleWriter session, to ask about the printer, rename it or
+/// clean its cartridge, waits for the adapter to take it.
+const SW_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Longest name each family accepts: the StyleWriter's Pascal-string rename
 /// takes 31, the LaserWriter's `PrinterName` 32. Drives both validation and the
@@ -112,14 +118,14 @@ const SW_MAX_NAME_LEN: usize = 31;
 const LW_MAX_NAME_LEN: usize = 32;
 
 impl DeviceKind {
-    /// The NBP type each configurable family registers under.
-    fn nbp_type(self) -> Option<&'static str> {
+    /// The NBP types each configurable family registers under.
+    fn nbp_types(self) -> &'static [&'static str] {
         match self {
-            DeviceKind::LaserWriter => Some("LaserWriter"),
-            DeviceKind::StyleWriter => Some("ColorStyleWriter2400AT"),
-            DeviceKind::ImageWriter => Some("ImageWriter"),
-            DeviceKind::InkTalk => Some(inkproto::NBP_TYPE),
-            DeviceKind::Generic => None,
+            DeviceKind::LaserWriter => &["LaserWriter"],
+            DeviceKind::StyleWriter => &["ColorStyleWriter2400AT", "StyleWriter1200AT"],
+            DeviceKind::ImageWriter => &["ImageWriter"],
+            DeviceKind::InkTalk => &[inkproto::NBP_TYPE],
+            DeviceKind::Generic => &[],
         }
     }
 
@@ -135,7 +141,7 @@ impl DeviceKind {
             DeviceKind::ImageWriter,
             DeviceKind::InkTalk,
         ] {
-            if kind.nbp_type().is_some_and(|t| t.eq_ignore_ascii_case(nbp_type)) {
+            if kind.nbp_types().iter().any(|t| t.eq_ignore_ascii_case(nbp_type)) {
                 return kind;
             }
         }
@@ -165,6 +171,7 @@ impl DeviceKind {
 const KNOWN_TYPES: &[(&str, &str, &str)] = &[
     ("LaserWriter", "🖨", "LaserWriter (PostScript)"),
     ("ColorStyleWriter2400AT", "🖨", "Color StyleWriter"),
+    ("StyleWriter1200AT", "🖨", "StyleWriter"),
     ("ImageWriter", "🖨", "ImageWriter"),
     ("ImageWriter LQ", "🖨", "ImageWriter LQ"),
     ("InkTalk", "🖨", "InkTalk"),
@@ -221,6 +228,9 @@ struct Device {
     net: u16,
     node: u8,
     socket: u8,
+    /// For an InkTalk, the socket of the StyleWriter it registers when it is
+    /// emulating one.
+    printer_socket: Option<u8>,
 }
 
 impl Device {
@@ -234,13 +244,16 @@ impl Device {
         }
     }
 
-    /// The fixed management endpoint used for renaming (StyleWriter).
-    fn adsp_mgmt_addr(&self) -> AdspAddress {
-        AdspAddress {
-            network_number: self.net,
-            node_number: self.node,
-            socket_number: SW_MGMT_SOCKET,
-        }
+    /// Where a StyleWriter takes print jobs, cleaning among them. That is a
+    /// StyleWriter's advertised socket, or the one an InkTalk registers for the
+    /// StyleWriter it emulates.
+    fn stylewriter_addr(&self) -> Option<AdspAddress> {
+        let socket = match self.kind {
+            DeviceKind::StyleWriter => self.socket,
+            DeviceKind::InkTalk => self.printer_socket?,
+            _ => return None,
+        };
+        Some(AdspAddress { network_number: self.net, node_number: self.node, socket_number: socket })
     }
 
     /// The advertised print endpoint, as an ATP address (LaserWriter, ImageWriter).
@@ -353,6 +366,8 @@ struct Queried {
     /// Current values for the editable controls, for the families that give
     /// us any.
     settings: Option<Settings>,
+    /// Whether the printer cleans its ink cartridge on command.
+    can_clean: bool,
 }
 
 #[derive(Clone)]
@@ -566,7 +581,7 @@ async fn discover(handles: &ExplorerHandles) -> anyhow::Result<Vec<Device>> {
                 DeviceKind::InkTalk,
             ]
             .iter()
-            .filter_map(|k| k.nbp_type())
+            .flat_map(|k| k.nbp_types())
             .map(|t| format!("=:{t}@*")),
         )
         .collect();
@@ -624,6 +639,7 @@ async fn discover(handles: &ExplorerHandles) -> anyhow::Result<Vec<Device>> {
                 net: t.network_number,
                 node: t.node_id,
                 socket: t.socket_number,
+                printer_socket: None,
             });
         }
     }
@@ -631,12 +647,21 @@ async fn discover(handles: &ExplorerHandles) -> anyhow::Result<Vec<Device>> {
     // An InkTalk registers the printer it's emulating as well as its control
     // socket. If we listed both, one box would show up as two devices, and
     // one of them could only be configured the limited way the emulated
-    // printer allows. So for those nodes we only keep the InkTalk entry.
+    // printer allows. So for those nodes we only keep the InkTalk entry,
+    // noting where an emulated StyleWriter takes jobs.
     let inktalk_nodes: HashSet<(u16, u8)> = found
         .iter()
         .filter(|d| d.kind == DeviceKind::InkTalk)
         .map(|d| (d.net, d.node))
         .collect();
+    let printer_sockets: HashMap<(u16, u8), u8> = found
+        .iter()
+        .filter(|d| d.kind == DeviceKind::StyleWriter && inktalk_nodes.contains(&(d.net, d.node)))
+        .map(|d| ((d.net, d.node), d.socket))
+        .collect();
+    for device in found.iter_mut().filter(|d| d.kind == DeviceKind::InkTalk) {
+        device.printer_socket = printer_sockets.get(&(device.net, device.node)).copied();
+    }
     found.retain(|d| d.kind == DeviceKind::InkTalk || !inktalk_nodes.contains(&(d.net, d.node)));
 
     // Configurable devices first, since they are what the window can act on,
@@ -671,7 +696,8 @@ fn directory_lines(device: &Device) -> Vec<Line> {
 
 /// Query a StyleWriter's identity over a short-lived ADSP session (no page fed).
 async fn query_stylewriter(ddp: &DdpHandle, addr: AdspAddress) -> anyhow::Result<Queried> {
-    let mut session = StyleWriterSession::connect(ddp, addr, "TailTalk").await?;
+    let give_up = tokio::time::Instant::now() + SW_SESSION_TIMEOUT;
+    let mut session = StyleWriterSession::connect(ddp, addr, "TailTalk", Some(give_up)).await?;
     let info = session.query_info().await;
     let _ = session.abort().await;
     let info = info?;
@@ -706,9 +732,8 @@ async fn query_stylewriter(ddp: &DdpHandle, addr: AdspAddress) -> anyhow::Result
                     "No — this model is mono only"
                 },
             ),
-            // The printer's error vocabulary was never fully reverse-engineered
-            // (lpstyl documents three codes for '2' and nothing at all for '1'),
-            // so show the raw bytes rather than decode them into a guess.
+            // The raw replies too, for any bit the decoding above does not
+            // name.
             Line::section("Raw protocol replies"),
             Line::field(
                 "Identity  '?'",
@@ -721,6 +746,7 @@ async fn query_stylewriter(ddp: &DdpHandle, addr: AdspAddress) -> anyhow::Result
             Line::field("Buffer    'B'", raw(info.status_buffer)),
         ],
         settings: None,
+        can_clean: info.family().is_some_and(|family| family.can_clean()),
     })
 }
 
@@ -732,11 +758,17 @@ async fn query_imagewriter(ddp: &DdpHandle, addr: AtpAddress) -> anyhow::Result<
     Ok(Queried {
         lines: imagewriter_lines(&s),
         settings: None,
+        can_clean: false,
     })
 }
 
-/// Query an InkTalk over its control socket.
-async fn query_inktalk(ddp: &DdpHandle, addr: AdspAddress) -> anyhow::Result<Queried> {
+/// The model an InkTalk reports for an original StyleWriter, the one
+/// StyleWriter with no cleaning command.
+const ORIGINAL_STYLEWRITER_MODEL: &str = "Apple StyleWriter";
+
+/// Query an InkTalk over its control socket. `emulated_stylewriter` is
+/// whether it has a StyleWriter registered, to take a cleaning job.
+async fn query_inktalk(ddp: &DdpHandle, addr: AdspAddress, emulated_stylewriter: bool) -> anyhow::Result<Queried> {
     let info = inktalk::query(ddp, addr).await?;
     let unknown = || "not reported".to_string();
     let yes_no = |b: Option<bool>| b.map_or_else(unknown, |b| if b { "Yes" } else { "No" }.to_string());
@@ -782,11 +814,15 @@ async fn query_inktalk(ddp: &DdpHandle, addr: AdspAddress) -> anyhow::Result<Que
         Line::field("Bytes from printer", info.printer_rx.map_or_else(unknown, |n| n.to_string())),
     ]);
 
+    // The printer has to have answered for us to know it cleans.
+    let can_clean = emulated_stylewriter
+        && info.mode == Some(Mode::StyleWriter)
+        && info.printer_model.as_deref().is_some_and(|m| !m.is_empty() && m != ORIGINAL_STYLEWRITER_MODEL);
     let settings = match (info.name.or(info.live_name), info.mode, info.baud) {
         (Some(name), Some(mode), Some(baud)) => Some(Settings::InkTalk(InkTalkSettings { name, mode, baud })),
         _ => anyhow::bail!("the InkTalk did not report its settings"),
     };
-    Ok(Queried { lines, settings })
+    Ok(Queried { lines, settings, can_clean })
 }
 
 fn format_uptime(secs: u32) -> String {
@@ -849,47 +885,81 @@ fn imagewriter_condition(s: &ImageWriterStatus) -> String {
 
 /// Send one attention command and check the printer's two-byte acknowledgement.
 async fn attention(stream: &mut AdspStream, code: u16, payload: &[u8]) -> anyhow::Result<()> {
-    stream.send_attention(code, payload).await?;
-    let mut resp = [0u8; 2];
-    timeout(Duration::from_secs(30), stream.read_exact(&mut resp))
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for reply to 0x{code:04X}"))??;
+    let resp = attention_reply(stream, code, payload).await?;
     if resp != [0x00, 0x00] {
         anyhow::bail!("unexpected reply to 0x{code:04X}: {resp:02X?}");
     }
     Ok(())
 }
 
-/// Attention codes used by the StyleWriter name-change protocol.
-const ATTN_GET_NAME: u16 = 0x0011;
-const ATTN_SET_NAME: u16 = 0x0009;
-const ATTN_COMMIT: u16 = 0x0012;
+/// Send an attention and return its two-byte in-band reply.
+async fn attention_reply(stream: &mut AdspStream, code: u16, payload: &[u8]) -> anyhow::Result<[u8; 2]> {
+    stream.send_attention(code, payload).await?;
+    let mut resp = [0u8; 2];
+    timeout(Duration::from_secs(30), stream.read_exact(&mut resp))
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for reply to 0x{code:04X}"))??;
+    Ok(resp)
+}
 
-/// Rename a StyleWriter via its ADSP management socket (the `sw-rename` flow).
+/// Attention codes a StyleWriter rename uses. These are the number of jobs in
+/// the queue, which has to be 0 for the rename to go ahead, the new name, and
+/// the end of the session, on which the adapter takes the name.
+const ATTN_JOB_COUNT: u16 = 0x0011;
+const ATTN_SET_NAME: u16 = 0x0009;
+const ATTN_END_SESSION: u16 = 0x0012;
+
+/// Rename a StyleWriter over a control connection to the socket it
+/// advertises (the `sw-rename` flow).
 async fn rename_stylewriter(
     ddp: &DdpHandle,
-    mgmt_addr: AdspAddress,
+    addr: AdspAddress,
     new_name: &str,
 ) -> anyhow::Result<String> {
     validate_name(new_name, DeviceKind::StyleWriter.max_name_len())?;
 
-    let mut stream = timeout(Duration::from_secs(10), Adsp::connect(ddp, mgmt_addr))
+    let mut stream = timeout(Duration::from_secs(10), Adsp::connect(ddp, addr))
         .await
-        .map_err(|_| anyhow::anyhow!("ADSP connect timed out — is socket {SW_MGMT_SOCKET} open?"))??;
+        .map_err(|_| anyhow::anyhow!("ADSP connect to socket {} timed out", addr.socket_number))??;
 
     // Pascal string: length byte followed by the name bytes.
     let mut pascal = Vec::with_capacity(1 + new_name.len());
     pascal.push(new_name.len() as u8);
     pascal.extend_from_slice(new_name.as_bytes());
 
-    attention(&mut stream, ATTN_GET_NAME, &[0x00]).await?;
+    if attention_reply(&mut stream, ATTN_JOB_COUNT, &[0x00]).await? != [0x00, 0x00] {
+        let _ = attention_reply(&mut stream, ATTN_END_SESSION, &[0x00]).await;
+        let _ = stream.close().await;
+        anyhow::bail!("The printer is busy; it cannot be renamed while it is printing");
+    }
     attention(&mut stream, ATTN_SET_NAME, &pascal).await?;
-    attention(&mut stream, ATTN_COMMIT, &[0x00]).await?;
+    attention(&mut stream, ATTN_END_SESSION, &[0x00]).await?;
     stream.close().await?;
 
     Ok(format!(
         "Renamed to \"{new_name}\". Click Refresh in a moment to confirm re-registration."
     ))
+}
+
+/// Clean a StyleWriter's ink cartridge, or super clean it, as a job with no
+/// pages over its print socket. The original StyleWriter refuses.
+async fn clean_stylewriter(ddp: &DdpHandle, addr: AdspAddress, super_clean: bool) -> anyhow::Result<String> {
+    let give_up = tokio::time::Instant::now() + SW_SESSION_TIMEOUT;
+    let mut session = StyleWriterSession::connect(ddp, addr, "TailTalk", Some(give_up)).await?;
+    let family = match session.query_info().await {
+        Ok(info) => info.family().ok_or_else(|| anyhow::anyhow!("'{}' is no StyleWriter", info.identity)),
+        Err(e) => Err(e),
+    };
+    let family = match family {
+        Ok(family) => family,
+        Err(e) => {
+            let _ = session.abort().await;
+            return Err(e);
+        }
+    };
+    let cleaning = if super_clean { Cleaning::SuperClean } else { Cleaning::Clean };
+    session.clean_cartridge(family, cleaning).await?;
+    Ok(if super_clean { "Super cleaned the ink cartridge." } else { "Cleaned the ink cartridge." }.to_string())
 }
 
 /// Rename an ImageWriter by sending the option card's `ESC b` command over PAP.
@@ -1034,6 +1104,7 @@ async fn query_laserwriter(ddp: &DdpHandle, addr: AtpAddress) -> anyhow::Result<
             startup_enabled: by_label("Startup page") == "true",
             printer_name: by_label("Printer name").to_string(),
         })),
+        can_clean: false,
     })
 }
 
@@ -1179,6 +1250,7 @@ pub fn open(
             if let Some(w) = weak.upgrade() {
                 w.set_selected(-1);
                 w.set_detail_loaded(false);
+                w.set_can_clean(false);
                 clear_ping_results(&w);
             }
             let weak = weak.clone();
@@ -1266,6 +1338,7 @@ pub fn open(
             // and startup flag if this query fails, and write those to this
             // printer's NVRAM.
             w.set_detail_loaded(false);
+            w.set_can_clean(false);
             w.set_error_text("".into());
             w.set_edit_name(device.name.as_str().into());
             w.set_name_max(device.kind.max_name_len() as i32);
@@ -1276,11 +1349,12 @@ pub fn open(
             // dump, or an ADSP session - is not repeated on every click.
             // `Some(None)` is a device that was queried and reported no
             // settings, which is not the same as one never queried at all.
-            let cached = cache.lock().unwrap().queries.get(&idx).map(|q| q.settings.clone());
-            if let Some(settings) = cached {
+            let cached = cache.lock().unwrap().queries.get(&idx).map(|q| (q.settings.clone(), q.can_clean));
+            if let Some((settings, can_clean)) = cached {
                 // Settings first: a LaserWriter's own name can differ from the
                 // one it registered, and renaming the row feeds the panel.
                 apply_settings(&w, &discovered, idx, settings.as_ref());
+                w.set_can_clean(can_clean);
                 render_panel(&w, &discovered, &cache, idx);
                 w.set_detail_loaded(true);
                 w.set_busy(false);
@@ -1309,9 +1383,11 @@ pub fn open(
                     }
                     DeviceKind::LaserWriter => query_laserwriter(&ddp, device.atp_addr()).await,
                     DeviceKind::ImageWriter => query_imagewriter(&ddp, device.atp_addr()).await,
-                    DeviceKind::InkTalk => query_inktalk(&ddp, device.adsp_print_addr()).await,
+                    DeviceKind::InkTalk => {
+                        query_inktalk(&ddp, device.adsp_print_addr(), device.printer_socket.is_some()).await
+                    }
                     // Nothing beyond the registration and the latency reading.
-                    DeviceKind::Generic => Ok(Queried { lines: Vec::new(), settings: None }),
+                    DeviceKind::Generic => Ok(Queried { lines: Vec::new(), settings: None, can_clean: false }),
                 };
 
                 slint::invoke_from_event_loop(move || {
@@ -1322,6 +1398,7 @@ pub fn open(
                     match result {
                         Ok(q) => {
                             let settings = q.settings.clone();
+                            w.set_can_clean(q.can_clean);
                             cache.lock().unwrap().queries.insert(idx, q);
                             apply_settings(&w, &discovered, idx, settings.as_ref());
                             render_panel(&w, &discovered, &cache, idx);
@@ -1456,6 +1533,38 @@ pub fn open(
         });
     }
 
+    // ── Clean the ink cartridge (StyleWriter, InkTalk emulating one) ─────────
+    {
+        let rt = rt.clone();
+        let handles = handles.clone();
+        let weak = window.as_weak();
+        let discovered = discovered.clone();
+        window.on_clean_cartridge(move |index, super_clean| {
+            let Some(addr) = discovered.lock().unwrap().get(index as usize).and_then(Device::stylewriter_addr) else {
+                return;
+            };
+            let Some(ddp) = handles.lock().unwrap().as_ref().map(|h| h.ddp.clone()) else {
+                set_status(&weak, "The AFP server is no longer running.");
+                return;
+            };
+            begin_busy(&weak, if super_clean { "Super cleaning the ink cartridge…" } else { "Cleaning the ink cartridge…" });
+            let weak = weak.clone();
+            rt.spawn(async move {
+                let result = clean_stylewriter(&ddp, addr, super_clean).await;
+                slint::invoke_from_event_loop(move || {
+                    let Some(w) = weak.upgrade() else { return };
+                    w.set_busy(false);
+                    let status = match result {
+                        Ok(msg) => msg,
+                        Err(e) => format!("Cleaning failed: {e:#}"),
+                    };
+                    w.set_status_text(status.into());
+                })
+                .ok();
+            });
+        });
+    }
+
     // ── Save (kind-dependent) ────────────────────────────────────────────────
     {
         let rt = rt.clone();
@@ -1480,7 +1589,7 @@ pub fn open(
             match device.kind {
                 DeviceKind::StyleWriter => {
                     rt.spawn(async move {
-                        let result = rename_stylewriter(&ddp, device.adsp_mgmt_addr(), &name).await;
+                        let result = rename_stylewriter(&ddp, device.adsp_print_addr(), &name).await;
                         finish_save(weak, cache, index, result, false);
                     });
                 }

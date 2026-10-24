@@ -29,7 +29,8 @@ use tailtalk::{
     nbp::NbpHandle,
     pap::PapClient,
     stylewriter::{
-        PrintQuality, PrinterBusy, StyleWriterFamily, StyleWriterSession, encode_page_batches,
+        Cleaning, Halftone, Imager, JobOptions, Page, PaperType, Pixels, PrintQuality, PrinterBusy,
+        QUEUE_POLL_INTERVAL, Rendering, StyleWriterFamily, StyleWriterSession, encode_band,
     },
 };
 use tailtalk_packets::nbp::{EntityName, ServiceAddress};
@@ -86,10 +87,10 @@ fn media_dimensions_hmm(name: &str) -> Option<(i32, i32)> {
     MEDIA_DIMENSIONS_HMM.iter().find(|(n, _, _)| *n == name).map(|&(_, w, h)| (w, h))
 }
 
-/// The StyleWriter carriage/feed path's design width: 8.5in (215.9mm), the US
-/// Letter width `lpstyl`, this bridge's margins, and Apple's own PPD all
-/// assume. Nothing wider physically clears the print head regardless of what
-/// gets added to STANDARD_MEDIA/STYLEWRITER_EXTRA_MEDIA later.
+/// The StyleWriter carriage and feed path's design width, which is 8.5in
+/// (215.9mm), US Letter. Nothing wider physically clears the print head
+/// regardless of what gets added to STANDARD_MEDIA/STYLEWRITER_EXTRA_MEDIA
+/// later.
 const SW_MAX_PAPER_WIDTH_HMM: i32 = 21590;
 
 fn fits_stylewriter_carriage(name: &str) -> bool {
@@ -106,25 +107,61 @@ fn media_size_collection(w: i32, h: i32) -> Option<IppValue> {
     Some(IppValue::Collection(BTreeMap::from([(x, IppValue::Integer(w)), (y, IppValue::Integer(h))])))
 }
 
-/// StyleWriter margins for a given paper width, in hundredths of a mm
-/// (left, right, top, bottom). Left/top/bottom mirror the fixed crop
-/// constants `sw_printable_rows`/`ppm_page_to_planar` already use; right
-/// varies with paper width because the print head only covers the family's
-/// print width in dots; letter-width paper leaves an unprinted strip on the
-/// right, narrower paper (e.g. the photo/index sizes) does not.
+/// StyleWriter margins for a given paper width, in hundredths of a mm (left,
+/// right, top, bottom). These are the family's own, as `sw_printable_rows` and
+/// the page croppers apply them. The right margin grows with paper wide enough
+/// to outreach the print head.
 fn stylewriter_margins_hmm(width_hmm: i32, family: StyleWriterFamily) -> (i32, i32, i32, i32) {
-    let px_to_hmm = |px: i32| (px as f64 / SW_DPI as f64 * 2540.0).round() as i32;
-    let hmm_to_px = |hmm: i32| (hmm as f64 / 2540.0 * SW_DPI as f64).round() as i32;
-    let left_px = family.left_margin_px() as i32;
-    let print_w_px = (hmm_to_px(width_hmm) - left_px).clamp(0, family.print_width() as i32);
-    let right_px = (hmm_to_px(width_hmm) - left_px - print_w_px).max(0);
+    let px_to_hmm = |px: usize| (px as f64 / SW_DPI as f64 * 2540.0).round() as i32;
+    let paper_px = (width_hmm.max(0) as f64 / 2540.0 * SW_DPI as f64).round() as usize;
+    let left_px = family.left_margin_px();
+    let right_px = paper_px.saturating_sub(left_px + family.printable_width(paper_px));
     (
         px_to_hmm(left_px),
         px_to_hmm(right_px),
-        px_to_hmm(SW_TOP_MARGIN_ROWS as i32),
-        // sw_printable_rows excludes SW_BOTTOM_MARGIN_ROWS + 1 rows, not just SW_BOTTOM_MARGIN_ROWS.
-        px_to_hmm(SW_BOTTOM_MARGIN_ROWS as i32 + 1),
+        px_to_hmm(family.top_margin_rows()),
+        px_to_hmm(family.bottom_margin_rows()),
     )
+}
+
+/// The paper types a StyleWriter job can ask for, as IPP `media-type`
+/// keywords (PWG 5101.1).
+const STYLEWRITER_MEDIA_TYPES: &[&str] =
+    &["stationery", "stationery-coated", "transparency", "back-print-film", "photographic-glossy"];
+
+/// The StyleWriter paper type for an IPP `media-type` keyword.
+fn stylewriter_paper(media_type: &str) -> PaperType {
+    match media_type {
+        "stationery-coated" | "stationery-inkjet" | "photographic-matte" => PaperType::Coated,
+        "transparency" => PaperType::Transparency,
+        "back-print-film" => PaperType::BackPrintFilm,
+        "photographic" | "photographic-glossy" | "photographic-high-gloss" | "photographic-semi-gloss" => {
+            PaperType::Glossy
+        }
+        _ => PaperType::Plain,
+    }
+}
+
+/// The halftone for an IPP `print-content-optimize` keyword. Text and graphics
+/// get the pattern, where diffusion's grain would show in flat color, and
+/// photos and anything else get diffusion.
+fn stylewriter_halftone(optimize: Option<&str>) -> Halftone {
+    match optimize {
+        Some("text" | "graphics" | "text-and-graphics") => Halftone::Pattern,
+        _ => Halftone::Diffusion,
+    }
+}
+
+/// How a StyleWriter job renders for an IPP `print-color-mode`. `bi-level`
+/// prints in black and white, `monochrome` in grayscale, and anything else in
+/// color on a printer that can print it.
+fn stylewriter_rendering(color_mode: Option<&str>, color_capable: bool) -> Rendering {
+    match color_mode {
+        Some("bi-level" | "auto-monochrome-bi-level") => Rendering::BlackAndWhite,
+        Some("monochrome" | "auto-monochrome") => Rendering::Grayscale,
+        _ if color_capable => Rendering::Color,
+        _ => Rendering::Grayscale,
+    }
 }
 
 /// ImageWriter margins for a given paper width, in hundredths of a mm
@@ -187,8 +224,9 @@ struct JobRecord {
 enum PrinterKind {
     /// PostScript printer driven over PAP (NBP type "LaserWriter").
     LaserWriter,
-    /// Color StyleWriter behind an EtherTalk adapter, driven over ADSP
-    /// (NBP type "ColorStyleWriter2400AT").
+    /// StyleWriter behind an AppleTalk adapter, driven over ADSP. NBP type
+    /// "ColorStyleWriter2400AT" for a Color StyleWriter 2200, 2400 or 2500,
+    /// "StyleWriter1200AT" for the printers the Color SW 1500 driver drives.
     StyleWriter,
     /// Apple ImageWriter II driven over PAP (NBP type "ImageWriter"). No
     /// PostScript interpreter, so every job is rasterized by Ghostscript rather
@@ -196,13 +234,16 @@ enum PrinterKind {
     ImageWriter,
 }
 
-/// StyleWriters print at a fixed 360 dpi.
+/// StyleWriters print at a fixed 360 dpi. Each family has its own margins,
+/// given by [`StyleWriterFamily::top_margin_rows`] and the rest.
 const SW_DPI: u32 = 360;
-/// Top and bottom printable-area margins at 360 dpi (lpstyl
-/// `printerSetup()`), the same for every family. The left margin is not:
-/// see [`StyleWriterFamily::left_margin_px`].
-const SW_TOP_MARGIN_ROWS: usize = 90;
-const SW_BOTTOM_MARGIN_ROWS: usize = 90;
+
+/// How long a short StyleWriter session, to ask about the printer or clean
+/// its cartridge, waits for the adapter to take it.
+const SW_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long a print job waits in the adapter's queue before it is withdrawn.
+const SW_QUEUE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// Ghostscript's `iwhi`/`iwhic` devices (ImageWriter II) are 160x144 dpi; report the
 /// lower (vertical) figure for `printer-resolution-*` since IPP wants one
@@ -519,9 +560,10 @@ async fn discover(
     active: &Arc<ActivePrinters>,
 ) {
     // (kind, NBP type pattern) for each supported printer family.
-    let lookups: [(PrinterKind, &str); 3] = [
+    let lookups: [(PrinterKind, &str); 4] = [
         (PrinterKind::LaserWriter, "=:LaserWriter@*"),
         (PrinterKind::StyleWriter, "=:ColorStyleWriter2400AT@*"),
+        (PrinterKind::StyleWriter, "=:StyleWriter1200AT@*"),
         (PrinterKind::ImageWriter, "=:ImageWriter@*"),
     ];
 
@@ -537,7 +579,7 @@ async fn discover(
     // If the lookup errors, keep the existing registrations rather than
     // pruning them on a transient failure.
     let mut lookup_ok: Vec<PrinterKind> = Vec::new();
-    // Both name patterns go out as one concurrent batch, sharing a single
+    // Every name pattern goes out in one concurrent batch, sharing a single
     // NBP reply-collection window.
     let names: Vec<EntityName> = entities.iter().map(|(_, e)| e.clone()).collect();
     match nbp.lookup_many(names).await {
@@ -610,15 +652,17 @@ async fn discover(
             PrinterKind::StyleWriter => {
                 match query_stylewriter_caps(ddp, addr.into()).await {
                     Ok(caps) => caps,
+                    // Someone is printing, or the printer is off or not
+                    // answering, so retry on the next discovery cycle. Each
+                    // StyleWriter series takes its own commands and page
+                    // geometry, so there are no caps to guess with.
                     Err(e) if e.downcast_ref::<PrinterBusy>().is_some() => {
-                        // Someone is printing; retry on the next discovery
-                        // cycle rather than registering with guessed caps.
                         tracing::info!("IPP bridge: StyleWriter '{name}' is busy, deferring registration");
                         continue;
                     }
                     Err(e) => {
-                        tracing::warn!("IPP bridge: StyleWriter caps query for '{name}' failed ({e}), using defaults");
-                        default_stylewriter_caps()
+                        tracing::warn!("IPP bridge: StyleWriter caps query for '{name}' failed ({e}), deferring registration");
+                        continue;
                     }
                 }
             }
@@ -687,21 +731,6 @@ async fn discover(
 
 }
 
-/// Fallback caps when a StyleWriter is discovered but its info query fails.
-/// Assume a Color StyleWriter of unknown model: a color job on a black
-/// cartridge is refused cleanly at setup time ('H' check), whereas
-/// advertising mono-only would permanently hide a working color printer.
-fn default_stylewriter_caps() -> PrinterCaps {
-    PrinterCaps {
-        dpi: SW_DPI,
-        color: true,
-        model: "Apple Color StyleWriter".to_string(),
-        media_default: "na_letter_8.5x11in".to_string(),
-        tray_sources: vec!["main".into()],
-        sw_family: StyleWriterFamily::default(),
-    }
-}
-
 /// Fallback caps when an ImageWriter is discovered but its status query fails.
 /// Assume mono: a black ribbon is the common case, and printing a colour job
 /// through the colour Ghostscript device onto a black ribbon wastes a page,
@@ -750,10 +779,14 @@ async fn query_imagewriter_caps(ddp: &DdpHandle, addr: AtpAddress) -> anyhow::Re
 /// ADSP session (no page is fed). Propagates [`PrinterBusy`] so the caller
 /// can defer registration instead of guessing.
 async fn query_stylewriter_caps(ddp: &DdpHandle, addr: AdspAddress) -> anyhow::Result<PrinterCaps> {
-    let mut session = StyleWriterSession::connect(ddp, addr, "TailTalk").await?;
+    let give_up = tokio::time::Instant::now() + SW_QUERY_TIMEOUT;
+    let mut session = StyleWriterSession::connect(ddp, addr, "TailTalk", Some(give_up)).await?;
     let info = session.query_info().await;
     let _ = session.abort().await;
     let info = info?;
+    let sw_family = info
+        .family()
+        .ok_or_else(|| anyhow::anyhow!("the printer identifies as '{}', which is no StyleWriter", info.identity))?;
 
     tracing::info!(
         "IPP bridge: StyleWriter identity '{}' submodel {:?} cartridge={}",
@@ -766,8 +799,9 @@ async fn query_stylewriter_caps(ddp: &DdpHandle, addr: AdspAddress) -> anyhow::R
         dpi: SW_DPI,
         color: info.color_capable(),
         model: info.model_name().to_string(),
-        sw_family: info.family(),
-        ..default_stylewriter_caps()
+        media_default: "na_letter_8.5x11in".to_string(),
+        tray_sources: vec!["main".into()],
+        sw_family,
     })
 }
 
@@ -1156,24 +1190,25 @@ async fn handle_ipp(
                     });
                 }
                 PrinterKind::StyleWriter => {
-                    // Mono jobs take the K-only path even on a color cartridge:
-                    // true black beats CMY-composite gray and saves the color inks.
-                    let color = printer.caps.color
-                        && job_color_mode(&parsed).as_deref() != Some("monochrome");
+                    let rendering = stylewriter_rendering(job_color_mode(&parsed).as_deref(), printer.caps.color);
                     let quality = match job_print_quality(&parsed) {
+                        Some(3) => PrintQuality::Draft,
                         Some(5) => PrintQuality::Best,
                         _ => PrintQuality::Normal,
                     };
+                    let paper = job_media_type(&parsed).map_or(PaperType::Plain, |t| stylewriter_paper(&t));
+                    let halftone = stylewriter_halftone(job_content_optimize(&parsed).as_deref());
+                    let (media_width_pt, _) = job_media_pts(&parsed, &printer.caps.media_default);
+                    let narrow_paper = media_width_pt < JobOptions::NARROW_PAPER_WIDTH_IN * 72.0;
+                    let options =
+                        JobOptions { rendering, quality, paper, cleaning: Cleaning::None, halftone, narrow_paper };
                     let username = job_user_name(&parsed)
                         .unwrap_or_else(|| "TailTalk".to_string());
                     let addr = printer.adsp_addr();
                     let family = printer.caps.sw_family;
-                    tracing::info!(
-                        "IPP: StyleWriter job {job_id}: {family:?} color={color} quality={quality:?} user={username}"
-                    );
+                    tracing::info!("IPP: StyleWriter job {job_id}: {family:?} {options:?} user={username}");
                     tokio::spawn(run_stylewriter_job(
-                        job, ddp, addr, doc, fmt, color, family, quality, username, job_lock, job_id,
-                        active_guard,
+                        job, ddp, addr, doc, fmt, family, options, username, job_lock, job_id, active_guard,
                     ));
                 }
                 PrinterKind::ImageWriter => {
@@ -1358,19 +1393,20 @@ fn printer_attributes(printer: &Printer, req_id: u32) -> axum::response::Respons
     // ribbon, really is monochrome-only; the LaserWriter path always accepts
     // color input (ghostscript converts).
     let color_modes: &[&str] = match printer.kind {
-        PrinterKind::StyleWriter | PrinterKind::ImageWriter if !caps.color => &["monochrome"],
+        PrinterKind::StyleWriter if !caps.color => &["monochrome", "bi-level"],
+        PrinterKind::StyleWriter => &["auto", "color", "monochrome", "bi-level"],
+        PrinterKind::ImageWriter if !caps.color => &["monochrome"],
         _ => &["auto", "color", "monochrome"],
     };
     let color_mode_default = match printer.kind {
         PrinterKind::StyleWriter | PrinterKind::ImageWriter if caps.color => "auto",
         _ => "monochrome",
     };
-    // StyleWriter quality maps to the printer's own mode string (normal/best);
-    // draft has no known string, so it isn't offered there. `iwhi` doesn't
-    // distinguish quality tiers at all, so ImageWriter only offers Normal.
+    // StyleWriter quality maps to the printer's own quality command
+    // (draft/normal/best). `iwhi` doesn't distinguish quality tiers at all,
+    // so ImageWriter only offers Normal.
     let qualities: &[i32] = match printer.kind {
-        PrinterKind::LaserWriter => &[3, 4, 5],
-        PrinterKind::StyleWriter => &[4, 5],
+        PrinterKind::LaserWriter | PrinterKind::StyleWriter => &[3, 4, 5],
         PrinterKind::ImageWriter => &[4],
     };
 
@@ -1551,6 +1587,26 @@ fn printer_attributes(printer: &Printer, req_id: u32) -> axum::response::Respons
     if let Ok(k) = color_mode_default.try_into() {
         add("print-color-mode-default", IppValue::Keyword(k));
     }
+    // A StyleWriter is told the paper type, and halftones color for photos or
+    // for text and graphics.
+    if printer.kind == PrinterKind::StyleWriter {
+        let keywords = |names: &[&str]| -> IppValue {
+            IppValue::Array(
+                names.iter().copied().filter_map(|k| k.try_into().ok()).map(IppValue::Keyword).collect(),
+            )
+        };
+        add("media-type-supported", keywords(STYLEWRITER_MEDIA_TYPES));
+        if let Ok(k) = "stationery".try_into() {
+            add("media-type-default", IppValue::Keyword(k));
+        }
+        add(
+            "print-content-optimize-supported",
+            keywords(&["auto", "photo", "graphics", "text", "text-and-graphics"]),
+        );
+        if let Ok(k) = "auto".try_into() {
+            add("print-content-optimize-default", IppValue::Keyword(k));
+        }
+    }
 
     add("printer-is-accepting-jobs", IppValue::Boolean(true));
     add("queued-job-count", IppValue::Integer(0));
@@ -1672,6 +1728,37 @@ fn job_color_mode(parsed: &IppRequestResponse) -> Option<String> {
     None
 }
 
+/// Extract the paper type from `media-type`, or from the `media-type` member of
+/// `media-col`.
+fn job_media_type(parsed: &IppRequestResponse) -> Option<String> {
+    let group = parsed.attributes().groups_of(DelimiterTag::JobAttributes).next()?;
+    let keyword = |v: &IppValue| match v {
+        IppValue::Keyword(k) => Some(k.as_str().to_string()),
+        IppValue::NameWithoutLanguage(n) => Some(n.as_str().to_string()),
+        _ => None,
+    };
+    if let Some(t) = group.attributes().get("media-type").and_then(|a| keyword(a.value())) {
+        return Some(t);
+    }
+    match group.attributes().get("media-col")?.value() {
+        IppValue::Collection(members) => {
+            members.iter().find(|(k, _)| k.as_str() == "media-type").and_then(|(_, v)| keyword(v))
+        }
+        _ => None,
+    }
+}
+
+fn job_content_optimize(parsed: &IppRequestResponse) -> Option<String> {
+    parsed.attributes()
+        .groups_of(DelimiterTag::JobAttributes)
+        .next()
+        .and_then(|g| g.attributes().get("print-content-optimize"))
+        .and_then(|a| match a.value() {
+            IppValue::Keyword(k) => Some(k.as_str().to_string()),
+            _ => None,
+        })
+}
+
 /// Extract the `print-quality` job attribute (3=draft, 4=normal, 5=high).
 fn job_print_quality(parsed: &IppRequestResponse) -> Option<i32> {
     parsed.attributes()
@@ -1685,7 +1772,7 @@ fn job_print_quality(parsed: &IppRequestResponse) -> Option<i32> {
 }
 
 /// Extract `requesting-user-name` (sent to the StyleWriter in its
-/// print-request handshake, where the real Mac driver sends the chooser name).
+/// print-request handshake, where a Mac sends its Chooser name).
 fn job_user_name(parsed: &IppRequestResponse) -> Option<String> {
     parsed.attributes()
         .groups_of(DelimiterTag::OperationAttributes)
@@ -2017,144 +2104,135 @@ fn imagewriter_gs_args(media_pts: (f32, f32)) -> Vec<String> {
     ]
 }
 
-/// One page of raw planar StyleWriter scanlines: rows → planes (1 for mono,
-/// C/M/Y/K for color) → plane bytes (1 bit per pixel, MSB first, 1 = ink).
-type PlanarPage = Vec<Vec<Vec<u8>>>;
-
-/// Rasterize a document for the StyleWriter at 360 dpi and crop each page
-/// to the family's printable window (lpstyl's margins).
+/// Rasterize a document for the StyleWriter at 360 dpi, in the depth the job
+/// renders in, and crop each page to the family's printable window.
 async fn rasterize_for_stylewriter(
     data: Vec<u8>,
     fmt: &str,
-    color: bool,
     family: StyleWriterFamily,
+    rendering: Rendering,
     job_token: u32,
-) -> anyhow::Result<Vec<PlanarPage>> {
-    let device = if color { "ppmraw" } else { "pbmraw" };
+) -> anyhow::Result<Vec<Page>> {
+    let device = match rendering {
+        Rendering::Color => "ppmraw",
+        Rendering::Grayscale => "pgmraw",
+        Rendering::BlackAndWhite => "pbmraw",
+    };
     let raster = gs_raster(data, fmt, device, SW_DPI, job_token).await?;
-    let pages: Vec<PlanarPage> = if color {
-        parse_ppm_pages(&raster)?
+    let pages: Vec<Page> = match rendering {
+        Rendering::Color => parse_ppm_pages(&raster)?
             .into_iter()
-            .map(|(w, h, rgb)| ppm_page_to_planar(w, h, &rgb, family))
-            .collect()
-    } else {
-        parse_pbm_pages(&raster)?
+            .map(|(w, h, rgb)| crop_bytes_page(w, h, &rgb, 3, family))
+            .collect(),
+        Rendering::Grayscale => parse_pgm_pages(&raster)?
             .into_iter()
-            .map(|(w, h, bits)| pbm_page_to_planar(w, h, &bits, family))
-            .collect()
+            .map(|(w, h, gray)| crop_bytes_page(w, h, &gray, 1, family))
+            .collect(),
+        Rendering::BlackAndWhite => parse_pbm_pages(&raster)?
+            .into_iter()
+            .map(|(w, h, bits)| crop_pbm_page(w, h, &bits, family))
+            .collect(),
     };
     anyhow::ensure!(!pages.is_empty(), "gs produced no pages");
     Ok(pages)
 }
 
-/// Number of printable rows for a page of `h` rows: skip the top margin and
-/// stop above the bottom margin (lpstyl: PRINT_HEIGHT = height - (TOP +
-/// BOTTOM + 1)). Returns the top offset and one-past-the-end row.
-fn sw_printable_rows(h: usize) -> (usize, usize) {
-    let top = SW_TOP_MARGIN_ROWS.min(h);
-    let bottom = h.saturating_sub(SW_BOTTOM_MARGIN_ROWS + 1).max(top);
+/// The printable rows of a page `h` rows tall, below the family's top margin
+/// and above its bottom margin. Returns the top row and one past the last.
+fn sw_printable_rows(h: usize, family: StyleWriterFamily) -> (usize, usize) {
+    let top = family.top_margin_rows().min(h);
+    let bottom = h.saturating_sub(family.bottom_margin_rows()).max(top);
     (top, bottom)
 }
 
-/// Crop a full-page 360 dpi PBM raster to the printable window, returning
-/// per-row single-plane scanlines. PBM bit 1 = black = deposit ink, which is
-/// exactly the K-plane sense — no inversion needed.
-fn pbm_page_to_planar(w: u32, h: u32, bits: &[u8], family: StyleWriterFamily) -> PlanarPage {
-    let row_bytes = (w as usize).div_ceil(8);
+/// Crop a full-page 360 dpi PBM raster to the printable window. PBM bit 1 is
+/// black, as a black and white page has it. Pixels past the printable width
+/// are cleared.
+fn crop_pbm_page(w: u32, h: u32, bits: &[u8], family: StyleWriterFamily) -> Page {
+    let w = w as usize;
+    let row_bytes = w.div_ceil(8);
     let left_bytes = family.left_margin_px() / 8; // byte-aligned for every family
-    let take = family.print_rowbytes().min(row_bytes.saturating_sub(left_bytes));
-    let (top, bottom) = sw_printable_rows(h as usize);
-    let mut rows = Vec::with_capacity(bottom - top);
+    let print_w = family.printable_width(w);
+    let take = print_w.div_ceil(8);
+    let (top, bottom) = sw_printable_rows(h as usize, family);
+    let mut out = Vec::with_capacity(take * (bottom - top));
     for y in top..bottom {
         let start = y * row_bytes + left_bytes;
-        rows.push(vec![bits[start..start + take].to_vec()]);
+        let mut row = bits[start..start + take].to_vec();
+        if !print_w.is_multiple_of(8)
+            && let Some(last) = row.last_mut()
+        {
+            *last &= 0xFF << (8 - print_w % 8);
+        }
+        out.extend_from_slice(&row);
     }
-    rows
+    Page { width: print_w, height: bottom - top, pixels: Pixels::BlackAndWhite(out) }
 }
 
-/// Crop a full-page 360 dpi RGB raster to the printable window and
-/// Floyd–Steinberg dither it into C/M/Y 1-bit planes.
-///
-/// The K plane stays empty: with a color cartridge the printer deposits no
-/// ink for the K plane at all, so black must be composited from C+M+Y
-/// (undercolor removal 0 — see to_bitcmyk.py, verified on a real SW2200
-/// where UCR-moved black simply vanished from the page).
-fn ppm_page_to_planar(w: u32, h: u32, rgb: &[u8], family: StyleWriterFamily) -> PlanarPage {
+/// Crop a full-page 360 dpi raster of `channels` bytes a pixel (3 for RGB,
+/// 1 for gray) to the printable window.
+fn crop_bytes_page(w: u32, h: u32, pixels: &[u8], channels: usize, family: StyleWriterFamily) -> Page {
     let (w, h) = (w as usize, h as usize);
     let left = family.left_margin_px().min(w);
-    let print_w = (w - left).min(family.print_width());
-    let (top, bottom) = sw_printable_rows(h);
-    let plane_bytes = print_w.div_ceil(8).max(1);
-
-    // Floyd–Steinberg error buffers for the C/M/Y channels, padded one
-    // pixel each side so diffusion needs no bounds checks.
-    let mut err_cur = vec![[0.0f32; 3]; print_w + 2];
-    let mut err_next = vec![[0.0f32; 3]; print_w + 2];
-
-    let mut rows = Vec::with_capacity(bottom - top);
+    let print_w = family.printable_width(w);
+    let (top, bottom) = sw_printable_rows(h, family);
+    let mut out = Vec::with_capacity(print_w * channels * (bottom - top));
     for y in top..bottom {
-        let mut planes = vec![vec![0u8; plane_bytes]; 4];
-        for x in 0..print_w {
-            let px = (y * w + left + x) * 3;
-            for ch in 0..3 {
-                // RGB → CMY: ink = 255 - value (R→C, G→M, B→Y).
-                let want = (255 - rgb[px + ch]) as f32 + err_cur[x + 1][ch];
-                let on = want >= 127.5;
-                if on {
-                    planes[ch][x / 8] |= 0x80 >> (x % 8);
-                }
-                let e = want - if on { 255.0 } else { 0.0 };
-                err_cur[x + 2][ch] += e * (7.0 / 16.0);
-                err_next[x][ch] += e * (3.0 / 16.0);
-                err_next[x + 1][ch] += e * (5.0 / 16.0);
-                err_next[x + 2][ch] += e * (1.0 / 16.0);
-            }
-        }
-        rows.push(planes);
-        std::mem::swap(&mut err_cur, &mut err_next);
-        for e in err_next.iter_mut() {
-            *e = [0.0; 3];
-        }
+        let start = (y * w + left) * channels;
+        out.extend_from_slice(&pixels[start..start + print_w * channels]);
     }
-    rows
+    let pixels = if channels == 3 { Pixels::Rgb(out) } else { Pixels::Gray(out) };
+    Page { width: print_w, height: bottom - top, pixels }
 }
 
-/// Connect to a StyleWriter, retrying while it reports busy — another host
-/// may hold the print connection, or it may still be ejecting the previous
-/// page of this very job.
+/// Connect to a StyleWriter, retrying while it reports busy. Another host may
+/// hold the print connection, or its queue may be full.
 async fn connect_stylewriter(ddp: &DdpHandle, addr: AdspAddress, username: &str) -> anyhow::Result<StyleWriterSession> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     loop {
-        match StyleWriterSession::connect(ddp, addr, username).await {
+        let give_up = tokio::time::Instant::now() + SW_QUEUE_TIMEOUT;
+        match StyleWriterSession::connect(ddp, addr, username, Some(give_up)).await {
             Err(e) if e.downcast_ref::<PrinterBusy>().is_some()
                 && tokio::time::Instant::now() < deadline =>
             {
-                tracing::debug!("IPP: StyleWriter busy, retrying in 5s");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tracing::debug!("IPP: StyleWriter busy, retrying in {}s", QUEUE_POLL_INTERVAL.as_secs());
+                tokio::time::sleep(QUEUE_POLL_INTERVAL).await;
             }
             other => return other,
         }
     }
 }
 
-/// Print one page over a fresh ADSP session (connect → setup → bands →
-/// finish); on failure the abort path ejects any loaded page and resets the
-/// printer so the paper path isn't left wedged.
-async fn print_stylewriter_page(
+/// Print every page of a job over one ADSP session (connect, set up, then
+/// each page's start, bands and end, then finish), counting pages done in
+/// the job record. On failure the abort path ejects any loaded page and
+/// resets the printer so the paper path isn't left wedged. Each page is
+/// imaged as it prints, in what the printer's cartridge lets the job render.
+async fn print_stylewriter_job(
+    job: &Arc<Mutex<JobRecord>>,
     ddp: &DdpHandle,
     addr: AdspAddress,
-    rows: &PlanarPage,
-    color: bool,
+    pages: &[Page],
     family: StyleWriterFamily,
-    quality: PrintQuality,
+    options: JobOptions,
     username: &str,
 ) -> anyhow::Result<()> {
-    let batches = encode_page_batches(rows, !color, family);
     let mut session = connect_stylewriter(ddp, addr, username).await?;
     let result: anyhow::Result<()> = async {
-        session.setup(family, color, quality).await?;
-        for batch in &batches {
-            session.write_batch(batch.top, batch.bottom, &batch.data, color).await?;
+        session.setup(family, options).await?;
+        let mut imager = Imager::new(family, &JobOptions { rendering: session.rendering(), ..options });
+        for (i, page) in pages.iter().enumerate() {
+            job.lock().await.state_message = format!("Printing page {} of {}", i + 1, pages.len());
+            let printed: anyhow::Result<()> = async {
+                session.start_page().await?;
+                for band in imager.bands(page) {
+                    session.write_band(&encode_band(&band, family)).await?;
+                }
+                session.end_page().await
+            }
+            .await;
+            printed.map_err(|e| e.context(format!("page {}", i + 1)))?;
+            job.lock().await.impressions_completed = (i + 1) as i32;
         }
         Ok(())
     }
@@ -2168,8 +2246,8 @@ async fn print_stylewriter_page(
     }
 }
 
-/// Full StyleWriter job pipeline: rasterize + dither, queue behind any job
-/// already printing (per-printer lock), then print page by page.
+/// Full StyleWriter job pipeline. Rasterize, queue behind any job already
+/// printing (per-printer lock), then print it.
 #[allow(clippy::too_many_arguments)]
 async fn run_stylewriter_job(
     job: Arc<Mutex<JobRecord>>,
@@ -2177,9 +2255,8 @@ async fn run_stylewriter_job(
     addr: AdspAddress,
     doc: Vec<u8>,
     fmt: String,
-    color: bool,
     family: StyleWriterFamily,
-    quality: PrintQuality,
+    options: JobOptions,
     username: String,
     job_lock: Arc<Mutex<()>>,
     job_id: u32,
@@ -2187,7 +2264,7 @@ async fn run_stylewriter_job(
     _active_guard: PrintingGuard,
 ) {
     job.lock().await.state_message = "Rasterizing".to_string();
-    let pages = match rasterize_for_stylewriter(doc, &fmt, color, family, job_id).await {
+    let pages = match rasterize_for_stylewriter(doc, &fmt, family, options.rendering, job_id).await {
         Ok(p) => p,
         Err(e) => {
             tracing::error!("IPP: StyleWriter job {job_id} rasterize failed: {e}");
@@ -2201,16 +2278,12 @@ async fn run_stylewriter_job(
 
     job.lock().await.state_message = "Waiting for printer".to_string();
     let _guard = job_lock.lock().await;
-    for (i, rows) in pages.iter().enumerate() {
-        job.lock().await.state_message = format!("Printing page {} of {}", i + 1, pages.len());
-        if let Err(e) = print_stylewriter_page(&ddp, addr, rows, color, family, quality, &username).await {
-            tracing::error!("IPP: StyleWriter job {job_id} failed on page {}: {e:#}", i + 1);
-            let mut j = job.lock().await;
-            j.state = JobState::Aborted;
-            j.state_message = format!("Print failed on page {}: {e:#}", i + 1);
-            return;
-        }
-        job.lock().await.impressions_completed = (i + 1) as i32;
+    if let Err(e) = print_stylewriter_job(&job, &ddp, addr, &pages, family, options, &username).await {
+        tracing::error!("IPP: StyleWriter job {job_id} failed: {e:#}");
+        let mut j = job.lock().await;
+        j.state = JobState::Aborted;
+        j.state_message = format!("Print failed: {e:#}");
+        return;
     }
     let mut j = job.lock().await;
     j.state = JobState::Completed;
@@ -2241,6 +2314,22 @@ fn parse_ppm_pages(data: &[u8]) -> anyhow::Result<Vec<(u32, u32, Vec<u8>)>> {
     while pos < data.len() {
         let Some((w, h, header_len)) = parse_ppm_header(&data[pos..]) else { break };
         let page_bytes = w as usize * h as usize * 3;
+        let data_start = pos + header_len;
+        let data_end = data_start + page_bytes;
+        if data_end > data.len() { break; }
+        pages.push((w, h, data[data_start..data_end].to_vec()));
+        pos = data_end;
+    }
+    Ok(pages)
+}
+
+/// Parse one or more concatenated P5 (binary PGM, maxval 255) images from `data`.
+fn parse_pgm_pages(data: &[u8]) -> anyhow::Result<Vec<(u32, u32, Vec<u8>)>> {
+    let mut pages = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let Some((w, h, header_len)) = parse_pnm_header(&data[pos..], b'5', true) else { break };
+        let page_bytes = w as usize * h as usize;
         let data_start = pos + header_len;
         let data_end = data_start + page_bytes;
         if data_end > data.len() { break; }
@@ -2672,56 +2761,78 @@ mod tests {
 
     #[test]
     fn test_sw_printable_rows() {
-        // Letter at 360 dpi: 3960 rows → lpstyl's PRINT_HEIGHT = 3960 - 181.
-        let (top, bottom) = sw_printable_rows(3960);
-        assert_eq!(top, SW_TOP_MARGIN_ROWS);
-        assert_eq!(bottom - top, 3960 - 181);
+        // Letter at 360 dpi is 3960 rows. The 1200 series loses 72 at the top
+        // and 114 at the bottom, and the 2200's engine 45 and 99.
+        let original = StyleWriterFamily::Original;
+        let (top, bottom) = sw_printable_rows(3960, original);
+        assert_eq!((top, bottom - top), (72, 3960 - 186));
+        let (top, bottom) = sw_printable_rows(3960, SW2200);
+        assert_eq!((top, bottom - top), (45, 3960 - 144));
         // Degenerate tiny page must not underflow.
-        let (top, bottom) = sw_printable_rows(50);
+        let (top, bottom) = sw_printable_rows(50, SW2200);
         assert!(bottom >= top);
     }
 
     #[test]
-    fn test_pbm_page_to_planar_crop() {
-        // 2 printable rows on a page just tall enough to have them; row bytes
-        // beyond the left margin land at byte offset 9.
-        let w = 3060u32; // letter width at 360 dpi
-        let h = (SW_TOP_MARGIN_ROWS + SW_BOTTOM_MARGIN_ROWS + 3) as u32;
-        let row_bytes = (w as usize).div_ceil(8);
-        let mut bits = vec![0u8; row_bytes * h as usize];
-        let printable_row = SW_TOP_MARGIN_ROWS;
-        bits[printable_row * row_bytes + 9] = 0xAB;
-        let rows = pbm_page_to_planar(w, h, &bits, SW2200);
-        assert_eq!(rows.len(), 2); // h - (top + bottom + 1)
-        assert_eq!(rows[0].len(), 1); // single K plane
-        assert_eq!(rows[0][0].len(), 365);
-        assert_eq!(rows[0][0][0], 0xAB);
-        assert!(rows[1][0].iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn test_pbm_page_to_planar_crop_original_stylewriter() {
-        // lpstyl KIND_SW1 crops 12 bytes on the left (90 px rounded up) and
-        // prints 360 bytes per row.
+    fn stylewriter_pages_are_cropped_to_the_printable_area() {
+        // On a 2200, 2 printable rows on letter at 360 dpi. Row bytes beyond
+        // the left margin land at byte offset 9, and ink in the right margin,
+        // past the printable 2916 dots, is cleared.
         let w = 3060u32;
-        let h = (SW_TOP_MARGIN_ROWS + SW_BOTTOM_MARGIN_ROWS + 2) as u32;
         let row_bytes = (w as usize).div_ceil(8);
+        let h = (SW2200.top_margin_rows() + SW2200.bottom_margin_rows() + 2) as u32;
         let mut bits = vec![0u8; row_bytes * h as usize];
-        bits[SW_TOP_MARGIN_ROWS * row_bytes + 11] = 0xFF; // inside the margin
-        bits[SW_TOP_MARGIN_ROWS * row_bytes + 12] = 0xAB;
-        let rows = pbm_page_to_planar(w, h, &bits, StyleWriterFamily::Original);
-        assert_eq!(rows[0][0].len(), 360);
-        assert_eq!(rows[0][0][0], 0xAB);
+        let printable_row = SW2200.top_margin_rows();
+        bits[printable_row * row_bytes + 9] = 0xAB;
+        bits[printable_row * row_bytes + 9 + 364] = 0xFF;
+        let page = crop_pbm_page(w, h, &bits, SW2200);
+        assert_eq!((page.width, page.height), (2916, 2));
+        let Pixels::BlackAndWhite(rows) = page.pixels else { panic!("a black and white page") };
+        assert_eq!(rows.len(), 2 * 365);
+        assert_eq!(rows[0], 0xAB);
+        assert_eq!(rows[364], 0xF0);
+        assert!(rows[365..].iter().all(|&b| b == 0));
+
+        // The 1200 series crops 9 bytes on the left and prints 360 bytes a row.
+        let family = StyleWriterFamily::Original;
+        let h = (family.top_margin_rows() + family.bottom_margin_rows() + 1) as u32;
+        let mut bits = vec![0u8; row_bytes * h as usize];
+        bits[family.top_margin_rows() * row_bytes + 8] = 0xFF; // inside the margin
+        bits[family.top_margin_rows() * row_bytes + 9] = 0xAB;
+        let page = crop_pbm_page(w, h, &bits, family);
+        assert_eq!(page.width, 2880);
+        let Pixels::BlackAndWhite(rows) = page.pixels else { panic!("a black and white page") };
+        assert_eq!(rows.len(), 360);
+        assert_eq!(rows[0], 0xAB);
+
+        // An RGB page starts at the first printable pixel, 72 dots in on the
+        // first printable row.
+        let w = 400u32;
+        let h = (SW2200.top_margin_rows() + SW2200.bottom_margin_rows() + 3) as u32;
+        let mut rgb = vec![255u8; (w * h * 3) as usize];
+        let first = (SW2200.top_margin_rows() * w as usize + 72) * 3;
+        rgb[first..first + 3].copy_from_slice(&[1, 2, 3]);
+        let page = crop_bytes_page(w, h, &rgb, 3, SW2200);
+        assert_eq!((page.width, page.height), (400 - 144, 3));
+        let Pixels::Rgb(pixels) = page.pixels else { panic!("an RGB page") };
+        assert_eq!(pixels.len(), 256 * 3 * 3);
+        assert_eq!(pixels[..3], [1, 2, 3]);
     }
 
     #[test]
     fn test_stylewriter_margins_follow_family() {
         let letter_w = 21590; // 8.5 in, in hundredths of a mm
-        let (cl, _, ct, cb) = stylewriter_margins_hmm(letter_w, SW2200);
-        let (ol, _, ot, ob) = stylewriter_margins_hmm(letter_w, StyleWriterFamily::Original);
-        assert_eq!(cl, 508); // 72 px
-        assert_eq!(ol, 677); // 96 px
-        assert_eq!((ct, cb), (ot, ob));
+        let (cl, cr, ct, cb) = stylewriter_margins_hmm(letter_w, SW2200);
+        let (ol, or, ot, ob) = stylewriter_margins_hmm(letter_w, StyleWriterFamily::Original);
+        // The 2200's engine has 0.2 in each side, 0.125 in at the top and 0.275
+        // in at the bottom.
+        assert_eq!((cl, cr, ct, cb), (508, 508, 318, 699));
+        // The 1200 series has 0.2 in at the left and top and 38/120 in at the
+        // bottom, and is 8 in across, which leaves 0.3 in at the right of
+        // letter.
+        assert_eq!((ol, or, ot, ob), (508, 762, 508, 804));
+        // A4 keeps the 0.2 in right margin too.
+        assert_eq!(stylewriter_margins_hmm(21000, SW2200).1, 508);
         // The StyleWriter II shares the original StyleWriter's printable area.
         assert_eq!(
             stylewriter_margins_hmm(letter_w, StyleWriterFamily::StyleWriterII),
@@ -2730,37 +2841,23 @@ mod tests {
     }
 
     #[test]
-    fn test_ppm_page_to_planar_dither_extremes() {
-        let w = 200u32;
-        let h = (SW_TOP_MARGIN_ROWS + SW_BOTTOM_MARGIN_ROWS + 5) as u32;
-        // Pure black page: every C/M/Y bit inside the printable window must
-        // be set (composite black), and the K plane must stay empty.
-        let black = vec![0u8; (w * h * 3) as usize];
-        let rows = pbm_like_bits(&ppm_page_to_planar(w, h, &black, SW2200), w as usize);
-        for (c, m, y, k) in rows {
-            assert!(c && m && y, "black page must dither to solid CMY");
-            assert!(!k, "K plane must stay empty in color mode");
+    fn stylewriter_job_attributes_map_to_options() {
+        assert_eq!(stylewriter_paper("stationery"), PaperType::Plain);
+        assert_eq!(stylewriter_paper("stationery-coated"), PaperType::Coated);
+        assert_eq!(stylewriter_paper("transparency"), PaperType::Transparency);
+        assert_eq!(stylewriter_paper("back-print-film"), PaperType::BackPrintFilm);
+        assert_eq!(stylewriter_paper("photographic-glossy"), PaperType::Glossy);
+        assert_eq!(stylewriter_paper("cardstock"), PaperType::Plain);
+        for t in STYLEWRITER_MEDIA_TYPES {
+            assert!(*t == "stationery" || stylewriter_paper(t) != PaperType::Plain, "{t}");
         }
-        // Pure white page: no ink anywhere.
-        let white = vec![255u8; (w * h * 3) as usize];
-        for planes in ppm_page_to_planar(w, h, &white, SW2200) {
-            for plane in planes {
-                assert!(plane.iter().all(|&b| b == 0));
-            }
-        }
-    }
-
-    /// Collapse a dithered page to per-plane "any ink missing / any ink present"
-    /// flags over the printable pixel span (ignores byte padding bits).
-    fn pbm_like_bits(page: &PlanarPage, w: usize) -> Vec<(bool, bool, bool, bool)> {
-        let family = SW2200;
-        let print_w = (w - family.left_margin_px()).min(family.print_width());
-        page.iter()
-            .map(|planes| {
-                let all_set = |p: &Vec<u8>| (0..print_w).all(|x| p[x / 8] & (0x80 >> (x % 8)) != 0);
-                let any_set = |p: &Vec<u8>| (0..print_w).any(|x| p[x / 8] & (0x80 >> (x % 8)) != 0);
-                (all_set(&planes[0]), all_set(&planes[1]), all_set(&planes[2]), any_set(&planes[3]))
-            })
-            .collect()
+        assert_eq!(stylewriter_halftone(Some("photo")), Halftone::Diffusion);
+        assert_eq!(stylewriter_halftone(None), Halftone::Diffusion);
+        assert_eq!(stylewriter_halftone(Some("text-and-graphics")), Halftone::Pattern);
+        assert_eq!(stylewriter_rendering(Some("bi-level"), true), Rendering::BlackAndWhite);
+        assert_eq!(stylewriter_rendering(Some("monochrome"), true), Rendering::Grayscale);
+        assert_eq!(stylewriter_rendering(Some("auto"), true), Rendering::Color);
+        assert_eq!(stylewriter_rendering(None, true), Rendering::Color);
+        assert_eq!(stylewriter_rendering(Some("color"), false), Rendering::Grayscale);
     }
 }

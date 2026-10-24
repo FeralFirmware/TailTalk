@@ -283,6 +283,13 @@ impl AdspEndpoint {
         Ok(())
     }
 
+    /// Abandon an open started by [`Self::connect`], using the handle it
+    /// returned. Its request is not sent again, and a refusal of it is not
+    /// reported as [`AdspEvent::OpenFailed`].
+    pub fn abandon_open(&mut self, pending: u16) {
+        self.pending_opens.remove(&pending);
+    }
+
     /// Close a connection: send CloseAdvice and forget it.
     pub fn close(&mut self, conn: u16) {
         let Some(key) = self.key_by_handle(conn) else {

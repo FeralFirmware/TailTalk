@@ -78,8 +78,8 @@ impl Default for Config {
         Self {
             role: Role::StyleWriter,
             name: heapless::String::try_from("InkTalk").unwrap(),
-            // lpstyl drives serial StyleWriters at 57600; the default role
-            // is StyleWriter, so default the port to match.
+            // A StyleWriter talks at 57600 baud, and the default role is
+            // StyleWriter, so default the port to match.
             baud: 57_600,
         }
     }

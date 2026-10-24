@@ -363,10 +363,10 @@ async fn cmd_set_role(cdc: &mut Cdc, args: &[u8]) -> Result<(), EndpointError> {
         }
     };
     // The baud rate does not follow the role, and the roles do not agree on
-    // one: lpstyl drives a StyleWriter at 57600, while an ImageWriter's
-    // serial rate is whatever its DIP switches say. Saying the rate here
-    // puts the mismatch in front of whoever just changed the role, which is
-    // the moment it is created.
+    // one. A StyleWriter talks at 57600, while an ImageWriter's serial rate is
+    // whatever its DIP switches say. Saying the rate here puts the mismatch in
+    // front of whoever just changed the role, which is the moment it is
+    // created.
     let mut out: heapless::String<96> = heapless::String::new();
     let _ = core::fmt::Write::write_fmt(
         &mut out,
