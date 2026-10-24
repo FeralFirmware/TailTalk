@@ -18,7 +18,7 @@ std = ["tailtalk-packets/std"]
 # dependency's default-features, and this crate must be able to drop them.
 # Dropping them loses std (the firmware has none) and afp (a file-server
 # protocol with no place on a printer bridge).
-tailtalk-packets = { path = "../tailtalk-packets", version = "^0.12", default-features = false }
+tailtalk-packets = { path = "../tailtalk-packets", version = "^0.13", default-features = false }
 
 # The desktop crate depends on this one, so this is a cycle - but only
 # through dev-dependencies, which cargo allows and resolves. It is what lets
