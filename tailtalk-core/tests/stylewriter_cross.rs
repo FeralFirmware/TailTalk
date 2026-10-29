@@ -32,7 +32,7 @@ use tailtalk::{
         StyleWriterSession, encode_band,
     },
 };
-use tailtalk_core::stylewriter::{FastClock, StyleWriterEvent, StyleWriterRole};
+use tailtalk_core::stylewriter::{FastClock, PortClock, StyleWriterEvent, StyleWriterRole};
 use tailtalk_packets::aarp::{AddressSource, AppleTalkAddress};
 use tailtalk_packets::ddp::{DdpPacket as DdpHeaders, DdpProtocolType};
 use tailtalk_packets::nbp::ServiceAddress;
@@ -372,8 +372,11 @@ async fn embedded_stylewriter_prints_a_color_job_in_order() {
     }
     session.finish().await.expect("finish failed");
 
-    use StyleWriterEvent::{FastClockDisable, FastClockEnable, JobEnded};
-    assert_eq!(events_to_job_end(&mut events).await, [FastClockEnable, FastClockDisable, JobEnded { clean: true }]);
+    use StyleWriterEvent::{JobEnded, PortClock as Clock};
+    assert_eq!(
+        events_to_job_end(&mut events).await,
+        [Clock(PortClock::PrinterHski), Clock(PortClock::Normal), JobEnded { clean: true }]
+    );
 
     let sent = sent.lock().unwrap().clone();
     let expected: Vec<&[u8]> = vec![
@@ -416,7 +419,10 @@ async fn embedded_stylewriter_prints_a_stylewriter_ii_job_in_order() {
     session.finish().await.expect("finish failed");
 
     let job_events = events_to_job_end(&mut events).await;
-    assert!(job_events.contains(&StyleWriterEvent::FastClockEnable), "the port follows the printer's clock");
+    assert!(
+        job_events.contains(&StyleWriterEvent::PortClock(PortClock::Baud230400)),
+        "the port runs at 230,400 baud"
+    );
     assert_eq!(job_events.last(), Some(&StyleWriterEvent::JobEnded { clean: true }));
 
     let sent = sent.lock().unwrap().clone();

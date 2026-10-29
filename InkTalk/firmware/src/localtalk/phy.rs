@@ -3,14 +3,17 @@
 //! Configures PIO0 SM0 (TX shift-out) and PIO1 SM0 (RX FM-0 decoder).
 //! After init, core 1 accesses these via PAC - the Embassy HAL handles
 //! are leaked (mem::forget) to prevent Drop from disabling the SMs
-//! or resetting pin function selects.
+//! or resetting pin function selects. PIO0's other state machines go to
+//! the printer port (`fast_clock.rs`).
 
 use core::mem;
 
 use embassy_rp::gpio::{Level, Output};
+use embassy_rp::pac;
 use embassy_rp::peripherals::{PIO0, PIO1};
 use embassy_rp::pio::{
-    Config, Direction, FifoJoin, InterruptHandler, Pio, PioPin, ShiftConfig, ShiftDirection,
+    Common, Config, Direction, FifoJoin, InterruptHandler, Pio, PioPin, ShiftConfig,
+    ShiftDirection, StateMachine,
 };
 use embassy_rp::Peripheral;
 use fixed::types::U24F8;
@@ -34,6 +37,50 @@ const fn clock_div(target_hz: u32) -> U24F8 {
     U24F8::from_bits(div_x256 as u32)
 }
 
+/// The parts of PIO0 the LocalTalk PHY doesn't use, handed on to the
+/// printer port's fast clock (`fast_clock.rs`). `Pio::new` gives out a
+/// PIO's handles only once and the PHY needs only SM0, so it passes on
+/// SM1, SM2 and the `Common` that loads programs into the instruction
+/// memory still free.
+///
+/// These are kept for good, as SM0's handle is. Once the last PIO0 handle
+/// is dropped, Embassy resets the FUNCSEL of every pin PIO0 was given,
+/// and GP2 would stop carrying LocalTalk TX.
+pub struct Pio0Spare {
+    pub common: Common<'static, PIO0>,
+    pub sm1: StateMachine<'static, PIO0, 1>,
+    pub sm2: StateMachine<'static, PIO0, 2>,
+}
+
+/// Set bits in PIO0's CTRL through the RP2040's atomic set alias.
+///
+/// Core 1 starts and stops SM0 while core 0 starts and stops the printer
+/// port's machines, all in this one register, so a read-modify-write from
+/// either core could undo the other's change.
+pub fn pio0_ctrl_set(f: impl FnOnce(&mut pac::pio::regs::Ctrl)) {
+    pio0_ctrl_alias(0x2000, f);
+}
+
+/// Clear bits in PIO0's CTRL through the atomic clear alias. See
+/// [`pio0_ctrl_set`].
+pub fn pio0_ctrl_clear(f: impl FnOnce(&mut pac::pio::regs::Ctrl)) {
+    pio0_ctrl_alias(0x3000, f);
+}
+
+fn pio0_ctrl_alias(offset: usize, f: impl FnOnce(&mut pac::pio::regs::Ctrl)) {
+    let mut bits = pac::pio::regs::Ctrl::default();
+    f(&mut bits);
+    // SAFETY: the set and clear aliases sit at fixed offsets from every
+    // RP2040 peripheral register, and a write there touches only the bits
+    // given.
+    unsafe {
+        (pac::PIO0.ctrl().as_ptr() as *mut u8)
+            .add(offset)
+            .cast::<pac::pio::regs::Ctrl>()
+            .write_volatile(bits);
+    }
+}
+
 /// Initialize PIO state machines and pin configuration.
 ///
 /// After this call:
@@ -41,9 +88,10 @@ const fn clock_div(target_hz: u32) -> U24F8 {
 /// - PIO1 SM0 is configured and ENABLED for continuous RX.
 /// - GP3 (DE) is configured as SIO output, driven low.
 ///
-/// All Embassy handles are leaked via `mem::forget` to prevent their
-/// Drop impls from disabling state machines or resetting pin function
-/// selects. Core 1 accesses hardware via PAC registers.
+/// The Embassy handles for these are leaked via `mem::forget` to prevent
+/// their Drop impls from disabling state machines or resetting pin
+/// function selects. Core 1 accesses hardware via PAC registers. PIO0's
+/// spare state machines are returned along with its [`Common`].
 pub fn init_phy(
     pio0: impl Peripheral<P = PIO0> + 'static,
     _pio0_irqs: Pio0Irqs,
@@ -52,12 +100,14 @@ pub fn init_phy(
     tx_data_pin: impl Peripheral<P = impl PioPin> + 'static,
     tx_en_pin: impl Peripheral<P = impl embassy_rp::gpio::Pin> + 'static,
     rx_data_pin: impl Peripheral<P = impl PioPin> + 'static,
-) {
+) -> Pio0Spare {
     // ── PIO0: SM0 (TX Data Shift-out) ──────────────────────────────
 
     let Pio {
         common: mut common0,
         sm0: mut tx_sm,
+        sm1,
+        sm2,
         ..
     } = Pio::new(pio0, Pio0Irqs {});
 
@@ -195,10 +245,15 @@ pub fn init_phy(
 
     rx_sm.set_enable(true);
 
-    // Leak all handles to prevent Drop from disabling SMs or resetting
-    // pin function selects. Core 1 owns the hardware via PAC.
+    // Leak the LocalTalk handles to prevent Drop from disabling SMs or
+    // resetting pin function selects. Core 1 owns the hardware via PAC.
     mem::forget(tx_sm);
-    mem::forget(common0);
     mem::forget(rx_sm);
     mem::forget(common1);
+
+    Pio0Spare {
+        common: common0,
+        sm1,
+        sm2,
+    }
 }

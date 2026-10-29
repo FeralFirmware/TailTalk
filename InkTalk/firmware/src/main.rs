@@ -21,12 +21,12 @@
 //! | GP4  | `LocalTalk_RX`         | PIO1 SM0 JMP PIN <- U4 R |
 //! | GP6/7| (unconnected)          | DBG0/DBG1 scope outputs |
 //! | GP17 | `Net-(TX1-K)`          | TX1 blue LED, active low |
-//! | GP18 | `PRINT_HSKI_CLAMPED`   | UART0 CTS <- printer HSKi, inverted in the pad |
+//! | GP18 | `PRINT_HSKI_CLAMPED`   | UART0 CTS <- printer HSKi, inverted in the pad. A Colour StyleWriter's fast clock for PIO0, not inverted |
 //! | GP19 | `Net-(RX1-K)`          | RX1 green LED, active low |
 //! | GP26 | `PRINT_DE`             | U5 DE, driven high |
 //! | GP27 | `PRINT_RE`             | U5 /RE, driven low |
-//! | GP28 | `PRINT_D`              | UART0 TX -> U5 D |
-//! | GP29 | `PRINT_R`              | UART0 RX <- U5 R |
+//! | GP28 | `PRINT_D`              | UART0 TX -> U5 D, or PIO0 SM1 on a Colour StyleWriter's fast clock |
+//! | GP29 | `PRINT_R`              | UART0 RX <- U5 R, or PIO0 SM2 on a Colour StyleWriter's fast clock |
 //!
 //! U4 /RE is strapped to ground, so the LocalTalk receiver is always on. It
 //! hears our own frames only if the connector box joins the TX and RX
@@ -67,6 +67,7 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::multicore::Stack;
+use embassy_rp::Peripheral;
 use embassy_rp::peripherals::{UART0, USB};
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart};
 use embassy_rp::usb::{Driver, InterruptHandler};
@@ -79,6 +80,7 @@ mod config;
 mod control;
 mod core1;
 mod debug;
+mod fast_clock;
 mod identify;
 mod wire;
 mod led;
@@ -239,7 +241,7 @@ fn main() -> ! {
     info!("config: role={} baud={}", cfg.role as u8, cfg.baud);
 
     // ── LocalTalk PHY (configures PIO + pins, drops handles) ────────
-    localtalk::phy::init_phy(
+    let pio0_spare = localtalk::phy::init_phy(
         p.PIO0,
         localtalk::phy::Pio0Irqs {},
         p.PIO1,
@@ -256,6 +258,16 @@ fn main() -> ! {
     let printer_re = Output::new(p.PIN_27, Level::Low);
     core::mem::forget(printer_de);
     core::mem::forget(printer_re);
+
+    // The fast clock's state machines take GP28 and GP29 for PIO0 while
+    // they are set up, and building the UART hands both back to it.
+    // SAFETY: the UART is the pins' only other user, and fast_clock.rs
+    // moves GP28 between the two so only one drives it at a time.
+    let (fast_tx, fast_rx) = fast_clock::init(
+        pio0_spare,
+        unsafe { p.PIN_28.clone_unchecked() },
+        unsafe { p.PIN_29.clone_unchecked() },
+    );
 
     static UART_TX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
     static UART_RX_BUF: StaticCell<[u8; 2048]> = StaticCell::new();
@@ -312,8 +324,8 @@ fn main() -> ! {
         defmt::unwrap!(spawner.spawn(debug::run(debug_cdc, &SHARED)));
         defmt::unwrap!(spawner.spawn(rx_dispatch_task(&SHARED)));
         stack_task::start(&spawner, &SHARED, role, name, baud);
-        defmt::unwrap!(spawner.spawn(printer::tx_run(uart_tx)));
-        defmt::unwrap!(spawner.spawn(printer::rx_run(uart_rx)));
+        defmt::unwrap!(spawner.spawn(printer::tx_run(uart_tx, fast_tx, baud)));
+        defmt::unwrap!(spawner.spawn(printer::rx_run(uart_rx, fast_rx)));
         defmt::unwrap!(spawner.spawn(printer::handshake_run()));
         defmt::unwrap!(spawner.spawn(led::run(led_tx_blue, led_rx_green)));
         defmt::unwrap!(spawner.spawn(watchdog_task(watchdog)));

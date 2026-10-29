@@ -24,7 +24,7 @@ use static_cell::StaticCell;
 
 use localtalk::MAX_FRAME_LEN;
 use localtalk::crc::lt_crc;
-use tailtalk_net::printer::{FastClock, Printer, PrinterEvent};
+use tailtalk_net::printer::{FastClock, PortClock, Printer, PrinterEvent};
 use tailtalk_net::{AppleTalkAddress, Link, Micros, Net, NetState, NodeClass, Platform, Runner, StackConfig};
 
 use crate::config::Role;
@@ -165,8 +165,9 @@ async fn serve_printer(
     name: heapless::String<31>,
 ) -> ! {
     let bind = |name: &str| match role {
-        // Fast mode needs the UART clocked from HSKi, which we don't do yet.
-        Role::StyleWriter => Printer::stylewriter(net, name, FastClock::Unsupported),
+        // The port follows a Colour StyleWriter's fast mode on HSKi
+        // (fast_clock.rs), and a StyleWriter II or 1200's at 230,400 baud.
+        Role::StyleWriter => Printer::stylewriter(net, name, FastClock::Supported),
         Role::ImageWriter => Printer::imagewriter(net, name),
     };
     // A name that cannot be registered would leave the printer invisible
@@ -233,8 +234,14 @@ async fn serve_printer(
                 save_name(shared, &new_name).await;
             }
             Ok(PrinterEvent::RenameRejected) => tt_log!("STACK: rename ignored, name not usable"),
-            // Never sent: the StyleWriter is bound without fast clock support.
-            Ok(PrinterEvent::FastClockEnable | PrinterEvent::FastClockDisable) => {}
+            Ok(PrinterEvent::PortClock(clock)) => {
+                printer::set_port_clock(clock).await;
+                match clock {
+                    PortClock::Normal => tt_log!("PRINTER: on our own clock"),
+                    PortClock::PrinterHski => tt_log!("PRINTER: on the printer's clock"),
+                    PortClock::Baud230400 => tt_log!("PRINTER: at 230400 baud"),
+                }
+            }
             // Our port can't fail or reach end of stream. This keeps a future
             // one that can from spinning.
             Err(e) => {

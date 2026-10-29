@@ -56,12 +56,16 @@ pub const ATTN_FAST_CLOCK_QUERY: u16 = 0x0005;
 /// raster band for up to 10 seconds, and treats a printer that stays busy that
 /// long as a communication error.
 pub const ATTN_OUTPUT_DRAINED: u16 = 0x0006;
-/// Sent by Macs to signal the adapter to start or stop using the clock fed 
-/// by the printer on HSKi. This is sent _ater_ it has already instructed the printer
-/// to start generating the clock.
+/// StyleWriter II and 1200's fast mode enable command, which sets the printer
+/// to run at 230,400 baud (without using HSKi like the later models).
+/// The Mac first sends 0x0000 to ask whether the adapter supports this mode.
+/// If the answer from us is 0x0000, it sends `h` to the
+/// printer and then 0x0001, which moves the port to 230,400 baud. On any other
+/// answer the printer stays at 57600, and the Mac sets the port back to that
+/// speed with [`ATTN_SERIAL_CONFIG`].
 pub const ATTN_SERIAL_CONTROL_JF: u16 = 0x0007;
-/// Some special stuff for Quadras? Here only for posterity but we dont particularly care
-/// about it.
+/// Sent with 0x0101 between the two [`ATTN_SERIAL_CONTROL_JF`]s. There is
+/// nothing for the adapter's port to do, and it is answered with 0x0000.
 pub const ATTN_SERIAL_CONTROL_LOWER_JF: u16 = 0x0008;
 
 /// Asks the adapter to change its name broadcasted via NBP. Name is passed as a Pascal string.
@@ -119,8 +123,8 @@ const OUTPUT_PENDING: [u8; 2] = [0x00, 0x00];
 /// return so a Mac does not try and enable it.
 const FAST_CLOCK_UNAVAILABLE: [u8; 2] = [0x00, 0xEF];
 
-/// Largely the same as the above - tells the asking Mac that we cannot enable
-/// fast clock mode.
+/// The answer to [`ATTN_SERIAL_CONTROL_JF`] from a port that cannot run at
+/// 230,400 baud, so the Mac keeps a StyleWriter II or 1200 at 57600.
 const SERIAL_CONTROL_REFUSED: [u8; 2] = (-17i16).to_be_bytes();
 
 /// Puts the printer back in to a known state, including ejecting paper if 
@@ -128,27 +132,43 @@ const SERIAL_CONTROL_REFUSED: [u8; 2] = (-17i16).to_be_bytes();
 /// if enabled and we are not aware (i.e power cycled).
 pub const PRINTER_RESET: &[u8] = &[0x00, 0xFF, 0xFF, 0xFF, QUERY_RESET];
 
-/// Command sent to the actual printer itself to direct it to enable fast clock mode
+/// Puts a Colour StyleWriter into its fast mode, where it clocks the link on
+/// HSKi.
 pub const FAST_CLOCK: u8 = b'x';
 
-/// Puts a StyleWriter II or 1200 into fast clock mode.
+/// Puts a StyleWriter II or 1200 into its fast mode, 230,400 baud.
 pub const FAST_CLOCK_SW: u8 = b'h';
 
 /// [`ATTN_SERIAL_OPTIONS`] bit: clock the port from the printer's HSKi.
 pub const SERIAL_EXTERNAL_CLOCK: u8 = 0x40;
 
-/// Allows an adapter implementation to decide if it does or does not support 
-/// externally clocking its UART via the HSKi pin. If [`FastClock::Supported`]` is 
-/// chosen, [`StyleWriterEvent::FastClockEnable`] and [`StyleWriterEvent::FastClockDisable`]
-/// will be passed on the event handler to instruct the adapter when it should 
-/// reconfigure its UART.
-/// 
-/// If [`FastClock::Unsupported`] is chosen these events will not occur and we 
-/// will report back to the Mac to not attempt to enable fast clock mode.
+/// Allows an adapter implementation to decide if it does or does not support
+/// the printers' fast modes, which are following a Colour StyleWriter's clock on
+/// HSKi and running a StyleWriter II or 1200 at 230,400 baud. If [`FastClock::Supported`]
+/// is chosen, [`StyleWriterEvent::PortClock`] will be passed on the event handler
+/// to instruct the adapter when it should reconfigure its UART.
+///
+/// If [`FastClock::Unsupported`] is chosen these events will not occur and we
+/// will report back to the Mac to not attempt either fast mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FastClock {
     Supported,
     Unsupported,
+}
+
+/// What clocks the adapter's printer port. Every printer starts at
+/// [`PortClock::Normal`], and a job can move it into the printer's fast mode
+/// and back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortClock {
+    /// The printer's usual 57600 baud, 8N1, on the port's own clock.
+    Normal,
+    /// A Colour StyleWriter's fast mode, where the printer drives a bit clock on
+    /// HSKi, one clock per bit, and both directions keep to 8N1 framing on it.
+    PrinterHski,
+    /// A StyleWriter II or 1200's fast mode, which is 230,400 baud, 8N1, on the
+    /// port's own clock.
+    Baud230400,
 }
 
 /// The identify command. The printer answers with its model string,
@@ -304,15 +324,12 @@ pub enum StyleWriterEvent {
     /// across a power cycle and re-registers itself, so a client looking the
     /// printer up shortly afterwards expects to find the new name.
     Rename(Vec<u8>),
-    /// From here on, clock the printer port from the printer's HSKi: the
-    /// printer is in its fast mode. Comes after the bytes that switched it.
-    /// Only with [`FastClock::Supported`].
-    FastClockEnable,
-    /// Go back to clocking the printer port at its own baud rate: the client
-    /// switched fast mode off, or the job ended. Comes after any bytes the
-    /// printer still has to hear at the fast clock, such as the reset for a
-    /// client that vanished. Only after [`StyleWriterEvent::FastClockEnable`].
-    FastClockDisable,
+    /// From here on, run the printer port on this clock. A fast mode comes after
+    /// the bytes that switched the printer into it. [`PortClock::Normal`] comes
+    /// when the client switches the fast mode off or the job ends, after any
+    /// bytes the printer still has to hear at its fast speed, such as the reset
+    /// for a client that vanished. Only with [`FastClock::Supported`].
+    PortClock(PortClock),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,8 +393,8 @@ pub struct StyleWriterRole {
     /// messages, never as bytes inside raster data.
     data_msg_start: bool,
     fast_clock: FastClock,
-    /// Whether the port has been told to follow the printer's clock.
-    fast_clock_on: bool,
+    /// The clock the port has been told to run on.
+    port_clock: PortClock,
 }
 
 impl StyleWriterRole {
@@ -396,19 +413,25 @@ impl StyleWriterRole {
             printer_drained: true,
             data_msg_start: true,
             fast_clock,
-            fast_clock_on: false,
+            port_clock: PortClock::Normal,
         }
     }
 
     /// Tell the embedder to switch the port's clock, if that changes it.
-    fn follow_printer_clock(&mut self, on: bool) {
-        if on != self.fast_clock_on {
-            self.fast_clock_on = on;
-            self.events.push_back(if on {
-                StyleWriterEvent::FastClockEnable
-            } else {
-                StyleWriterEvent::FastClockDisable
-            });
+    fn set_port_clock(&mut self, clock: PortClock) {
+        if clock != self.port_clock {
+            self.port_clock = clock;
+            self.events.push_back(StyleWriterEvent::PortClock(clock));
+        }
+    }
+
+    /// Switch the port's clock for a request on `conn`. The port belongs to
+    /// the job in hand, so only its data connection can move it. The same
+    /// request from any other connection is answered as usual and changes
+    /// nothing.
+    fn set_port_clock_for(&mut self, conn: u16, clock: PortClock) {
+        if matches!(self.state, State::Piping { conn: dc, .. } if dc == conn) {
+            self.set_port_clock(clock);
         }
     }
 
@@ -613,7 +636,7 @@ impl StyleWriterRole {
                             self.events
                                 .push_back(StyleWriterEvent::ToPrinter(PRINTER_RESET.to_vec()));
                         }
-                        self.follow_printer_clock(false);
+                        self.set_port_clock(PortClock::Normal);
                         self.events
                             .push_back(StyleWriterEvent::JobEnded { clean: kill_seen });
                         self.enter(State::Idle, now);
@@ -751,7 +774,7 @@ impl StyleWriterRole {
                 let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
                 if self.fast_clock == FastClock::Supported {
                     let external = data.first().is_some_and(|o| o & SERIAL_EXTERNAL_CLOCK != 0);
-                    self.follow_printer_clock(external);
+                    self.set_port_clock_for(conn, if external { PortClock::PrinterHski } else { PortClock::Normal });
                 }
             }
             ATTN_SET_STATUS => {
@@ -789,7 +812,7 @@ impl StyleWriterRole {
                 FastClock::Supported => {
                     let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
                     let fast = data.get(..2).is_some_and(|arg| arg != [0, 0]);
-                    self.follow_printer_clock(fast);
+                    self.set_port_clock_for(conn, if fast { PortClock::Baud230400 } else { PortClock::Normal });
                 }
                 FastClock::Unsupported => {
                     let _ = self.endpoint.send(conn, &SERIAL_CONTROL_REFUSED, false);
@@ -797,9 +820,9 @@ impl StyleWriterRole {
             },
             ATTN_SERIAL_CONFIG => {
                 // Only ever the printer's usual 57600 baud, which the port
-                // runs at whenever it is not following the printer's clock.
+                // runs at whenever the printer is out of its fast mode.
                 let _ = self.endpoint.send(conn, &RESULT_ACCEPTED, false);
-                self.follow_printer_clock(false);
+                self.set_port_clock_for(conn, PortClock::Normal);
             }
             ATTN_SEND_BREAK | ATTN_BREAK_RECEIVED | ATTN_SERIAL_CONTROL_LOWER_JF => {
                 // Nothing for the port to do. For ATTN_BREAK_RECEIVED, 0x0000
@@ -1266,7 +1289,9 @@ mod tests {
     /// job ends, after any reset the printer still has to hear at its speed.
     #[test]
     fn supported_fast_clock_follows_the_client_and_the_job() {
-        use StyleWriterEvent::{FastClockDisable, FastClockEnable, JobEnded, ToPrinter};
+        use StyleWriterEvent::{JobEnded, ToPrinter};
+        let hski = StyleWriterEvent::PortClock(PortClock::PrinterHski);
+        let normal = StyleWriterEvent::PortClock(PortClock::Normal);
         let mac_addr = addr(10, 70);
         let (mut role, mut mac, data_conn) = job_in_progress(FastClock::Supported);
 
@@ -1280,10 +1305,10 @@ mod tests {
         shuttle(&mut role, &mut mac, mac_addr, 300);
         let mut expected = alloc::vec![ToPrinter(alloc::vec![FAST_CLOCK])];
         for (at, options, event) in [
-            (310, 0x40, Some(FastClockEnable)),
+            (310, 0x40, Some(hski.clone())),
             (320, 0x40, None),
-            (330, 0x00, Some(FastClockDisable)),
-            (340, 0x40, Some(FastClockEnable)),
+            (330, 0x00, Some(normal.clone())),
+            (340, 0x40, Some(hski.clone())),
         ] {
             mac.send_attention(data_conn, ATTN_SERIAL_OPTIONS, &[options], at)
                 .unwrap();
@@ -1293,6 +1318,12 @@ mod tests {
             assert_eq!(role_events(&mut role), expected, "options {options:#04x}");
             expected.clear();
         }
+
+        // A second connection, such as another Mac asking after the printer,
+        // cannot move the port out from under the job.
+        let other = open_control(&mut role, &mut mac, mac_addr);
+        assert_eq!(ask(&mut role, &mut mac, other, ATTN_SERIAL_CONFIG, &[0x4C, 0x00], 350), [0, 0]);
+        assert_eq!(role_events(&mut role), []);
 
         // The client vanishes mid-job, as in vanished_client_resets_the_printer.
         role.printer_input(b"status byte");
@@ -1308,7 +1339,7 @@ mod tests {
             role_events(&mut role),
             [
                 ToPrinter(PRINTER_RESET.to_vec()),
-                FastClockDisable,
+                normal,
                 JobEnded { clean: false },
             ]
         );
@@ -1345,14 +1376,14 @@ mod tests {
         in_band(mac, conn)
     }
 
-    /// A StyleWriter II goes fast only where the port can follow. A port that
-    /// cannot refuses the Mac's call, so the printer stays at 57600 baud, and a
-    /// stray `h` is kept from the printer. One that can passes the switch on,
-    /// follows once the Mac moves it, and goes back when the Mac puts it at
-    /// 57600 baud again.
+    /// A StyleWriter II goes fast only where the port can run at 230,400 baud.
+    /// A port that cannot refuses the Mac's call, so the printer stays at 57600
+    /// baud, and a stray `h` is kept from the printer. One that can passes the
+    /// switch on, moves to 230,400 baud once the Mac says so, and goes back when
+    /// the Mac puts it at 57600 baud again.
     #[test]
-    fn a_stylewriter_ii_goes_fast_only_where_the_port_can_follow() {
-        use StyleWriterEvent::{FastClockDisable, FastClockEnable, ToPrinter};
+    fn a_stylewriter_ii_goes_fast_only_where_the_port_can_run_at_230400() {
+        use StyleWriterEvent::ToPrinter;
         let (mut role, mut mac, data) = job_in_progress(FastClock::Unsupported);
         assert_eq!(ask(&mut role, &mut mac, data, ATTN_SERIAL_CONTROL_JF, &[0, 0], 250), [0xFF, 0xEF]);
         assert_eq!(ask(&mut role, &mut mac, data, ATTN_SERIAL_CONFIG, &[0x4C, 0x00], 260), [0, 0]);
@@ -1371,9 +1402,12 @@ mod tests {
         mac.send(data, &[FAST_CLOCK_SW], true).unwrap();
         shuttle(&mut role, &mut mac, addr(10, 70), 270);
         assert_eq!(ask(&mut role, &mut mac, data, ATTN_SERIAL_CONTROL_JF, &[0, 1], 280), [0, 0]);
-        assert_eq!(role_events(&mut role), [ToPrinter(vec![FAST_CLOCK_SW]), FastClockEnable]);
+        assert_eq!(
+            role_events(&mut role),
+            [ToPrinter(vec![FAST_CLOCK_SW]), StyleWriterEvent::PortClock(PortClock::Baud230400)]
+        );
         assert_eq!(ask(&mut role, &mut mac, data, ATTN_SERIAL_CONFIG, &[0x4C, 0x00], 290), [0, 0]);
-        assert_eq!(role_events(&mut role), [FastClockDisable]);
+        assert_eq!(role_events(&mut role), [StyleWriterEvent::PortClock(PortClock::Normal)]);
     }
 
     /// A client that vanishes between the accept and the control close
