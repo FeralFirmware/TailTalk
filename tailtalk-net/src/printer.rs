@@ -26,7 +26,7 @@ use tailtalk_core::imagewriter::{self, ImageWriterEvent, ImageWriterRole};
 use tailtalk_core::pap::{self, PapEvent, PapServer};
 use tailtalk_core::stylewriter::{self, StyleWriterEvent, StyleWriterRole};
 
-pub use tailtalk_core::stylewriter::FastClock;
+pub use tailtalk_core::stylewriter::{FastClock, PortClock};
 use tailtalk_packets::ddp::DdpProtocolType;
 use tailtalk_packets::nbp::{EntityName, ServiceAddress};
 
@@ -58,14 +58,11 @@ pub enum PrinterEvent {
     /// A client asked for a name this node cannot register (not UTF-8,
     /// carrying an NBP delimiter, or too long). The old name stands.
     RenameRejected,
-    /// From here on, clock the port from the printer's HSKi: the printer is
-    /// in its fast mode. Only from a StyleWriter bound with
-    /// [`FastClock::Supported`]. Every byte before it has been written.
-    FastClockEnable,
-    /// Go back to clocking the port at its own baud rate. Only after
-    /// [`PrinterEvent::FastClockEnable`]. Every byte before it has been
-    /// written, at the fast clock.
-    FastClockDisable,
+    /// From here on, run the port on this clock, because the printer has gone
+    /// into its fast mode or come out of it. Only from a StyleWriter bound with
+    /// [`FastClock::Supported`]. Every byte before it has been written, at the
+    /// old clock.
+    PortClock(PortClock),
 }
 
 /// Why [`Printer::run`] stopped.
@@ -139,8 +136,7 @@ impl Role for StyleWriterRole {
             StyleWriterEvent::ToPrinter(bytes) => RoleEvent::ToPrinter(bytes),
             StyleWriterEvent::JobEnded { clean } => RoleEvent::Event(PrinterEvent::JobEnded { clean }),
             StyleWriterEvent::Rename(name) => RoleEvent::Rename(name),
-            StyleWriterEvent::FastClockEnable => RoleEvent::Event(PrinterEvent::FastClockEnable),
-            StyleWriterEvent::FastClockDisable => RoleEvent::Event(PrinterEvent::FastClockDisable),
+            StyleWriterEvent::PortClock(clock) => RoleEvent::Event(PrinterEvent::PortClock(clock)),
         })
     }
 }
@@ -334,8 +330,8 @@ impl<'a, P: Platform> Printer<'a, P> {
     /// it to the type a Mac looks up for its model (see
     /// [`stylewriter::nbp_type_for`]). The port speaks the StyleWriter's serial
     /// command language, which passes through untouched apart from the
-    /// printer's fast mode. `fast_clock` says whether the port can follow a
-    /// Color StyleWriter into it (see [`FastClock`]).
+    /// printer's fast mode. `fast_clock` says whether the port can follow the
+    /// printer into it (see [`FastClock`]).
     pub fn stylewriter(net: Net<'a, P>, name: &str, fast_clock: FastClock) -> Result<Self, BindError> {
         Self::bind(net, name, stylewriter::NBP_TYPE, 1, |inner, sockets| {
             // ADSP connection IDs want to differ across boots, so a Mac does

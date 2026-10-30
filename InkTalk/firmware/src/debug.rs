@@ -777,8 +777,9 @@ fn pio_status(shared: &SharedState) -> heapless::String<1024> {
         // From UARTFR.CTS, which is what the transmitter acts on.
         if crate::printer::handshake_high() { "READY" } else { "BUSY" },
         if crate::printer::handshake_gating() { "on" } else { "off" },
-        // The raw SIO bit, which INOVER inverts: expect the opposite of the
-        // voltage you measure on the pin.
+        // The raw SIO bit. While the UART has the port INOVER inverts it, so
+        // expect the opposite of the voltage on the pin. On the printer's
+        // HSKi clock it matches the pin.
         crate::printer::handshake_pad() as u8,
     );
     // Bytes the UART has accepted but not got rid of. With gate=on and
@@ -788,6 +789,17 @@ fn pio_status(shared: &SharedState) -> heapless::String<1024> {
         s,
         "Printer: uart_tx={}\r\n",
         if crate::printer::tx_in_flight() { "HOLDING" } else { "drained" },
+    );
+    // HSKi while a Colour StyleWriter is in its fast mode (see fast_clock.rs),
+    // and 230400 baud while a StyleWriter II or 1200 is.
+    let _ = write!(
+        s,
+        "Printer: clock={}\r\n",
+        match crate::printer::port_clock() {
+            tailtalk_net::printer::PortClock::Normal => "own",
+            tailtalk_net::printer::PortClock::PrinterHski => "HSKi",
+            tailtalk_net::printer::PortClock::Baud230400 => "own 230400",
+        },
     );
     // GP29 is the UART RX pin. Idle mark is high; a stuck-low line means
     // the transceiver or the wire is holding a break, not that the printer

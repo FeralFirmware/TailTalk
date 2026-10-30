@@ -21,6 +21,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use embassy_rp::pac;
 use embassy_rp::pac::dma::vals::{DataSize, TreqSel};
+use crate::localtalk::phy::{pio0_ctrl_clear, pio0_ctrl_set};
 use portable_atomic::AtomicU32;
 use localtalk::backoff::BackoffState;
 use localtalk::bitstuff::{BitUnstuffer, UnstuffEvent, FLAG};
@@ -381,22 +382,18 @@ fn mark_activity() {
     unsafe { LAST_ACTIVITY_US = read_timer_us(); }
 }
 
+// Core 0 drives PIO0's other state machines, so these go through CTRL's
+// atomic aliases.
 fn enable_pio0_sm0() {
-    pac::PIO0.ctrl().modify(|w| {
-        w.set_sm_enable(w.sm_enable() | 1);
-    });
+    pio0_ctrl_set(|w| w.set_sm_enable(1));
 }
 
 fn disable_pio0_sm0() {
-    pac::PIO0.ctrl().modify(|w| {
-        w.set_sm_enable(w.sm_enable() & !1);
-    });
+    pio0_ctrl_clear(|w| w.set_sm_enable(1));
 }
 
 fn restart_pio0_sm0() {
-    pac::PIO0.ctrl().modify(|w| {
-        w.set_sm_restart(1);
-    });
+    pio0_ctrl_set(|w| w.set_sm_restart(1));
 }
 
 fn pio0_tx_fifo_empty() -> bool {
