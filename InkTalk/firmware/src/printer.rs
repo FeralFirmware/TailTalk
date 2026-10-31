@@ -274,11 +274,16 @@ impl Read for PortRx {
     }
 }
 
+/// The most bytes `tx_run` hands over in one go. A printer on its fast clock
+/// takes this many in about 3 ms, so the task wakes a few hundred times a
+/// second at most.
+const TX_CHUNK: usize = 256;
+
 /// Feed the printer from [`TX_PIPE`], at whichever clock the port is on.
 /// `base_baud` is what the UART runs at outside a fast mode.
 #[embassy_executor::task]
 pub async fn tx_run(mut tx: BufferedUartTx<'static, UART0>, mut fast: FastTx, base_baud: u32) -> ! {
-    let mut buf = [0u8; 64];
+    let mut buf = [0u8; TX_CHUNK];
     loop {
         // The pipe is polled first, so a clock switch waits for every byte
         // queued ahead of it.

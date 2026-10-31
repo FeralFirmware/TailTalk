@@ -13,6 +13,10 @@
 //!   side of the rising edge to sample it.
 //! - SM2 receives on GP29 (`PRINT_R`), sampling on each rising edge.
 //!
+//! DMA channel 2 keeps SM1's FIFO full. The printer can take a byte every
+//! 11 us, and waking a task that often would leave core 0 little time for
+//! the stack and USB.
+//!
 //! Both run at the full system clock, so an edge is acted on within a few
 //! 8 ns cycles of reaching the pad. HSKi reaches GP18 the right way up
 //! (see `printer.rs`), so the state machines see it with the pad's input
@@ -30,9 +34,9 @@
 use embassy_rp::gpio::Level;
 use embassy_rp::pac;
 use embassy_rp::pac::io::vals::Inover;
-use embassy_rp::peripherals::PIO0;
+use embassy_rp::peripherals::{DMA_CH2, PIO0};
 use embassy_rp::pio::{Config, Direction, FifoJoin, PioPin, ShiftConfig, ShiftDirection, StateMachine};
-use embassy_rp::Peripheral;
+use embassy_rp::{Peripheral, PeripheralRef};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use pio::{InstructionOperands, JmpCondition, SetDestination};
 
@@ -44,9 +48,10 @@ const HSKI_GPIO: usize = 18;
 const FUNCSEL_UART0: u8 = 0x02;
 const FUNCSEL_PIO0: u8 = 0x06;
 
-/// How long the printer can go without taking a byte before its clock is
-/// taken to have stopped, most likely because it was reset or switched
-/// off. A clocking printer takes a byte about every 11 us.
+/// How long the printer can take over a write or a flush before its clock
+/// is taken to have stopped, most likely because it was reset or switched
+/// off. A clocking printer takes a byte about every 11 us, so even a full
+/// chunk from the printer TX task only takes a few milliseconds.
 const CLOCK_LOST: Duration = Duration::from_secs(2);
 
 /// Long enough for the printer to clock in the last stop bit, at any clock
@@ -68,6 +73,7 @@ fn set_hski_inversion(invert: bool) {
 /// needs. The printer TX task owns it and switches between chunks.
 pub struct FastTx {
     sm: StateMachine<'static, PIO0, TX_SM>,
+    dma: PeripheralRef<'static, DMA_CH2>,
     /// The data pin, whose FUNCSEL moves between UART0 and PIO0.
     tx_gpio: usize,
     tx_origin: u8,
@@ -94,6 +100,7 @@ pub struct Received {
 /// takes them back.
 pub fn init(
     spare: Pio0Spare,
+    dma: DMA_CH2,
     tx_pin: impl Peripheral<P = impl PioPin> + 'static,
     rx_pin: impl Peripheral<P = impl PioPin> + 'static,
 ) -> (FastTx, FastRx) {
@@ -178,6 +185,7 @@ pub fn init(
     (
         FastTx {
             sm: tx_sm,
+            dma: dma.into_ref(),
             tx_gpio: usize::from(tx_pin.pin()),
             tx_origin: tx_loaded.origin,
             rx_origin: rx_loaded.origin,
@@ -240,14 +248,12 @@ impl FastTx {
         pac::UART0.uartcr().modify(|w| w.set_rxe(true));
     }
 
-    /// Send bytes at the printer's clock, waiting while the FIFO is full.
+    /// Send bytes at the printer's clock, returning once the last has gone
+    /// into the FIFO. Each byte fills a whole FIFO word, and SM1 only shifts
+    /// out the low eight bits.
     pub async fn write(&mut self, data: &[u8]) -> Result<(), ClockLost> {
-        for &b in data {
-            with_timeout(CLOCK_LOST, self.sm.tx().wait_push(u32::from(b)))
-                .await
-                .map_err(|_| ClockLost)?;
-        }
-        Ok(())
+        let transfer = self.sm.tx().dma_push(self.dma.reborrow(), data);
+        with_timeout(CLOCK_LOST, transfer).await.map_err(|_| ClockLost)
     }
 
     /// Wait until the last byte has gone out, stop bit and all.
