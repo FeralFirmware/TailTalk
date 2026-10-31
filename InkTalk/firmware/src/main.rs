@@ -262,9 +262,11 @@ fn main() -> ! {
     // The fast clock's state machines take GP28 and GP29 for PIO0 while
     // they are set up, and building the UART hands both back to it.
     // SAFETY: the UART is the pins' only other user, and fast_clock.rs
-    // moves GP28 between the two so only one drives it at a time.
+    // moves GP28 between the two so only one drives it at a time. Channel 2
+    // is free because core 1 only uses channels 0 and 1.
     let (fast_tx, fast_rx) = fast_clock::init(
         pio0_spare,
+        p.DMA_CH2,
         unsafe { p.PIN_28.clone_unchecked() },
         unsafe { p.PIN_29.clone_unchecked() },
     );
