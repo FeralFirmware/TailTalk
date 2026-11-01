@@ -4,40 +4,56 @@ Write up of my learnings from decompiling the official Apple driver for these pr
 
 From what I can tell of these drivers these printers are incredibly simple in that virtually all formatting and control is done from the host. The onboard logic requires the host to write to the printers RAM the current page to be printed, signal the page is ready and the printer then begins printing exactly what was handed to it with no real interpretation.
 
-It can be thought of to be _kinda_ like the StyleWriter, but far more primitive in that the host is entirely in control (so the host is entirely in charge of not overrunning RAM), 
+It can be thought of to be _kinda_ like the StyleWriter, but far more primitive in that the host is entirely in control and must fill in the onboard RAM and tell the printer when exactly to print.
 
 The rough flow for driving it is:
 
-- Switch the interface (on the host) to being externally clocked via HSKi. I am _pretty_ sure at this point there is no way around this, and the printer uses this to clock data in and out of its interface.
+- Switch the interface (on the host) to being externally clocked via HSKi. This is the only way
+  to communicate with the printer, with my Personal 300 clocking it at roughly 530kHz.
 - Send the link reset sequence and query the current status of the printer, and its engine/controller type. 
-- Check the current paper size, any errors, and presence of errors.
-- Probe the size of the onboard RAM to know what features we can use (The Select 300 has a SIMM slot, the PLW 300 does not)
+- Check for paper presence, and any errors that might be set (The Apple driver does not check for errors before printing attempts, but we can do better)
+- If page RAM is reported (As on the Select 300 and LS models), probe the RAM to see how much is present. 
 - Feed page data to it one page at a time, as one "packet" per scan line with the same RLE as a StyleWriter.
 - After the current page has been fed in to RAM, send the print sequence
 - Wait for the printer to signal it has finished that page and begin the next, if applicable.
 
 ## Data link
 
-Clocked via the printer via HSKi, one bit per clock edge. Every "packet" to the printer starts with a "BREAK" 
-sequence, which is a logic 0 sent for a short period of time. This is _fuzzy_ how lon it precisely takes on the Mac, but a few dozen microseconds should be sufficient. I assume this is for the onboard logic to "ready" for a command from us.
+The printer constantly drives the HSKi line as long as it is powered up. This can be used to 
+detect if the printer is currently connected and powered on. I have yet to find a case where
+this clock stops.
 
-After the BREAK, the format then is a 2 byte command code, args for the command, and the XOR of those bytes:
+The data link itself is clocked by the printer via HSKi as 8N1, LSB first. Transmits towards
+the printer should be changed on the falling edge of this clock, and receives from the printer
+should be sampled by us on the rising edge.
+
+Every "packet" to the printer starts with a "BREAK" sequence, which is a logic 0 sent for a short period of time.  I assume this is for the onboard logic to "ready" for a command from us. When sampled with my Saleae my PowerBook G3 took approx 180uS, but I am not sure what the true minimum is required here. 
+
+The Mac left a minimum of 210uS from the BREAK to the first bytes and 310uS between packets.
+
+After the BREAK, the format then is a 1 byte command code, 1 arg byte for the command, and the XOR of those two bytes:
 ```
 BREAK  cmd  arg  cmd^arg
 ``` 
 
-Depending on the command the printer may send up to 1 byte back as a response, with the original driver allowing up
-to 5 seconds for these before timing out.
+The printer generally returns 1 byte from each command, with the notable exception being 0x8E -
+if the printer responds with 0x00 and the printer does _not_ have page RAM, an additional
+byte should be expected which contains the status byte.
 
-If the response is 0x81 - 0xFF this should be considered an error with a request to immediately retry the command. The
-original driver retries up to 5 times before giving up.
+The driver waits up to 5 seconds for a response to these before timing out. Note that for some commands like 0x82 I noticed the
+printer would start answering us whilst we we are still transmitting the XOR byte, and for others like 0x83 it would take approx 30ms to respond.
 
-The printer can also send a BREAK sequence towards us, which is its way of signaliIng a sort of interrupt towards the 
-host, where the host should then send 0x83 0x00 towards it to read the status register. 
+If the response to a 0x83 command is 0x81 - 0xFF this should be considered an error with a request to immediately retry the command.
+The original driver retries up to 4 times before giving up. 0x80 seems to be a special "not supported" response for some commands in the original driver
+
+The printer can also send a BREAK sequence towards us, which is its way of signaling a sort of interrupt towards the 
+host, where the host should then send 0x8E 0x00 towards it to read the status register. 
 
 ## Probe Sequence
 
-The below sequence is what the original Apple driver sends when it brings up the printer link and tries to discover what is attached to it. Note that I am very much guessing on what each "engine identity" resolves to based on how the original driver later handles them (Like the Select has multiple tray feeds, the one on the end has special B4 paper handling so I think it was some Japanese model, and such)
+The below sequence is the planned InkTalk identify-and-query sequence based on the original Apple driver. The Apple driver follows steps 1 through 4, with subsequent steps being ones I plan to have for InkTalk.
+
+Note that I am very much guessing on what each "engine identity" resolves to based on how the original driver later handles them (Like the Select has multiple tray feeds, the one on the end has special B4 paper handling so I think it was some Japanese model, and such). The only confirmed one is 0x29 as a Personal LaserWriter 300 as I validated against it.
 
 ```mermaid
 flowchart TD
@@ -65,7 +81,7 @@ flowchart TD
     ctrl -->|"bit 6 (0x40) set, bit 7 (0x80) unset"| ram["Page RAM and pointers"]
     ctrl -->|"otherwise"| noram["No page RAM"]
 
-    feeds["5. BREAK 83 25 A6<br/>Which paper trays are fitted?<br/>Save the reply for the cassette questions at step 9"]
+    feeds["5. BREAK 83 25 A6<br/>Which paper trays are fitted?<br/>Save the reply for the cassette questions at step 9.<br/>PLW300 does not support this query and returns 0x80 (not supported)"]
     ram --> feeds
     noram --> feeds
 
@@ -111,6 +127,12 @@ Notes:
   is the lower cassette.
 - The driver checks paper size only for the cassette feeds. I dont believe there is a way to check
   the multipurpose cassettes (or at least I didnt see any).
+
+## Status Regisgter (`8E 00`)
+| Bit | Meaning |
+| 0 | RAM full (as in the job tried to write beyond the onboard RAM) |
+| 1 | Printer Error (Query the Engine status below if seen) |
+| 2 | Page done (Success! Send the next page one if needed, otherwise done) |
 
 ## Engine status (`83 01`, `83 02`, `83 04`, `83 07`)
 
