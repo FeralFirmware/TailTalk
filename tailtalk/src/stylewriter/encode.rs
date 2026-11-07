@@ -70,6 +70,17 @@ impl Band {
     pub fn row_bytes(&self) -> usize {
         usize::from(self.width).div_ceil(8)
     }
+
+    /// The rect ahead of the band's blocks, with its left edge at `left`. It
+    /// spans every dot of the bytes a row is coded in, padding included, which
+    /// can be a few dots wider than the band. The printer reads a row as the
+    /// rect's width in whole bytes, rounded down, so a rect only as wide as a
+    /// band 2916 dots across (Letter on a 2200) reads 364-byte rows where 365
+    /// were sent.
+    pub fn rect(&self, left: u16) -> Vec<u8> {
+        let right = left + (self.row_bytes() * 8) as u16 - 1;
+        rect(self.kind.tag(), left, self.top, right, self.bottom())
+    }
 }
 
 /// Code a band's rows. Every plane is padded with white to the band's width,
@@ -308,6 +319,22 @@ mod tests {
         assert_eq!(rect(b'R', 20, 10, 40, 30), [b'R', 20, 0, 10, 0, 40, 0, 30, 0]);
         assert_eq!(rect(BandKind::Color.tag(), 20, 10, 40, 30)[0], b'c');
         assert_eq!(g_block(&[0xAB, 0xCD, 0xEF]), [b'G', 3, 0, 0xAB, 0xCD, 0xEF, 0]);
+
+        // A band's rect covers whole bytes, so its right edge is where the
+        // coded rows end. Letter on a 2200 is 2916 dots across in 365 bytes.
+        let right = |width: u16, left: u16| {
+            let band = Band { top: 10, width, kind: BandKind::Mono, rows: vec![vec![MASK_RUNWHT]; 3] };
+            let rect = band.rect(left);
+            assert_eq!(rect[3..5], [10, 0], "top");
+            assert_eq!(rect[7..9], [12, 0], "bottom");
+            u16::from_le_bytes([rect[5], rect[6]])
+        };
+        assert_eq!(right(2916, 0), 2919);
+        assert_eq!(right(2919, 0), 2919);
+        assert_eq!(right(2920, 0), 2919);
+        assert_eq!(right(2832, 0), 2831);
+        assert_eq!(right(2880, 16), 2895);
+        assert_eq!(right(9, 0), 15);
 
         let band = Band { top: 0, width: 8, kind: BandKind::Mono, rows: vec![vec![1; 10]; 5] };
         let blocks = band_blocks(&band, G_FRAMING + 25);

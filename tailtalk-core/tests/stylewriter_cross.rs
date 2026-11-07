@@ -56,8 +56,9 @@ const PRINTER_MAC: [u8; 6] = [2, 0, 0, 0, 0, 77];
 enum Sent {
     /// `FF FF FF <q>`.
     Query(u8),
-    /// A rect, with its tag (`R` or `c`), its left edge and its top row.
-    Rect { tag: u8, left: u16, top: u16 },
+    /// A rect, with its tag (`R` or `c`), its left and right edges and its
+    /// top row.
+    Rect { tag: u8, left: u16, right: u16, top: u16 },
     /// A G block's raster bytes.
     Raster(Vec<u8>),
     /// Any other command, `m` with its digit.
@@ -115,6 +116,7 @@ impl PrinterSim {
                         tag: rest[0],
                         left: u16::from_le_bytes([rest[1], rest[2]]),
                         top: u16::from_le_bytes([rest[3], rest[4]]),
+                        right: u16::from_le_bytes([rest[5], rest[6]]),
                     },
                 ),
                 b'G' if rest.len() < 3 => break,
@@ -345,7 +347,8 @@ async fn events_to_job_end(events: &mut mpsc::UnboundedReceiver<StyleWriterEvent
 /// each page's `L`, raster and form feed, then `E` and `l`. A clean job ends
 /// without a reset. The second page has only black on it below a blank top, so
 /// its blank rows never go to the printer and the rest prints at 1 bit in an `R`
-/// band, still under the colour page mode.
+/// band, still under the colour page mode. The pages are 61 dots across, so each
+/// rect reaches dot 63, the last of the 8 bytes every row is coded in.
 #[tokio::test]
 async fn embedded_stylewriter_prints_a_color_job_in_order() {
     let Bench { ddp, mut events, printer, sent } = bench_on(CS2200, FastClock::Supported);
@@ -357,8 +360,8 @@ async fn embedded_stylewriter_prints_a_color_job_in_order() {
 
     let family = StyleWriterFamily::Color(tailtalk::stylewriter::ColorModel::Cs2200);
     let pages = [
-        rgb_page(64, 8, |_, y| if y < 4 { [0, 0, 0] } else { [255, 0, 0] }),
-        rgb_page(64, 12, |x, y| if (4..8).contains(&y) && x < 20 { [0, 0, 0] } else { [255, 255, 255] }),
+        rgb_page(61, 8, |_, y| if y < 4 { [0, 0, 0] } else { [255, 0, 0] }),
+        rgb_page(61, 12, |x, y| if (4..8).contains(&y) && x < 20 { [0, 0, 0] } else { [255, 255, 255] }),
     ];
     let job = JobOptions { rendering: Rendering::Color, quality: PrintQuality::Normal, ..JobOptions::default() };
     session.setup(family, job).await.expect("setup failed");
@@ -385,7 +388,10 @@ async fn embedded_stylewriter_prints_a_color_job_in_order() {
     ];
     assert_eq!(commands(&sent), expected, "{sent:?}");
     let rects: Vec<&Sent> = sent.iter().filter(|s| matches!(s, Sent::Rect { .. })).collect();
-    assert_eq!(rects, [&Sent::Rect { tag: b'c', left: 0, top: 0 }, &Sent::Rect { tag: b'R', left: 0, top: 4 }]);
+    assert_eq!(
+        rects,
+        [&Sent::Rect { tag: b'c', left: 0, right: 63, top: 0 }, &Sent::Rect { tag: b'R', left: 0, right: 63, top: 4 }]
+    );
     assert_eq!(sent.get(1), Some(&Sent::Query(b'I')));
     assert!(!sent.iter().skip(2).any(|s| s == &Sent::Query(b'I')), "no reset after the first");
 }
