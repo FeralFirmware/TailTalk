@@ -735,10 +735,7 @@ impl StyleWriterSession {
         self.wait_output_drained()
             .await
             .map_err(|e| e.context("waiting for the last band to go out"))?;
-        let left = self.family.rect_left();
-        let right = left + band.width - 1;
-        self.send(&encode::rect(band.kind.tag(), left, band.top, right, band.bottom()))
-            .await?;
+        self.send(&band.rect(self.family.rect_left())).await?;
         let room = self.family.block_room(band.kind, band.row_bytes());
         let mut block = Vec::new();
         for row in &band.rows {
