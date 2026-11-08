@@ -127,9 +127,11 @@ impl Nbp {
                                 // the lookup onto other cables, like the far side of a bridge),
                                 // falling back to a local broadcast only when there is none.
                                 // That is exactly the "=" (all zones) dispatch; the two differ
-                                // only in the zone carried in the request, which stays intact.
+                                // only in the zone carried in the request. (The BrRq
+                                // path needs to rename the zone explicitly).
                                 let mut zone_buf = [0u8; MAX_NAME_UTF8_LEN];
                                 let zone = lookup.request.zone.decode(&mut zone_buf).unwrap_or("");
+                                let this_zone = zone == "*";
                                 let dispatch = match zone {
                                     "*" | "=" => self.route_table.nbp_dispatch(NbpZone::All),
                                     z => self.route_table.nbp_dispatch(NbpZone::Named(z)),
@@ -166,12 +168,24 @@ impl Nbp {
                                             // through to one on the other interface.
                                             let iface = self.route_table.interface_for_net(router.network_number);
                                             let our_addr = self.addr_on(iface).await;
+                                            // A BrRq from a PhaseII/extended network must specify
+                                            // the actual zone name, not "*" (Inside AppleTalk
+                                            // 7-11); otherwise, strictly-compliant routers will drop it.
+                                            // Use the zone we got from ZIP.
+                                            let mut tuple = make_tuple(our_addr);
+                                            if this_zone
+                                                && let Some(z) = iface
+                                                    .and_then(|i| self.route_table.zones_on(i).into_iter().next())
+                                                && let Ok(z) = z.as_str().try_into()
+                                            {
+                                                tuple.entity_name.zone = z;
+                                            }
                                             let packet = NbpPacket {
                                                 operation: NbpOperation::BroadcastRequest,
                                                 transaction_id: tid,
                                                 tuples: {
                                                     let mut t = tailtalk_packets::heapless::Vec::new();
-                                                    let _ = t.push(make_tuple(our_addr));
+                                                    let _ = t.push(tuple);
                                                     t
                                                 },
                                             };
