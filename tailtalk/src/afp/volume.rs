@@ -26,6 +26,12 @@ const FINDER_INFO_XATTR: &str = "user.com.apple.FinderInfo";
 #[cfg(windows)]
 const FINDER_INFO_STREAM: &str = "com.apple.FinderInfo";
 
+/// Whether a directory entry is hidden from the client. Symlinks are hidden
+/// for now since following them could loop or escape the volume.
+fn is_hidden_entry(name: &str, file_type: std::fs::FileType) -> bool {
+    name == ".tailtalk" || name == ".AppleDesktop" || file_type.is_symlink()
+}
+
 /// Classic Mac OS four-character type/creator codes for a file.
 struct TypeCreator {
     file_type: [u8; 4],
@@ -38,6 +44,11 @@ struct TypeCreator {
 /// listing, and `load()` rebuilds the whole compiled database each call (~37 ms
 /// in release) instead of sharing one `OnceLock` copy.
 fn infer_type_creator_from_content(path: &Path) -> Option<TypeCreator> {
+    // pure-magic expects a regular file; directories, FIFOs and devices can't be probed safely.
+    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return None;
+    }
+
     let db = magic_db::global().ok()?;
     let magic = db.first_magic_file(path).ok()?;
 
@@ -1043,7 +1054,8 @@ impl Volume {
             let mut read_dir = tokio::fs::read_dir(&current_dir).await?;
             while let Some(entry) = read_dir.next_entry().await? {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name == ".tailtalk" || name == ".AppleDesktop" {
+                let file_type = entry.file_type().await?;
+                if is_hidden_entry(&name, file_type) {
                     continue;
                 }
 
@@ -1055,7 +1067,7 @@ impl Volume {
                     let new_id = self.next_id;
                     self.next_id += 1;
 
-                    let is_dir = entry.file_type().await?.is_dir();
+                    let is_dir = file_type.is_dir();
 
                     let node = Node {
                         id: new_id,
@@ -1101,14 +1113,15 @@ impl Volume {
 
         while let Some(entry) = read_dir.next_entry().await? {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name == ".tailtalk" || name == ".AppleDesktop" {
+            let file_type = entry.file_type().await?;
+            if is_hidden_entry(&name, file_type) {
                 continue;
             }
             let rel_path = dir_path.join(&name);
             if self.path_to_id.contains_key(&rel_path) {
                 continue;
             }
-            let is_dir = entry.file_type().await?.is_dir();
+            let is_dir = file_type.is_dir();
             let new_id = self.next_id;
             self.next_id += 1;
             self.nodes.insert(
@@ -1295,7 +1308,7 @@ impl Volume {
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name == ".tailtalk" || name == ".AppleDesktop" {
+            if is_hidden_entry(&name, entry.file_type().await?) {
                 continue;
             }
             count = count.saturating_add(1);
@@ -1843,15 +1856,14 @@ impl Volume {
                 .map_err(|_| AfpError::ObjectNotFound)?
             {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name == ".tailtalk" || name == ".AppleDesktop" {
-                    continue;
-                }
-                let is_dir = entry
+                let file_type = entry
                     .file_type()
                     .await
-                    .map_err(|_| AfpError::ObjectNotFound)?
-                    .is_dir();
-                entries.push((name, is_dir));
+                    .map_err(|_| AfpError::ObjectNotFound)?;
+                if is_hidden_entry(&name, file_type) {
+                    continue;
+                }
+                entries.push((name, file_type.is_dir()));
             }
             entries.sort_by(|a, b| match (a.1, b.1) {
                 (true, false) => std::cmp::Ordering::Less,
