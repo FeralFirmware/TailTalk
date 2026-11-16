@@ -364,6 +364,15 @@ enum State {
 /// enough to cover the ADSP open retry budget on the reverse connection.
 const HANDSHAKE_TIMEOUT_US: Micros = 15_000_000;
 
+/// How long a client may go unheard before it is probed. Four of these with
+/// no answer, 20 seconds, and the client is taken to be gone.
+///
+/// This is well inside ADSP's own two minutes because a dead client holds the
+/// printer against everyone else, and the time only has to cover a live one
+/// answering. Its ADSP driver does that whatever the application is up to, so
+/// a client that is just quiet, rendering a page say, is never dropped.
+const CLIENT_PROBE_INTERVAL_US: Micros = 5_000_000;
+
 pub struct StyleWriterRole {
     endpoint: AdspEndpoint,
     state: State,
@@ -401,6 +410,7 @@ impl StyleWriterRole {
     pub fn new(control_socket: u8, seed: u32, fast_clock: FastClock) -> Self {
         let mut endpoint = AdspEndpoint::new(control_socket, seed);
         endpoint.set_listening(true);
+        endpoint.set_connection_timeout(CLIENT_PROBE_INTERVAL_US);
         Self {
             endpoint,
             state: State::Idle,
@@ -1282,6 +1292,53 @@ mod tests {
         assert!(saw_reset, "printer reset must be injected");
         assert!(saw_unclean_end);
         assert!(!role.busy());
+    }
+
+    /// A client that dies mid-job while the printer has nothing to say leaves
+    /// no unacked data to give up on. Only the connection timer can notice,
+    /// and until it does every other client is answered "busy".
+    #[test]
+    fn a_client_that_vanishes_with_nothing_in_flight_is_released() {
+        let (mut role, _mac, _data_conn) = job_in_progress(FastClock::Unsupported);
+        assert!(role.busy());
+        while role.poll_event().is_some() {}
+        while role.poll_transmit().is_some() {}
+
+        let mut now = 0;
+        for _ in 0..16 {
+            let Some(deadline) = role.next_deadline() else {
+                break;
+            };
+            now = deadline;
+            role.poll(now);
+            while role.poll_transmit().is_some() {}
+        }
+
+        let events: Vec<_> = core::iter::from_fn(|| role.poll_event()).collect();
+        assert!(events.contains(&StyleWriterEvent::JobEnded { clean: false }), "{events:?}");
+        assert!(events.contains(&StyleWriterEvent::ToPrinter(PRINTER_RESET.to_vec())));
+        assert!(!role.busy(), "a dead client must not hold the printer");
+        assert!(now <= 200 + 20_000_000, "released within 20 seconds, at {now}");
+    }
+
+    /// Going quiet is not going away. A client that sends nothing for far
+    /// longer than the timer, but whose driver answers its probes, keeps the
+    /// printer, which is the case the short timer must not get wrong.
+    #[test]
+    fn a_quiet_client_that_answers_probes_keeps_the_printer() {
+        let (mut role, mut mac, _data_conn) = job_in_progress(FastClock::Unsupported);
+        let mac_addr = addr(10, 70);
+        while role.poll_event().is_some() {}
+
+        let mut now = 200;
+        for _ in 0..120 {
+            now = role.next_deadline().expect("the timer is always running");
+            role.poll(now);
+            shuttle(&mut role, &mut mac, mac_addr, now);
+        }
+        assert!(now > 10 * 60 * 1_000_000, "ten minutes of quiet, reached {now}");
+        assert!(role.busy(), "the job is still running");
+        assert!(role.poll_event().is_none(), "and nothing has ended it");
     }
 
     /// With fast clock support the switch reaches the printer, and the port

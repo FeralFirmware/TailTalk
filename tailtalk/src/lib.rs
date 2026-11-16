@@ -357,30 +357,29 @@ impl PacketProcessor {
                         continue;
                     }
 
-                    match addressing_handle.addr().await {
-                        Ok(addr) => {
-                            let node_id = addr.node_number;
-                            tracing::info!("TashTalk: setting node ID bits for node {}", node_id);
-                            let mut node_bits = [0u8; 32];
-                            node_bits[(node_id / 8) as usize] |= 1 << (node_id % 8);
-                            if let Err(e) = tashtalk_instance.set_node_ids(node_bits).await {
-                                tracing::error!("TashTalk set_node_ids failed: {:?}", e);
-                                continue;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("TashTalk: failed to get address: {:?}", e);
-                            continue;
-                        }
+                    // Addressing has to be past its startup probe, so that
+                    // what it publishes from here on is the probe below.
+                    if let Err(e) = addressing_handle.addr().await {
+                        tracing::error!("TashTalk: failed to get address: {:?}", e);
+                        continue;
                     }
-                    // The node bits above reflect the current address; don't
-                    // replay an already-seen change notification.
+                    // No node until that probe is over. An adapter drops what
+                    // looks like an echo of its own frames, and that would
+                    // include the ACK of a node defending the same address.
+                    if let Err(e) = tashtalk_instance.set_node_ids([0; 32]).await {
+                        tracing::error!("TashTalk set_node_ids failed: {:?}", e);
+                        continue;
+                    }
                     let _ = addr_watch.borrow_and_update();
 
                     // ── Create TX channel for this connection ────────────
                     let (tx, mut tashtalk_rx) = mpsc::channel::<Vec<u8>>(100);
                     let _ = tx_watch.send(Some(tx));
                     let _ = ready.send(true);
+
+                    // The loop below has to be running to hear any ACK, and
+                    // its address watch sets the node bits once this settles.
+                    addressing_handle.link_up();
 
                     // ── Main I/O loop ────────────────────────────────────
                     tracing::info!("TashTalk: online");
@@ -396,7 +395,7 @@ impl PacketProcessor {
                                 };
                                 if let Some(addr) = new_addr {
                                     let node_id = addr.node_number;
-                                    tracing::info!("TashTalk: address changed, setting node ID bits for node {node_id}");
+                                    tracing::info!("TashTalk: setting node ID bits for node {node_id}");
                                     let mut node_bits = [0u8; 32];
                                     node_bits[(node_id / 8) as usize] |= 1 << (node_id % 8);
                                     if let Err(e) = tashtalk_instance.set_node_ids(node_bits).await {

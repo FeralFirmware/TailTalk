@@ -41,7 +41,18 @@ enum AarpCommand {
     OurAddr(SelfAddress),
     SetAddr(SetAddress),
     Probe(ProbeAddress),
+    /// The LocalTalk adapter has just come up.
+    LinkUp,
 }
+
+/// ENQs sent for a LocalTalk node once the adapter is up. A frame already on
+/// the wire can outlast one ENQ's 10 ms window, and a defender can't answer
+/// until it has finished.
+const LINK_UP_ENQS: usize = 3;
+
+/// Nodes tried once the adapter is up before settling for the last. A
+/// LocalTalk cable would have to be nearly full to get this far.
+const LINK_UP_ATTEMPTS: usize = 64;
 
 pub struct Addressing {
     packet_recv: mpsc::Receiver<(AarpPacket, AddressSource)>,
@@ -317,6 +328,10 @@ impl Addressing {
                                 let available = self.probe_candidate(req.addr, Some(our_addr)).await;
                                 let _ = req.chan.send(available);
                             },
+                            AarpCommand::LinkUp => {
+                                our_addr = self.confirm_on_link(our_addr).await;
+                                let _ = self.addr_tx.send(Some(our_addr));
+                            },
                         }
                     }
                 }
@@ -407,6 +422,37 @@ impl Addressing {
                 }
             },
         }
+    }
+
+    /// Make sure `addr` is free on a LocalTalk cable we can now hear, or find
+    /// one that is. The startup probe can't do this, since it runs before the
+    /// adapter is open, and a node can also be claimed while the adapter is
+    /// unplugged.
+    async fn confirm_on_link(&mut self, mut addr: AppleTalkAddress) -> AppleTalkAddress {
+        // ACKs are only read during a probe, so anything here is old news.
+        while self.lt_ack_recv.try_recv().is_ok() {}
+        for _ in 0..LINK_UP_ATTEMPTS {
+            if self.node_is_free(addr).await {
+                tracing::info!("LocalTalk: node {} confirmed", addr.node_number);
+                return addr;
+            }
+            if self.cancel.is_cancelled() {
+                return addr;
+            }
+            tracing::warn!("LocalTalk: node {} in use, retrying", addr.node_number);
+            addr.node_number = rand::rng().random_range(1..=253);
+        }
+        tracing::warn!("LocalTalk: no free node found, keeping {}", addr.node_number);
+        addr
+    }
+
+    async fn node_is_free(&mut self, addr: AppleTalkAddress) -> bool {
+        for _ in 0..LINK_UP_ENQS {
+            if !self.probe_candidate(addr, None).await {
+                return false;
+            }
+        }
+        true
     }
 
     /// Probe a candidate address on the network to see if it is in use. Does not
@@ -525,6 +571,15 @@ impl AddressingHandle {
         match &self.inner {
             AddressingInner::Local { addr_watch, .. } => Some(addr_watch.clone()),
             AddressingInner::Remote { .. } => None,
+        }
+    }
+
+    /// Tell a LocalTalk interface its adapter has just come up. It probes its
+    /// node again now that it can hear the cable, moves to another if that one
+    /// is taken, and publishes the result on [`Self::addr_watch`] either way.
+    pub fn link_up(&self) {
+        if let AddressingInner::Local { request_send, .. } = &self.inner {
+            let _ = request_send.try_send(AarpCommand::LinkUp);
         }
     }
 
