@@ -3,6 +3,19 @@
 //!
 //! One [`AdspEndpoint`] owns every connection on a single DDP socket.
 //!
+//! Each connection runs the spec's connection timer (Inside AppleTalk 12-5).
+//! Unacked data can show that a far end has gone, but only while there is
+//! some. A far end that dies with nothing in flight says nothing at all, and
+//! the timer is what notices. It restarts on any packet from the far end.
+//! Each time it runs out we send a probe, which the far end has to answer,
+//! and the fourth time, after two minutes of silence, we close.
+//!
+//! An idle far end is never closed, since its ADSP driver answers probes
+//! whatever its client is doing, so the timer only has to outlast the time
+//! a live peer takes to answer. Each end decides that for itself. A host
+//! whose connections tie up something scarce can run it faster with
+//! [`AdspEndpoint::set_connection_timeout`].
+//!
 //! Callers should set the advertised receive window
 //! ([`AdspEndpoint::set_recv_window`]) rather than take the default: it is
 //! the back pressure on a peer, and can be driven down to zero as the
@@ -34,6 +47,10 @@ const MAX_OPEN_RETRIES: u8 = 5;
 /// Attention retransmission, on the same schedule as stream data.
 const ATTN_RETRY_INTERVAL: Micros = 1_000_000;
 const MAX_ATTN_RETRIES: u8 = 5;
+/// How long the connection timer runs, unless a host sets another.
+const CONNECTION_TIMEOUT: Micros = 30_000_000;
+/// The expiry of the connection timer that closes the connection.
+const CONNECTION_EXPIRIES: u8 = 4;
 
 /// Minimal big-endian helpers so this module does not need the byteorder
 /// crate's traits in scope everywhere.
@@ -127,6 +144,10 @@ struct Connection {
     attn_recv_seq: u32,
     /// An attention we sent and have not seen acked, kept for retransmission.
     attn_in_flight: Option<AttnInFlight>,
+    /// When the connection timer last started.
+    timer_start: Micros,
+    /// Times it has run out since the far end was last heard from.
+    timer_expiries: u8,
     /// Monotonic ids for queued writes; a write is "complete" once fully
     /// cut into packets (in flight, not necessarily acked). Callers that
     /// promise write-completion - an `AsyncWrite` flush, say - key off
@@ -140,6 +161,7 @@ pub struct AdspEndpoint {
     /// Accept inbound OpenConnRequests. Off by default for pure clients.
     listening: bool,
     recv_window: u16,
+    connection_timeout: Micros,
     connections: BTreeMap<u16, Connection>,
     pending_opens: BTreeMap<u16, PendingOpen>,
     rng: Rand,
@@ -153,6 +175,7 @@ impl AdspEndpoint {
             local_socket,
             listening: false,
             recv_window: DEFAULT_RECV_WINDOW,
+            connection_timeout: CONNECTION_TIMEOUT,
             connections: BTreeMap::new(),
             pending_opens: BTreeMap::new(),
             rng: Rand::new(seed),
@@ -183,6 +206,12 @@ impl AdspEndpoint {
     /// connection. A peer told zero stops sending, so nothing it sends will
     /// prompt a reply carrying the new window; a receiver with no data of
     /// its own would otherwise leave it waiting forever.
+    /// How long each connection may go unheard before it is probed. It is
+    /// closed after four of these.
+    pub fn set_connection_timeout(&mut self, timeout: Micros) {
+        self.connection_timeout = timeout;
+    }
+
     pub fn set_recv_window(&mut self, window: u16) {
         let reopened = self.recv_window == 0 && window > 0;
         self.recv_window = window;
@@ -295,6 +324,11 @@ impl AdspEndpoint {
         let Some(key) = self.key_by_handle(conn) else {
             return;
         };
+        self.remove_with_advice(key);
+    }
+
+    /// Forget a connection, telling the far end so. It needs no reply.
+    fn remove_with_advice(&mut self, key: u16) {
         let c = self.connections.remove(&key).unwrap();
         let pkt = AdspPacket {
             descriptor: AdspDescriptor::CloseAdvice,
@@ -315,6 +349,11 @@ impl AdspEndpoint {
             return;
         };
         let data = &payload[AdspPacket::HEADER_LEN..];
+
+        if let Some(c) = self.connections.get_mut(&packet.connection_id) {
+            c.timer_start = now;
+            c.timer_expiries = 0;
+        }
 
         if packet.flags & AdspPacket::FLAG_ATTENTION != 0 {
             // Two packets share the Attention flag: a message (a data packet
@@ -386,7 +425,12 @@ impl AdspEndpoint {
             .filter_map(|c| c.attn_in_flight.as_ref())
             .map(|a| a.last_tx + ATTN_RETRY_INTERVAL)
             .min();
-        [retrans, opens, attns]
+        let timers = self
+            .connections
+            .values()
+            .map(|c| c.timer_start + self.connection_timeout)
+            .min();
+        [retrans, opens, attns, timers]
             .into_iter()
             .flatten()
             .min()
@@ -459,6 +503,23 @@ impl AdspEndpoint {
                 continue;
             }
             self.resend_unacked(key, now);
+        }
+
+        // Connection timers.
+        let keys: Vec<u16> = self.connections.keys().copied().collect();
+        for key in keys {
+            let c = self.connections.get_mut(&key).unwrap();
+            if now.saturating_sub(c.timer_start) < self.connection_timeout {
+                continue;
+            }
+            c.timer_start = now;
+            c.timer_expiries += 1;
+            if c.timer_expiries >= CONNECTION_EXPIRIES {
+                self.remove_with_advice(key);
+                self.events.push_back(AdspEvent::Closed { conn: key });
+            } else {
+                self.send_control(key, AdspPacket::FLAG_ACK);
+            }
         }
     }
 
@@ -776,6 +837,12 @@ impl AdspEndpoint {
     }
 
     fn send_ack(&mut self, key: u16) {
+        self.send_control(key, 0);
+    }
+
+    /// Send a control packet with no data. With the Ack Request flag this is
+    /// a probe, which the far end must answer, and without it an ack.
+    fn send_control(&mut self, key: u16, flags: u8) {
         let Some(c) = self.connections.get(&key) else {
             return;
         };
@@ -785,7 +852,7 @@ impl AdspEndpoint {
             first_byte_seq: c.send_seq,
             next_recv_seq: c.recv_seq,
             recv_window: self.recv_window,
-            flags: 0,
+            flags,
         };
         let mut buf = [0u8; AdspPacket::HEADER_LEN];
         pkt.to_bytes(&mut buf).expect("sized buffer");
@@ -945,6 +1012,8 @@ impl Connection {
             attn_send_seq: 0,
             attn_recv_seq: 0,
             attn_in_flight: None,
+            timer_start: now,
+            timer_expiries: 0,
             writes_submitted: 0,
             writes_completed: 0,
         }
@@ -1153,6 +1222,32 @@ mod tests {
         now += RETRANSMIT_TIMEOUT + 1;
         client.poll(now);
         assert!(client.poll_event().is_none(), "teardown must happen once");
+    }
+
+    /// A far end that never answers gets every probe before it is closed. A
+    /// live Mac that is slow to answer one is never closed early.
+    #[test]
+    fn a_silent_far_end_gets_three_probes_before_it_is_closed() {
+        let (mut client, _ca, _server, _sa, client_conn, _server_conn) = connect_pair();
+        client.set_connection_timeout(5_000_000);
+
+        for probe in 1..=3 {
+            client.poll(probe * 5_000_000);
+            assert!(client.poll_event().is_none(), "still open after probe {probe}");
+        }
+        client.poll(20_000_000);
+        assert_eq!(client.poll_event(), Some(AdspEvent::Closed { conn: client_conn }));
+    }
+
+    /// The far end answers a probe with a bare ack. If that drew an answer
+    /// of its own, two idle ends would keep each other talking.
+    #[test]
+    fn a_probe_gets_one_ack_and_nothing_more() {
+        let (mut client, ca, mut server, sa, _client_conn, _server_conn) = connect_pair();
+
+        client.poll(CONNECTION_TIMEOUT);
+        let moved = shuttle(&mut client, ca, &mut server, sa, CONNECTION_TIMEOUT);
+        assert_eq!(moved, 2, "the probe and its ack");
     }
 
     #[test]
