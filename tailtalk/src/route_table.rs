@@ -572,6 +572,31 @@ impl RouteTable {
         });
     }
 
+    /// Record `router` as the A-Router for a nonextended LocalTalk cable
+    /// numbered `cable`, learned from the router's forwarded traffic rather
+    /// than from its RTMP broadcasts. Returns `true` if no router was known
+    /// before. No-op (returning `false`) in [`LearningMode::Static`].
+    ///
+    /// A bridge whose RTMP Data never reaches us intact, or that sends none,
+    /// still forwards long-form DDP onto the cable, and that is enough to tell
+    /// us both the cable's network number and which node routes off it.
+    pub fn note_forwarding_router(&self, router: AppleTalkAddress, cable: u16) -> bool {
+        let mut inner = self.0.write().unwrap();
+        if matches!(inner.mode, LearningMode::Static) {
+            return false;
+        }
+        let first = !inner.has_router(Instant::now());
+        inner.default_router = Some(DefaultRouter {
+            addr: router,
+            interface: Interface::LocalTalk,
+            expires_at: Some(Instant::now() + RTMP_ROUTE_TTL),
+        });
+        if inner.upsert_local_range(Interface::LocalTalk, (cable, cable)) {
+            inner.publish(RouteChange::SetLocalRange((cable, cable)));
+        }
+        first
+    }
+
     /// Drop expired RTMP-learned routes and, if it has lapsed, the A-Router.
     /// Meant to be called periodically (the RTMP listener does this); reads
     /// already ignore expired entries, this just reclaims them.
@@ -609,6 +634,38 @@ impl RouteTable {
     /// Look up the next hop for a destination network.
     pub fn resolve(&self, net: u16) -> Option<NextHop> {
         self.0.read().unwrap().route_for(net, Instant::now())
+    }
+
+    /// One-line dump of local ranges, live RTMP routes and the A-Router, for debug logs.
+    pub fn debug_summary(&self) -> String {
+        let now = Instant::now();
+        let inner = self.0.read().unwrap();
+        let local: Vec<String> = inner
+            .local_ranges
+            .iter()
+            .map(|r| format!("{:?}={}-{}", r.interface, r.range.0, r.range.1))
+            .collect();
+        let routes: Vec<String> = inner
+            .rtmp
+            .entries
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}-{}>{}.{}{}",
+                    e.range_lo, e.range_hi, e.next_hop.network_number, e.next_hop.node_number,
+                    if e.expired(now) { "(expired)" } else { "" }
+                )
+            })
+            .collect();
+        let default = match inner.default_router.as_ref() {
+            Some(r) => format!(
+                "{}.{}{}",
+                r.addr.network_number, r.addr.node_number,
+                if r.expired(now) { "(expired)" } else { "" }
+            ),
+            None => "none".to_string(),
+        };
+        format!("local[{}] routes[{}] a-router={default}", local.join(","), routes.join(","))
     }
 
     /// Find the router for a remote network, if known.
