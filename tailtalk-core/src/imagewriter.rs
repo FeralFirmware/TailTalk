@@ -35,15 +35,6 @@
 //! (manual p89) - hence only ever asking when no job is open. And the reply
 //! carries no terminator, so it is collected until it stops arriving rather
 //! than parsed for an end marker.
-//!
-//! Nothing else the printer sends is forwarded: the option card being
-//! emulated has no reverse data path to the Mac, so job-time chatter is
-//! dropped as it would be on real hardware.
-//!
-//! Everything below bit 7 is a live condition - paper out, off line, cover,
-//! jam - and reading those needs the printer's DTR line, which the current
-//! InkTalk board does not bring to the MCU. Until it does, the role reports
-//! a ready printer and only the ribbon bit is answered from hardware.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -64,14 +55,17 @@ pub const RENAME: &[u8] = &[0x1B, b'b'];
 /// Colour ribbon fitted (status word bit 7). Verified active-high on a
 /// real ImageWriter II; see the module docs for the readings.
 pub const STATUS_COLOUR_RIBBON: u16 = 0x0080;
+/// If the printer is currently reported as busy (i.e processing a job by us/others)
+pub const STATUS_BUSY: u16 = 0x8000;
+/// Set when a status feeder is installed on this printer
+pub const STATUS_SHEET_FEEDER: u16 = 0x0040;
 
-/// Status word for a ready printer, with the ribbon bit supplied by
-/// [`ImageWriterRole::set_colour_ribbon`] or by the self ID reply.
+/// Status word for a ready printer 
 pub const READY_STATUS: u16 = STATUS_COLOUR_RIBBON;
 
 /// Longest self ID reply worth waiting for: `IW` + two width digits + `C` +
 /// `F`. A 15-inch LQ answers the same length.
-const SELF_ID_MAX: usize = 6;
+const SELF_ID_MAX: usize = 8;
 
 /// Quiet time after the last byte that marks the end of the reply. It has
 /// no terminator, and the shortest valid one (`IW10`) is four bytes, so the
@@ -89,11 +83,17 @@ const SELF_ID_TIMEOUT: Micros = 2_000_000;
 enum Ident {
     /// Nothing asked yet, or a job just ended and the ribbon may have moved.
     Due,
-    /// Query sent; collecting an unterminated reply. `last` is when a byte
-    /// most recently arrived, which is what says the reply has finished.
-    Waiting { since: Micros, last: Option<Micros> },
-    /// Answered, or given up on. Nothing further until the next job ends.
+    /// Query sent at `since`, and no reply read yet. Gives up at
+    /// [`SELF_ID_TIMEOUT`].
+    Waiting { since: Micros },
+    /// Answered, or given up on. No further query until the next job ends,
+    /// though a reply that turns up anyway is still read.
     Settled,
+}
+
+pub enum ImageWriterError {
+    /// Returned when we cant correctly parse the ident string from the printer
+    UnknownModel,
 }
 
 /// What the embedder sees. The PAP server's own events pass through; the
@@ -114,13 +114,128 @@ pub enum ImageWriterEvent {
     Rename(Vec<u8>),
 }
 
+pub enum SheetFeeder {
+    II,
+    LQ {
+        /// How many paper bins the sheet feeder has available to pull from
+        bins: u8,
+        /// Whether the envelope attachment is installed
+        envelope: bool,
+    }
+}
+
+#[derive(Default)]
+pub struct ImageWriterII {
+    /// Whether or not a sheet feeder is installed. No options unlike the LQ
+    sheet_feeder: Option<SheetFeeder>,
+    /// Whether a colour ribbon is installed
+    colour_ribbon: bool,
+}
+
+impl ImageWriterII {
+    pub const fn nbp_type(&self) -> &'static str {
+        "ImageWriter"
+    }
+}
+
+#[derive(Default)]
+pub struct ImageWriterLQ {
+    /// Whether or not a sheet feeder is installed, and if so what options it has
+    sheet_feeder: Option<SheetFeeder>,
+    /// Whether a colour ribbon is installed
+    colour_ribbon: bool,
+    /// Whether it is currently set to pull tractor paper or not
+    pull_tractor: bool,
+}
+
+impl ImageWriterLQ {
+    pub const fn nbp_type(&self) -> &'static str {
+        "LQ"
+    }
+}
+
+pub enum ImageWriterModel {
+    ImageWriter,
+    ImageWriterII(ImageWriterII),
+    ImageWriterLQ(ImageWriterLQ),
+}
+
+impl TryFrom<&[u8]> for ImageWriterModel {
+    type Error = ImageWriterError;
+
+    fn try_from(ident: &[u8]) -> Result<Self, Self::Error> {
+        // ImageWriter II
+        if ident.starts_with(b"IW10") {
+            let mut model = ImageWriterII::default();
+
+            for byte in &ident[4..] {
+                match byte {
+                    b'C' => model.colour_ribbon = true,
+                    b'F' => model.sheet_feeder = Some(SheetFeeder::II),
+                    _ => {}
+                }
+            }
+
+            Ok(ImageWriterModel::ImageWriterII(model))
+        // ImageWriter LQ
+        } else if ident.starts_with(b"LQ1") {
+            let mut model = ImageWriterLQ::default();
+            let mut feeder = false;
+            let mut envelope = false;
+            let mut bins = 1;
+
+            for byte in &ident[3..] {
+                match byte {
+                    b'C' => model.colour_ribbon = true,
+                    b'F' => feeder = true,
+                    b'E' => (feeder, envelope) = (true, true),
+                    b'1'..=b'9' => bins = byte - b'0',
+                    b'P' => model.pull_tractor = true,
+                    b'\r' => break, // Signifies end of reply
+                    _ => {}
+                }
+            }
+
+            model.sheet_feeder = feeder.then_some(SheetFeeder::LQ { bins, envelope });
+
+            Ok(ImageWriterModel::ImageWriterLQ(model))
+        } else {
+            Err(ImageWriterError::UnknownModel)
+        }
+    }
+}
+
+impl ImageWriterModel {
+    /// Returns true if a colour ribbon is currently installed
+    pub fn colour_ribbon(&self) -> bool {
+        match self {
+            ImageWriterModel::ImageWriter => false,
+            ImageWriterModel::ImageWriterII(iw) => iw.colour_ribbon,
+            ImageWriterModel::ImageWriterLQ(lq) => lq.colour_ribbon,
+        }
+    }
+
+    /// Returns true if a sheet feeder is currently installed
+    pub fn sheet_feeder(&self) -> bool {
+        match self {
+            ImageWriterModel::ImageWriter => false,
+            ImageWriterModel::ImageWriterII(iw) => iw.sheet_feeder.is_some(),
+            ImageWriterModel::ImageWriterLQ(lq) => lq.sheet_feeder.is_some(),
+        }
+    }
+}
+
 pub struct ImageWriterRole {
     server: PapServer,
     ident: Ident,
     ident_reply: Vec<u8>,
+    /// When the last byte of a reply still being collected arrived. An II's
+    /// reply has no terminator, so it ends once this is [`SELF_ID_GAP`] old.
+    reply_last: Option<Micros>,
+    /// What model we have identified from ident_reply, if any.
+    model: Option<ImageWriterModel>,
     /// Events the role raises itself, ahead of the PAP server's.
     events: VecDeque<ImageWriterEvent>,
-    colour_ribbon: bool,
     /// Set while the next job bytes are still the first of a job.
     job_start: bool,
 }
@@ -131,46 +246,45 @@ impl ImageWriterRole {
             server: PapServer::new(listener_socket, conn_socket),
             ident: Ident::Due,
             ident_reply: Vec::new(),
+            reply_last: None,
+            model: None,
             events: VecDeque::new(),
-            colour_ribbon: true,
             job_start: true,
         };
         role.apply_status();
         role
     }
 
-    fn apply_status(&mut self) {
-        let word = if self.colour_ribbon {
-            STATUS_COLOUR_RIBBON
-        } else {
-            0
+    /// The u16 bitmap value that is reported via PAP because Apple decided to be weird and not
+    /// use human text for some reason.
+    fn status_word(&self) -> u16 {
+        let mut word = match &self.model {
+            Some(model) => {
+                let mut w = 0;
+                if model.colour_ribbon() {
+                    w |= STATUS_COLOUR_RIBBON;
+                }
+                if model.sheet_feeder() {
+                    w |= STATUS_SHEET_FEEDER;
+                }
+                w
+            }
+            // The printer hasn't answered.
+            None => STATUS_COLOUR_RIBBON,
         };
+        if self.server.busy() {
+            word |= STATUS_BUSY;
+        }
+        word
+    }
+
+    fn apply_status(&mut self) {
         // Low byte first; the length byte is added by the PAP framing.
-        self.server
-            .set_status(&[(word & 0xFF) as u8, (word >> 8) as u8]);
+        self.server.set_status(&self.status_word().to_le_bytes());
     }
 
-    /// Whether a colour ribbon is currently reported. Optimistic until the
-    /// printer answers: claiming colour on a black ribbon costs nothing,
-    /// because the ImageWriter ignores the colour commands unless a colour
-    /// ribbon is installed (manual, chapter 8).
     pub fn colour_ribbon(&self) -> bool {
-        self.colour_ribbon
-    }
-
-    /// Override the ribbon reading, for a printer that will not answer the
-    /// self ID query.
-    pub fn set_colour_ribbon(&mut self, colour: bool) {
-        self.colour_ribbon = colour;
-        self.apply_status();
-    }
-
-    /// Report a whole status word, should a path to the live condition bits
-    /// appear. Overwrites the ribbon bit along with everything else.
-    pub fn set_status_word(&mut self, word: u16) {
-        self.colour_ribbon = word & STATUS_COLOUR_RIBBON != 0;
-        self.server
-            .set_status(&[(word & 0xFF) as u8, (word >> 8) as u8]);
+        self.status_word() & STATUS_COLOUR_RIBBON != 0
     }
 
     pub fn listener_socket(&self) -> u8 {
@@ -188,40 +302,44 @@ impl ImageWriterRole {
 
     /// Bytes the printer sent. Only the self ID reply is of interest; the
     /// option card has no reverse data path, so anything else is dropped.
+    ///
+    /// Read whenever it arrives, not only while a query is outstanding: the
+    /// reply to a query sent after a job comes once the printer has printed
+    /// what it had buffered, and one sent while the printer was off comes
+    /// when it is switched on.
     pub fn printer_input(&mut self, data: &[u8], now: Micros) {
-        let Ident::Waiting { since, .. } = self.ident else {
-            return;
-        };
         for &b in data {
-            if self.ident_reply.len() < SELF_ID_MAX {
-                self.ident_reply.push(b);
+            // A reply starts with `IW` or `LQ`. Anything ahead of it, such as
+            // the XON a printer in XON/XOFF mode sends when it comes ready,
+            // is not part of one.
+            if self.ident_reply.is_empty() && b != b'I' && b != b'L' {
+                continue;
+            }
+            self.ident_reply.push(b);
+            // The LQ ends its reply with a CR. The II's has no terminator and
+            // ends when the line goes quiet, which `poll` watches for.
+            if b == b'\r' || self.ident_reply.len() >= SELF_ID_MAX {
+                self.settle_ident();
             }
         }
-        if self.ident_reply.len() >= SELF_ID_MAX {
-            self.settle_ident();
-        } else {
-            self.ident = Ident::Waiting {
-                since,
-                last: Some(now),
-            };
-        }
+        self.reply_last = (!self.ident_reply.is_empty()).then_some(now);
     }
 
-    /// Read the ribbon out of whatever arrived, then stop waiting.
-    ///
-    /// Only a reply that starts `IW` is believed: at the wrong baud rate, or
-    /// from a printer whose option card has taken the serial port, the
-    /// buffer holds noise or nothing, and the default must stand rather than
-    /// a stray byte deciding the ribbon.
+    /// Attempts to parse the identify string response from the printer, and if valid update
+    /// our internal options.
     fn settle_ident(&mut self) {
-        if self.ident_reply.starts_with(b"IW") {
-            // `C` appears in the reply only as the colour flag: the other
-            // letters it can carry are `I`, `W` and `F`.
-            self.colour_ribbon = self.ident_reply.contains(&b'C');
+        if let Ok(model) = self.ident_reply.as_slice().try_into() {
+            self.model = Some(model);
             self.apply_status();
+            // Answered. Anything that is not a reply leaves the query
+            // waiting for the real one.
+            if matches!(self.ident, Ident::Waiting { .. }) {
+                self.ident = Ident::Settled;
+            }
         }
+
         self.ident_reply.clear();
-        self.ident = Ident::Settled;
+        self.reply_last = None;
     }
 
     pub fn handle_datagram(
@@ -236,6 +354,12 @@ impl ImageWriterRole {
 
     pub fn poll(&mut self, now: Micros) {
         self.server.poll(now);
+        if self
+            .reply_last
+            .is_some_and(|t| now.saturating_sub(t) >= SELF_ID_GAP)
+        {
+            self.settle_ident();
+        }
         self.poll_ident(now);
     }
 
@@ -245,19 +369,14 @@ impl ImageWriterRole {
     fn poll_ident(&mut self, now: Micros) {
         match self.ident {
             Ident::Due if !self.server.busy() => {
-                self.ident_reply.clear();
                 self.events
                     .push_back(ImageWriterEvent::ToPrinter(SELF_ID.to_vec()));
-                self.ident = Ident::Waiting {
-                    since: now,
-                    last: None,
-                };
+                self.ident = Ident::Waiting { since: now };
             }
-            Ident::Waiting { since, last } => {
-                let finished = last.is_some_and(|t| now.saturating_sub(t) >= SELF_ID_GAP);
-                if finished || now.saturating_sub(since) >= SELF_ID_TIMEOUT {
-                    self.settle_ident();
-                }
+            // Giving up only stops the waiting. A reply still arriving is
+            // left for `poll` to finish.
+            Ident::Waiting { since } if now.saturating_sub(since) >= SELF_ID_TIMEOUT => {
+                self.ident = Ident::Settled;
             }
             _ => {}
         }
@@ -265,10 +384,7 @@ impl ImageWriterRole {
 
     pub fn next_deadline(&self) -> Option<Micros> {
         let ident = match self.ident {
-            Ident::Waiting { since, last } => Some(match last {
-                Some(t) => (t + SELF_ID_GAP).min(since + SELF_ID_TIMEOUT),
-                None => since + SELF_ID_TIMEOUT,
-            }),
+            Ident::Waiting { since } => Some(since + SELF_ID_TIMEOUT),
             // A query that is due needs a wake-up to go out at all - but
             // only once the printer is idle. While a job is open it is the
             // CloseConn that re-arms it, not the clock, and asking for an
@@ -278,10 +394,13 @@ impl ImageWriterRole {
             Ident::Due => None,
             Ident::Settled => None,
         };
-        match (self.server.next_deadline(), ident) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        // A reply in progress needs waking once the line has been quiet long
+        // enough to end it.
+        let reply = self.reply_last.map(|t| t + SELF_ID_GAP);
+        [self.server.next_deadline(), ident, reply]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     pub fn poll_transmit(&mut self) -> Option<(u8, ServiceAddress, Vec<u8>)> {
@@ -295,6 +414,7 @@ impl ImageWriterRole {
         match self.server.poll_event()? {
             PapEvent::ConnectionOpened { client } => {
                 self.job_start = true;
+                self.apply_status();
                 Some(ImageWriterEvent::ConnectionOpened { client })
             }
             PapEvent::JobEof => {
@@ -306,6 +426,7 @@ impl ImageWriterRole {
                 // the printer is idle.
                 self.ident = Ident::Due;
                 self.job_start = true;
+                self.apply_status();
                 Some(ImageWriterEvent::ConnectionClosed)
             }
             PapEvent::ToPrinter(bytes) => {
@@ -367,95 +488,269 @@ mod tests {
         })
     }
 
-    fn status_word(role: &ImageWriterRole) -> u16 {
-        if role.colour_ribbon() {
-            STATUS_COLOUR_RIBBON
-        } else {
-            0
-        }
-    }
-
-    #[test]
-    fn the_self_id_query_goes_out_once_the_role_is_polled() {
+    /// A role whose idle self ID query has just gone out, at time 0.
+    fn asked() -> ImageWriterRole {
         let mut role = ImageWriterRole::new(190, 191);
         role.poll(0);
         assert_eq!(next_to_printer(&mut role).as_deref(), Some(SELF_ID));
-
-        // And is not repeated while the answer is still outstanding.
-        role.poll(1_000);
-        assert_eq!(next_to_printer(&mut role), None);
+        role
     }
 
-    #[test]
-    fn a_colour_ribbon_is_read_out_of_the_reply() {
-        let mut role = ImageWriterRole::new(190, 191);
-        role.poll(0);
-        let _ = next_to_printer(&mut role);
+    /// The status word as a Mac reads it: the role's answer to a SendStatus,
+    /// taken off the wire rather than recomputed, so a change the role never
+    /// applied shows up as a stale word.
+    fn wire_status(role: &mut ImageWriterRole, mac: &mut MiniClient, now: Micros) -> u16 {
+        use crate::atp::AtpEvent;
+        use tailtalk_packets::pap::{PapFunction, PapPacket};
 
-        role.printer_input(b"IW10CF", 100);
-        assert!(role.colour_ribbon());
-        assert_eq!(status_word(&role), STATUS_COLOUR_RIBBON);
-    }
-
-    /// The interesting direction: a black ribbon is the *absence* of `C`, so
-    /// it can only be detected by believing a reply that arrived, which is
-    /// why a reply that never came must not be read as "no colour".
-    #[test]
-    fn a_black_ribbon_clears_the_ribbon_bit() {
-        let mut role = ImageWriterRole::new(190, 191);
-        role.poll(0);
-        let _ = next_to_printer(&mut role);
-
-        // No `C`, and no sheet feeder either: the shortest valid reply.
-        role.printer_input(b"IW10", 100);
-        // Four bytes is under the cap, so it settles once the line goes
-        // quiet - well before the give-up timeout.
-        role.poll(100 + SELF_ID_GAP);
-        assert!(!role.colour_ribbon());
-        assert_eq!(status_word(&role), 0);
-    }
-
-    #[test]
-    fn a_sheet_feeder_alone_is_not_mistaken_for_colour() {
-        let mut role = ImageWriterRole::new(190, 191);
-        role.poll(0);
-        let _ = next_to_printer(&mut role);
-
-        role.printer_input(b"IW10F", 100);
-        role.poll(100 + SELF_ID_GAP);
-        assert!(!role.colour_ribbon(), "`F` is the feeder, not the ribbon");
-    }
-
-    /// The printer answers in its own time - it has a print buffer in front
-    /// of the command - so the role must still be listening when the reply
-    /// arrives rather than having given up on the first quiet poll.
-    #[test]
-    fn a_reply_that_takes_a_moment_is_still_read() {
-        let mut role = ImageWriterRole::new(190, 191);
-        role.poll(0);
-        let _ = next_to_printer(&mut role);
-
-        // Polls go by with the line quiet, well short of the give-up point.
-        for tick in 1..=5u64 {
-            role.poll(tick * SELF_ID_TIMEOUT / 10);
+        let request = PapPacket {
+            connection_id: 0,
+            function: PapFunction::SendStatus,
+            sequence_num: 0,
+            eof: false,
+            data: &[],
+        };
+        let (ub, d) = request.to_atp_parts();
+        mac.ep
+            .request(addr(130, role.listener_socket()), ub, d, 0x01, now);
+        shuttle(role, 130, mac, now);
+        loop {
+            match mac.ep.poll_event() {
+                Some(AtpEvent::Response {
+                    user_bytes, data, ..
+                }) => {
+                    let pap = PapPacket::parse_from_atp(user_bytes, &data).unwrap();
+                    if pap.function != PapFunction::Status {
+                        continue;
+                    }
+                    // Four reserved bytes, then the card's buffer: a length
+                    // of 2 and the word, low byte first.
+                    assert_eq!(pap.data[4], 2, "the card's status buffer is two bytes");
+                    return u16::from_le_bytes([pap.data[5], pap.data[6]]);
+                }
+                Some(_) => continue,
+                None => panic!("the role never answered SendStatus"),
+            }
         }
-        let arrived = SELF_ID_TIMEOUT / 2;
-        role.printer_input(b"IW10", arrived);
-        role.poll(arrived + SELF_ID_GAP);
-        assert!(!role.colour_ribbon(), "a late answer must still be read");
+    }
+
+    /// Every reply the manuals allow. The II (p88): `IW10`, then `C` for a
+    /// colour ribbon and `F` for the SheetFeeder. The LQ (Table 8-8): `LQ1`,
+    /// then `C`, `F` or `E` (with the envelope attachment) and a bin count
+    /// for the Cut Sheet Feeder, `P` for the pull tractor, and a CR. The first
+    /// two LQ rows are the manual's own examples. A feeder with no count has
+    /// one bin, and the parser takes a reply with or without its CR.
+    ///
+    /// Anything without a known prefix is no reply at all. Bytes ahead of a
+    /// real reply are the role's to strip, not the parser's.
+    #[test]
+    fn parses_every_self_id_reply() {
+        let ii: &[(&[u8], bool, bool)] = &[
+            (b"IW10", false, false),
+            (b"IW10C", true, false),
+            (b"IW10F", false, true),
+            (b"IW10CF", true, true),
+        ];
+        for &(reply, colour, feeder) in ii {
+            let Ok(ImageWriterModel::ImageWriterII(m)) = ImageWriterModel::try_from(reply) else {
+                panic!("{} is an ImageWriter II", reply.escape_ascii());
+            };
+            assert_eq!(
+                (m.colour_ribbon, m.sheet_feeder.is_some()),
+                (colour, feeder),
+                "{}",
+                reply.escape_ascii()
+            );
+        }
+
+        /// Reply, colour ribbon, feeder as (bins, envelope), pull tractor.
+        type LqCase = (&'static [u8], bool, Option<(u8, bool)>, bool);
+        let lq: &[LqCase] = &[
+            (b"LQ1P\r", false, None, true),
+            (b"LQ1CE3\r", true, Some((3, true)), false),
+            (b"LQ1\r", false, None, false),
+            (b"LQ1C\r", true, None, false),
+            (b"LQ1F\r", false, Some((1, false)), false),
+            (b"LQ1F2\r", false, Some((2, false)), false),
+            (b"LQ1CF3\r", true, Some((3, false)), false),
+            (b"LQ1CE3P\r", true, Some((3, true)), true),
+            (b"LQ1CE3", true, Some((3, true)), false),
+        ];
+        for &(reply, colour, feeder, pull) in lq {
+            let Ok(ImageWriterModel::ImageWriterLQ(m)) = ImageWriterModel::try_from(reply) else {
+                panic!("{} is an ImageWriter LQ", reply.escape_ascii());
+            };
+            let got_feeder = match m.sheet_feeder {
+                None => None,
+                Some(SheetFeeder::LQ { bins, envelope }) => Some((bins, envelope)),
+                Some(SheetFeeder::II) => panic!("{} gave a II feeder", reply.escape_ascii()),
+            };
+            assert_eq!(
+                (m.colour_ribbon, got_feeder, m.pull_tractor),
+                (colour, feeder, pull),
+                "{}",
+                reply.escape_ascii()
+            );
+        }
+
+        for reply in [
+            &b""[..],
+            b"IW",
+            b"IW1",
+            b"LQ",
+            b"\x11IW10C",
+            b"LXC",
+            b"\xFFC",
+        ] {
+            assert!(
+                ImageWriterModel::try_from(reply).is_err(),
+                "{}",
+                reply.escape_ascii()
+            );
+        }
+    }
+
+    /// The reply decides bits 7 (colour ribbon) and 6 (sheet feeder) of the
+    /// word a Mac reads. Black is the *absence* of `C`, so it can only come
+    /// from a reply that arrived. An II's reply has no terminator and ends
+    /// when the line goes quiet. An LQ's ends at its CR with no wait, so those
+    /// rows are never polled. The longest LQ reply arrives whole.
+    #[test]
+    fn the_reply_decides_the_status_word() {
+        let cases: &[(&[u8], u16)] = &[
+            (b"IW10CF", STATUS_COLOUR_RIBBON | STATUS_SHEET_FEEDER),
+            (b"IW10F", STATUS_SHEET_FEEDER),
+            (b"IW10", 0),
+            (b"LQ1CE3\r", STATUS_COLOUR_RIBBON | STATUS_SHEET_FEEDER),
+            (b"LQ1P\r", 0),
+        ];
+        for &(reply, word) in cases {
+            let mut role = asked();
+            let mut mac = MiniClient::new(10, 70);
+            role.printer_input(reply, 100);
+            if !reply.ends_with(b"\r") {
+                role.poll(100 + SELF_ID_GAP);
+            }
+            assert_eq!(
+                wire_status(&mut role, &mut mac, 100 + SELF_ID_GAP),
+                word,
+                "{}",
+                reply.escape_ascii()
+            );
+        }
+
+        let mut role = asked();
+        role.printer_input(b"LQ1CE3P\r", 100);
+        assert!(
+            matches!(&role.model, Some(ImageWriterModel::ImageWriterLQ(lq)) if lq.pull_tractor),
+            "the `P` at the end of the longest reply must survive the length cap"
+        );
+    }
+
+    /// UART reads cut a reply wherever they like, and a printer in XON/XOFF
+    /// mode sends an XON as it comes ready, just ahead of the reply. The reply
+    /// starts at its `I` or `L`. An II's ends once the line has been quiet for
+    /// the gap counted from its last byte, so a shorter pause between pieces
+    /// does not end it early. An LQ's CR ends it whichever read it lands in.
+    /// Both replies are black-ribbon ones, so the colour default only changes
+    /// if the reply was read.
+    #[test]
+    fn a_reply_split_across_reads_is_put_back_together() {
+        let mut role = asked();
+        role.printer_input(b"\x11IW1", 100);
+        let second = 100 + SELF_ID_GAP / 2;
+        role.printer_input(b"0", second);
+        // A full gap after the first piece, but not after the second.
+        role.poll(100 + SELF_ID_GAP);
+        assert!(role.model.is_none(), "the reply is still arriving");
+        role.poll(second + SELF_ID_GAP);
+        assert!(!role.colour_ribbon());
+
+        let mut role = asked();
+        role.printer_input(b"LQ1", 100);
+        role.printer_input(b"P\r", 200);
+        assert!(!role.colour_ribbon());
     }
 
     /// A printer that says nothing - powered off, option card holding the
-    /// serial port, wrong baud rate - must leave the default standing rather
-    /// than be read as a black ribbon.
+    /// serial port, wrong baud rate - leaves the default standing rather than
+    /// reading as a black ribbon, and is not asked again while the query is
+    /// outstanding. A reply that turns up after the role has given up is
+    /// still the printer's answer: the one to a query sent after a job comes
+    /// once the printer has printed what it had buffered, and one sent while
+    /// it was off comes when it is switched on.
     #[test]
-    fn silence_keeps_the_default() {
-        let mut role = ImageWriterRole::new(190, 191);
-        role.poll(0);
-        let _ = next_to_printer(&mut role);
+    fn silence_keeps_the_default_until_a_late_reply() {
+        let mut role = asked();
+        let mut mac = MiniClient::new(10, 70);
+        role.poll(1_000);
+        assert_eq!(
+            next_to_printer(&mut role),
+            None,
+            "the query is not repeated"
+        );
 
         role.poll(SELF_ID_TIMEOUT);
-        assert!(role.colour_ribbon(), "no answer must not clear the bit");
+        assert_eq!(
+            wire_status(&mut role, &mut mac, SELF_ID_TIMEOUT),
+            STATUS_COLOUR_RIBBON
+        );
+        // The caller sleeps on this deadline, so one already past would spin
+        // its event loop.
+        assert!(
+            role.next_deadline().is_none_or(|t| t > SELF_ID_TIMEOUT),
+            "a role that has given up must not keep asking to be woken"
+        );
+
+        let late = SELF_ID_TIMEOUT * 5;
+        role.printer_input(b"IW10", late);
+        assert!(
+            role.next_deadline()
+                .is_some_and(|t| t <= late + SELF_ID_GAP),
+            "a reply in progress must ask to be woken when the line goes quiet"
+        );
+        role.poll(late + SELF_ID_GAP);
+        assert_eq!(wire_status(&mut role, &mut mac, late + SELF_ID_GAP), 0);
+    }
+
+    /// The busy bit tells every Mac that a job is open, so it is set for as
+    /// long as a session is and cleared when the session closes.
+    #[test]
+    fn the_busy_bit_follows_the_session() {
+        use tailtalk_packets::pap::{PapFunction, PapPacket};
+
+        let mut role = ImageWriterRole::new(190, 191);
+        let mut mac = MiniClient::new(10, 70);
+        assert_eq!(wire_status(&mut role, &mut mac, 0) & STATUS_BUSY, 0, "idle");
+
+        mac.open_conn(addr(130, role.listener_socket()), 10);
+        shuttle(&mut role, 130, &mut mac, 10);
+        // The embedder drains the role's events as they come, and the status
+        // follows from those.
+        while role.poll_event().is_some() {}
+        assert_ne!(
+            wire_status(&mut role, &mut mac, 20) & STATUS_BUSY,
+            0,
+            "a job is open"
+        );
+
+        let close = PapPacket {
+            connection_id: 70,
+            function: PapFunction::CloseConn,
+            sequence_num: 0,
+            eof: false,
+            data: &[],
+        };
+        let (ub, d) = close.to_atp_parts();
+        mac.ep
+            .request(addr(130, role.conn_socket()), ub, d, 0x01, 30);
+        shuttle(&mut role, 130, &mut mac, 30);
+        while role.poll_event().is_some() {}
+        assert_eq!(
+            wire_status(&mut role, &mut mac, 40) & STATUS_BUSY,
+            0,
+            "the job is over"
+        );
     }
 
     /// Open a session and answer the server's pulls with `chunks`, one PAP
@@ -612,18 +907,21 @@ mod tests {
     }
 
     /// Nor must line noise. At the wrong baud rate the bytes that arrive are
-    /// arbitrary, and one of them being `C` cannot be allowed to decide.
+    /// arbitrary, and one of them being `C` cannot be allowed to decide, not
+    /// even after a stray `L` that looks like the start of a reply.
     #[test]
     fn a_reply_that_is_not_an_imagewriter_id_is_ignored() {
-        let mut role = ImageWriterRole::new(190, 191);
-        role.set_colour_ribbon(false);
-        role.poll(0);
-        let _ = next_to_printer(&mut role);
+        let mut role = asked();
+        role.printer_input(b"IW10", 100);
+        role.poll(100 + SELF_ID_GAP);
+        assert!(!role.colour_ribbon(), "a black ribbon to start from");
 
-        role.printer_input(&[0xFF, b'C', 0x00, 0xAA, 0x55, 0x13], 100);
+        role.printer_input(&[0xFF, b'C', 0x00, 0xAA, 0x55, 0x13], 1_000_000);
+        role.printer_input(b"LXC", 1_000_100);
+        role.poll(1_000_100 + SELF_ID_GAP);
         assert!(
             !role.colour_ribbon(),
-            "only a reply starting `IW` may change the ribbon"
+            "only a reply starting `IW` or `LQ` may change the ribbon"
         );
     }
 }

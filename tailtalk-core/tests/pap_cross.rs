@@ -189,8 +189,8 @@ async fn embedded_imagewriter_streams_a_job_verbatim() {
         .expect("SendStatus failed");
     assert_eq!(
         status,
-        vec![0x80, 0x00],
-        "the printer answered `IW10CF`, so bit 7 is set"
+        vec![0xC0, 0x00],
+        "the printer answered `IW10CF`: bit 7 for the colour ribbon, bit 6 for the SheetFeeder"
     );
 
     // `ESC G <4-digit count>` then raw bitmap bytes, including the two that
