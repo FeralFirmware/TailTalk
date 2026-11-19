@@ -107,7 +107,11 @@ async fn imagewriter_streams_a_job_verbatim_and_reads_the_ribbon() {
             tokio::time::sleep(IDENT_SETTLE).await;
             let (_s, req, _r) = Atp::spawn(&desk.ddp, None).await;
             let status = PapClient::get_status_bytes(req, listener).await.unwrap();
-            assert_eq!(status, vec![0x80, 0x00], "`IW10CF` means a colour ribbon");
+            assert_eq!(
+                status,
+                vec![0xC0, 0x00],
+                "`IW10CF` means a colour ribbon and a SheetFeeder"
+            );
             written.lock().unwrap().clear();
 
             // Bitmap bytes that would be flow control if this path used any.
