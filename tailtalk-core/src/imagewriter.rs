@@ -43,9 +43,6 @@ use tailtalk_packets::nbp::ServiceAddress;
 use crate::Micros;
 use crate::pap::{PapEvent, PapServer};
 
-/// The NBP type the option card registers itself under.
-pub const NBP_TYPE: &str = "ImageWriter";
-
 /// Self ID query (manual Table 6-7). Answered with `IW<width>[C][F]`.
 pub const SELF_ID: &[u8] = &[0x1B, b'?'];
 
@@ -112,6 +109,9 @@ pub enum ImageWriterEvent {
     /// what happens next: re-register under it, and persist it. A real card
     /// keeps the name across a power cycle and re-registers itself.
     Rename(Vec<u8>),
+    /// The printer we are connected to has changed (either newly identified, or
+    /// a new type has been plugged in to us).
+    NbpTypeChanged(&'static str),
 }
 
 pub enum SheetFeeder {
@@ -132,12 +132,6 @@ pub struct ImageWriterII {
     colour_ribbon: bool,
 }
 
-impl ImageWriterII {
-    pub const fn nbp_type(&self) -> &'static str {
-        "ImageWriter"
-    }
-}
-
 #[derive(Default)]
 pub struct ImageWriterLQ {
     /// Whether or not a sheet feeder is installed, and if so what options it has
@@ -146,12 +140,6 @@ pub struct ImageWriterLQ {
     colour_ribbon: bool,
     /// Whether it is currently set to pull tractor paper or not
     pull_tractor: bool,
-}
-
-impl ImageWriterLQ {
-    pub const fn nbp_type(&self) -> &'static str {
-        "LQ"
-    }
 }
 
 pub enum ImageWriterModel {
@@ -223,6 +211,15 @@ impl ImageWriterModel {
             ImageWriterModel::ImageWriterLQ(lq) => lq.sheet_feeder.is_some(),
         }
     }
+
+    /// The NBP type string for registering this printer model
+    pub const fn nbp_type(&self) -> &'static str {
+        match self {
+            ImageWriterModel::ImageWriter => "ImageWriter",
+            ImageWriterModel::ImageWriterII(_) => "ImageWriter",
+            ImageWriterModel::ImageWriterLQ(_) => "LQ",
+        }
+    }
 }
 
 pub struct ImageWriterRole {
@@ -241,6 +238,12 @@ pub struct ImageWriterRole {
 }
 
 impl ImageWriterRole {
+    /// FIXME: Because of bad choices I made we have to have an NBP name at bind
+    /// time. This is just the placeholder for now.
+    pub const fn default_nbp() -> &'static str {
+        ImageWriterModel::ImageWriter.nbp_type()
+    }
+
     pub fn new(listener_socket: u8, conn_socket: u8) -> Self {
         let mut role = Self {
             server: PapServer::new(listener_socket, conn_socket),
@@ -328,18 +331,32 @@ impl ImageWriterRole {
     /// Attempts to parse the identify string response from the printer, and if valid update
     /// our internal options.
     fn settle_ident(&mut self) {
-        if let Ok(model) = self.ident_reply.as_slice().try_into() {
+        if let Ok(model) = ImageWriterModel::try_from(self.ident_reply.as_slice()) {
+            let nbp_type = model.nbp_type();
+            let changed = nbp_type != self.nbp_type();
             self.model = Some(model);
             self.apply_status();
+
             // Answered. Anything that is not a reply leaves the query
             // waiting for the real one.
             if matches!(self.ident, Ident::Waiting { .. }) {
                 self.ident = Ident::Settled;
             }
+
+            if changed {
+                self.events
+                    .push_back(ImageWriterEvent::NbpTypeChanged(nbp_type));
+            }
         }
 
         self.ident_reply.clear();
         self.reply_last = None;
+    }
+
+    pub fn nbp_type(&self) -> &'static str {
+        self.model
+            .as_ref()
+            .map_or_else(Self::default_nbp, ImageWriterModel::nbp_type)
     }
 
     pub fn handle_datagram(
