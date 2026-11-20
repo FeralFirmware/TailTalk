@@ -55,6 +55,11 @@ pub enum PrinterEvent {
     /// persist it if the device keeps its name across a power cycle, as the
     /// hardware being emulated does.
     Renamed(String),
+    /// The NBP type value has changed and has re-registered itself. this is
+    /// when the underlying role has detected a different printer type
+    /// (Like an LQ is now connected instead  of an ImageWriter II) which has
+    /// a different NBP type.
+    NbpTypeChanged(&'static str),
     /// A client asked for a name this node cannot register (not UTF-8,
     /// carrying an NBP delimiter, or too long). The old name stands.
     RenameRejected,
@@ -92,7 +97,10 @@ trait Role: Send + 'static {
 
 enum RoleEvent {
     ToPrinter(Vec<u8>),
+    /// The NBP name value is changing
     Rename(Vec<u8>),
+    /// The NBP type value is changing
+    Retype(&'static str),
     Event(PrinterEvent),
 }
 
@@ -181,6 +189,7 @@ impl Role for ImageWriterRole {
                 RoleEvent::Event(PrinterEvent::JobEnded { clean: true })
             }
             ImageWriterEvent::Rename(name) => RoleEvent::Rename(name),
+            ImageWriterEvent::NbpTypeChanged(new_type) => RoleEvent::Retype(new_type),
         })
     }
 
@@ -232,7 +241,10 @@ impl Role for PapServer {
 
 enum PortEvent {
     Event(PrinterEvent),
+    /// The NBP name value is changing
     Rename(Vec<u8>),
+    /// The NBP type value is changing
+    Retype(&'static str),
 }
 
 /// A role and the byte queue in front of its port.
@@ -268,6 +280,10 @@ impl PortState {
                 RoleEvent::Rename(name) => {
                     self.events
                         .push_back((self.queued_total, PortEvent::Rename(name)));
+                }
+                RoleEvent::Retype(new_type) => {
+                    self.events
+                        .push_back((self.queued_total, PortEvent::Retype(new_type)));
                 }
                 RoleEvent::Event(e) => {
                     self.events.push_back((self.queued_total, PortEvent::Event(e)));
@@ -341,12 +357,16 @@ impl<'a, P: Platform> Printer<'a, P> {
         })
     }
 
-    /// An ImageWriter II with its LocalTalk option card, registered as
-    /// `<name>:ImageWriter@*`. The port speaks ImageWriter command bytes.
+    /// An ImageWriter II or LQ with its LocalTalk option card, registered as
+    /// `<name>:ImageWriter|LQ@*`. The port speaks ImageWriter command bytes.
     pub fn imagewriter(net: Net<'a, P>, name: &str) -> Result<Self, BindError> {
-        Self::bind(net, name, imagewriter::NBP_TYPE, 2, |_, sockets| {
-            Box::new(ImageWriterRole::new(sockets[0], sockets[1]))
-        })
+        Self::bind(
+            net,
+            name,
+            imagewriter::ImageWriterRole::default_nbp(),
+            2,
+            |_, sockets| Box::new(ImageWriterRole::new(sockets[0], sockets[1])),
+        )
     }
 
     /// A plain PAP printer registered as `<name>:<nbp_type>@*`, answering
@@ -461,6 +481,15 @@ impl<'a, P: Platform> Printer<'a, P> {
             match event {
                 Some(PortEvent::Event(e)) => return Ok(e),
                 Some(PortEvent::Rename(raw)) => return Ok(self.rename(&raw)),
+                #[expect(
+                    clippy::collapsible_match,
+                    reason = "a guard would hide that this re-registers"
+                )]
+                Some(PortEvent::Retype(new_type )) => {
+                    if self.name_handle().set_type(new_type).is_ok() {
+                        return Ok(PrinterEvent::NbpTypeChanged(new_type));
+                    }
+                }
                 None => {}
             }
 

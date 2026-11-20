@@ -242,6 +242,9 @@ async fn serve_printer(
                     PortClock::Baud230400 => tt_log!("PRINTER: at 230400 baud"),
                 }
             }
+            Ok(PrinterEvent::NbpTypeChanged(nbp_type)) => {
+                tt_log!("STACK: registered as {}", nbp_type)
+            }
             // Our port can't fail or reach end of stream. This keeps a future
             // one that can from spinning.
             Err(e) => {
