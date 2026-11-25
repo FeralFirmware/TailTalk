@@ -81,6 +81,19 @@ pub enum MessageError {
     Closed,
 }
 
+impl core::fmt::Display for AdspError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            AdspError::NoSocket => "no socket available",
+            AdspError::OpenFailed => "connection refused or unanswered",
+            AdspError::Closed => "connection closed",
+            AdspError::AttentionUnacknowledged => "attention message unacknowledged",
+        })
+    }
+}
+
+impl core::error::Error for AdspError {}
+
 impl embedded_io_async::Error for AdspError {
     fn kind(&self) -> ErrorKind {
         match self {

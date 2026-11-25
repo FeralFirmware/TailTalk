@@ -399,7 +399,7 @@ async fn query_ipp_caps(uri: &Uri) -> anyhow::Result<IppCaps> {
         .groups_of(DelimiterTag::PrinterAttributes)
         .next()
         .ok_or_else(|| anyhow::anyhow!("response has no printer attributes"))?;
-    let attrs = group.attributes();
+    let attrs = group;
 
     let make_and_model = attrs
         .get("printer-make-and-model")
@@ -605,7 +605,7 @@ async fn forward_job(
         .attributes()
         .groups_of(DelimiterTag::JobAttributes)
         .next()
-        .and_then(|g| g.attributes().get("job-id"))
+        .and_then(|g| g.get("job-id"))
         .and_then(|a| match a.value() {
             IppValue::Integer(id) => Some(*id),
             _ => None,

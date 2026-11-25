@@ -67,7 +67,6 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::multicore::Stack;
-use embassy_rp::Peripheral;
 use embassy_rp::peripherals::{UART0, USB};
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart};
 use embassy_rp::usb::{Driver, InterruptHandler};
@@ -211,6 +210,7 @@ impl core::fmt::Write for SliceWriter<'_> {
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
     UART0_IRQ => BufferedInterruptHandler<UART0>;
+    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH2>;
 });
 
 // ── Core 1 stack ────────────────────────────────────────────────────
@@ -267,6 +267,7 @@ fn main() -> ! {
     let (fast_tx, fast_rx) = fast_clock::init(
         pio0_spare,
         p.DMA_CH2,
+        Irqs,
         unsafe { p.PIN_28.clone_unchecked() },
         unsafe { p.PIN_29.clone_unchecked() },
     );
@@ -277,9 +278,9 @@ fn main() -> ! {
     uart_config.baudrate = cfg.baud;
     let uart = BufferedUart::new(
         p.UART0,
-        Irqs,
         p.PIN_28,
         p.PIN_29,
+        Irqs,
         UART_TX_BUF.init([0u8; 512]),
         UART_RX_BUF.init([0u8; 2048]),
         uart_config,
@@ -321,16 +322,16 @@ fn main() -> ! {
     let baud = cfg.baud;
     let executor0 = EXECUTOR0.init(Executor::new());
     executor0.run(|spawner| {
-        defmt::unwrap!(spawner.spawn(init_config_task(flash, cfg)));
-        defmt::unwrap!(spawner.spawn(usb_run_task(usb_run)));
-        defmt::unwrap!(spawner.spawn(debug::run(debug_cdc, &SHARED)));
-        defmt::unwrap!(spawner.spawn(rx_dispatch_task(&SHARED)));
+        spawner.spawn(defmt::unwrap!(init_config_task(flash, cfg)));
+        spawner.spawn(defmt::unwrap!(usb_run_task(usb_run)));
+        spawner.spawn(defmt::unwrap!(debug::run(debug_cdc, &SHARED)));
+        spawner.spawn(defmt::unwrap!(rx_dispatch_task(&SHARED)));
         stack_task::start(&spawner, &SHARED, role, name, baud);
-        defmt::unwrap!(spawner.spawn(printer::tx_run(uart_tx, fast_tx, baud)));
-        defmt::unwrap!(spawner.spawn(printer::rx_run(uart_rx, fast_rx)));
-        defmt::unwrap!(spawner.spawn(printer::handshake_run()));
-        defmt::unwrap!(spawner.spawn(led::run(led_tx_blue, led_rx_green)));
-        defmt::unwrap!(spawner.spawn(watchdog_task(watchdog)));
+        spawner.spawn(defmt::unwrap!(printer::tx_run(uart_tx, fast_tx, baud)));
+        spawner.spawn(defmt::unwrap!(printer::rx_run(uart_rx, fast_rx)));
+        spawner.spawn(defmt::unwrap!(printer::handshake_run()));
+        spawner.spawn(defmt::unwrap!(led::run(led_tx_blue, led_rx_green)));
+        spawner.spawn(defmt::unwrap!(watchdog_task(watchdog)));
     });
 }
 
@@ -369,7 +370,7 @@ async fn watchdog_task(mut watchdog: embassy_rp::watchdog::Watchdog) -> ! {
         // correct across the ~71 minute wrap, which a plain compare is not.
         let since = (core1::timer_us() as u32).wrapping_sub(core1::heartbeat_us());
         if parked || since < CORE1_STALL_US {
-            watchdog.feed();
+            watchdog.feed(embassy_time::Duration::from_millis(5000));
         }
         // Otherwise core 1 is hung: stop feeding and let the watchdog reset us.
     }

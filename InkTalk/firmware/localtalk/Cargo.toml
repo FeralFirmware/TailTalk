@@ -13,5 +13,5 @@ default = []
 defmt = ["dep:defmt"]
 
 [dependencies]
-defmt = { version = "0.3", optional = true }
-heapless = "0.8"
+defmt = { version = "1.2", optional = true }
+heapless = "0.9"

@@ -16,9 +16,9 @@ tailtalk-packets = { path = "../tailtalk-packets", version = "^0.13", default-fe
 # Pinned to the minor versions the InkTalk firmware uses. RawMutex has to be
 # the same trait on both sides, or the firmware's ThreadModeRawMutex does not
 # satisfy it.
-embassy-sync = "0.6"
+embassy-sync = "0.8"
 embassy-futures = "0.1"
-embedded-io-async = "0.6"
+embedded-io-async = "0.7"
 
 [dev-dependencies]
 tailtalk = { workspace = true }

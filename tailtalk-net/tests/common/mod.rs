@@ -308,6 +308,10 @@ impl<M: Model> Write for PortTx<M> {
         }
         Ok(buf.len())
     }
+
+    async fn flush(&mut self) -> Result<(), Infallible> {
+        Ok(())
+    }
 }
 
 impl ErrorType for PortRx {

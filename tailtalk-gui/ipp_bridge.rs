@@ -976,18 +976,18 @@ fn ipp_bytes(resp: IppRequestResponse) -> axum::response::Response {
         .unwrap()
 }
 
-fn ipp_status(req_id: u32, status: StatusCode) -> axum::response::Response {
+fn ipp_status(req_id: i32, status: StatusCode) -> axum::response::Response {
     match IppRequestResponse::new_response(IppVersion::v1_1(), status, req_id) {
         Ok(r) => ipp_bytes(r),
         Err(_) => axum::response::Response::new(axum::body::Body::empty()),
     }
 }
 
-fn ipp_ok(req_id: u32) -> axum::response::Response {
+fn ipp_ok(req_id: i32) -> axum::response::Response {
     ipp_status(req_id, StatusCode::SuccessfulOk)
 }
 
-fn job_created_response(job_id: u32, job_uri: &str, req_id: u32) -> axum::response::Response {
+fn job_created_response(job_id: u32, job_uri: &str, req_id: i32) -> axum::response::Response {
     let mut resp = match IppRequestResponse::new_response(IppVersion::v1_1(), StatusCode::SuccessfulOk, req_id) {
         Ok(r) => r,
         Err(_) => return axum::response::Response::new(axum::body::Body::empty()),
@@ -1006,7 +1006,7 @@ fn job_created_response(job_id: u32, job_uri: &str, req_id: u32) -> axum::respon
     ipp_bytes(resp)
 }
 
-fn job_attributes_response(job: &JobRecord, req_id: u32) -> axum::response::Response {
+fn job_attributes_response(job: &JobRecord, req_id: i32) -> axum::response::Response {
     let mut resp = match IppRequestResponse::new_response(IppVersion::v1_1(), StatusCode::SuccessfulOk, req_id) {
         Ok(r) => r,
         Err(_) => return axum::response::Response::new(axum::body::Body::empty()),
@@ -1030,7 +1030,7 @@ fn job_attributes_response(job: &JobRecord, req_id: u32) -> axum::response::Resp
     ipp_bytes(resp)
 }
 
-fn get_jobs_response(jobs: &[JobRecord], req_id: u32) -> axum::response::Response {
+fn get_jobs_response(jobs: &[JobRecord], req_id: i32) -> axum::response::Response {
     let mut resp = match IppRequestResponse::new_response(IppVersion::v1_1(), StatusCode::SuccessfulOk, req_id) {
         Ok(r) => r,
         Err(_) => return axum::response::Response::new(axum::body::Body::empty()),
@@ -1058,11 +1058,11 @@ fn extract_job_id(parsed: &IppRequestResponse) -> Option<u32> {
         .groups_of(DelimiterTag::OperationAttributes)
         .next()
         .and_then(|g| {
-            if let Some(a) = g.attributes().get("job-id")
+            if let Some(a) = g.get("job-id")
                 && let IppValue::Integer(id) = a.value() {
                     return Some(*id as u32);
                 }
-            if let Some(a) = g.attributes().get("job-uri")
+            if let Some(a) = g.get("job-uri")
                 && let IppValue::Uri(u) = a.value() {
                     return u.as_str().rsplit('/').next()?.parse::<u32>().ok();
                 }
@@ -1102,10 +1102,10 @@ async fn handle_ipp(
     };
 
     match op {
-        op if op == Operation::GetPrinterAttributes as u16 => {
+        op if op == Operation::GetPrinterAttributes as i16 => {
             printer_attributes(&printer, req_id)
         }
-        op if op == Operation::PrintJob as u16 => {
+        op if op == Operation::PrintJob as i16 => {
             let job_id = state.next_job_id.fetch_add(1, Ordering::Relaxed);
             let job_uri = format!("ipp://localhost:8631/ipp/{}/{job_id}", printer.key);
             let created_at = state.start_time.elapsed().as_secs() as u32;
@@ -1313,9 +1313,9 @@ async fn handle_ipp(
             }
             job_created_response(job_id, &job_uri, req_id)
         }
-        op if op == Operation::ValidateJob as u16 => ipp_ok(req_id),
-        op if op == Operation::CancelJob as u16 => ipp_ok(req_id),
-        op if op == Operation::GetJobAttributes as u16 => {
+        op if op == Operation::ValidateJob as i16 => ipp_ok(req_id),
+        op if op == Operation::CancelJob as i16 => ipp_ok(req_id),
+        op if op == Operation::GetJobAttributes as i16 => {
             let job_id = extract_job_id(&parsed);
             match job_id {
                 None => ipp_status(req_id, StatusCode::ClientErrorBadRequest),
@@ -1331,7 +1331,7 @@ async fn handle_ipp(
                 }
             }
         }
-        op if op == Operation::GetJobs as u16 => {
+        op if op == Operation::GetJobs as i16 => {
             let key = printer.key.clone();
             let arcs: Vec<Arc<Mutex<JobRecord>>> =
                 state.jobs.read().await.values().cloned().collect();
@@ -1373,7 +1373,7 @@ fn printer_uuid(key: &str) -> String {
     )
 }
 
-fn printer_attributes(printer: &Printer, req_id: u32) -> axum::response::Response {
+fn printer_attributes(printer: &Printer, req_id: i32) -> axum::response::Response {
     let mut resp = match IppRequestResponse::new_response(
         IppVersion::v1_1(),
         StatusCode::SuccessfulOk,
@@ -1623,7 +1623,7 @@ fn doc_format(parsed: &IppRequestResponse) -> String {
     parsed.attributes()
         .groups_of(DelimiterTag::OperationAttributes)
         .next()
-        .and_then(|g| g.attributes().get("document-format"))
+        .and_then(|g| g.get("document-format"))
         .and_then(|a| {
             if let IppValue::MimeMediaType(m) = a.value() {
                 Some(m.as_str().to_string())
@@ -1641,7 +1641,7 @@ fn job_media_source(parsed: &IppRequestResponse) -> String {
         .next();
 
     let media_source = group
-        .and_then(|g| g.attributes().get("media-source"))
+        .and_then(|g| g.get("media-source"))
         .and_then(|a| match a.value() {
             IppValue::Keyword(k) => Some(k.as_str().to_string()),
             _ => None,
@@ -1651,7 +1651,7 @@ fn job_media_source(parsed: &IppRequestResponse) -> String {
     // Printer") never send the PWG media-source keyword at all — tray
     // choice comes across as the PPD's own InputSlot keyword instead.
     let input_slot = group
-        .and_then(|g| g.attributes().get("InputSlot"))
+        .and_then(|g| g.get("InputSlot"))
         .and_then(|a| match a.value() {
             IppValue::NameWithoutLanguage(n) => Some(n.as_str().to_lowercase()),
             IppValue::Keyword(k) => Some(k.as_str().to_lowercase()),
@@ -1675,7 +1675,7 @@ fn job_media_pts(parsed: &IppRequestResponse, default_media: &str) -> (f32, f32)
     let group = parsed.attributes().groups_of(DelimiterTag::JobAttributes).next();
 
     let keyword = group
-        .and_then(|g| g.attributes().get("media"))
+        .and_then(|g| g.get("media"))
         .and_then(|a| match a.value() {
             IppValue::Keyword(k) => Some(k.as_str()),
             IppValue::NameWithoutLanguage(n) => Some(n.as_str()),
@@ -1702,7 +1702,7 @@ fn job_media_pts(parsed: &IppRequestResponse, default_media: &str) -> (f32, f32)
         }
     };
     let size = group
-        .and_then(|g| g.attributes().get("media-col"))
+        .and_then(|g| g.get("media-col"))
         .and_then(|a| member(a.value(), "media-size"));
     if let Some(size) = size
         && let (Some(w), Some(h)) = (dimension(&size, "x-dimension"), dimension(&size, "y-dimension"))
@@ -1720,7 +1720,7 @@ fn job_color_mode(parsed: &IppRequestResponse) -> Option<String> {
         .groups_of(DelimiterTag::JobAttributes)
         .next()?;
     for name in ["print-color-mode", "output-mode"] {
-        if let Some(a) = group.attributes().get(name)
+        if let Some(a) = group.get(name)
             && let IppValue::Keyword(k) = a.value() {
                 return Some(k.as_str().to_string());
             }
@@ -1737,10 +1737,10 @@ fn job_media_type(parsed: &IppRequestResponse) -> Option<String> {
         IppValue::NameWithoutLanguage(n) => Some(n.as_str().to_string()),
         _ => None,
     };
-    if let Some(t) = group.attributes().get("media-type").and_then(|a| keyword(a.value())) {
+    if let Some(t) = group.get("media-type").and_then(|a| keyword(a.value())) {
         return Some(t);
     }
-    match group.attributes().get("media-col")?.value() {
+    match group.get("media-col")?.value() {
         IppValue::Collection(members) => {
             members.iter().find(|(k, _)| k.as_str() == "media-type").and_then(|(_, v)| keyword(v))
         }
@@ -1752,7 +1752,7 @@ fn job_content_optimize(parsed: &IppRequestResponse) -> Option<String> {
     parsed.attributes()
         .groups_of(DelimiterTag::JobAttributes)
         .next()
-        .and_then(|g| g.attributes().get("print-content-optimize"))
+        .and_then(|g| g.get("print-content-optimize"))
         .and_then(|a| match a.value() {
             IppValue::Keyword(k) => Some(k.as_str().to_string()),
             _ => None,
@@ -1764,7 +1764,7 @@ fn job_print_quality(parsed: &IppRequestResponse) -> Option<i32> {
     parsed.attributes()
         .groups_of(DelimiterTag::JobAttributes)
         .next()
-        .and_then(|g| g.attributes().get("print-quality"))
+        .and_then(|g| g.get("print-quality"))
         .and_then(|a| match a.value() {
             IppValue::Enum(v) | IppValue::Integer(v) => Some(*v),
             _ => None,
@@ -1777,7 +1777,7 @@ fn job_user_name(parsed: &IppRequestResponse) -> Option<String> {
     parsed.attributes()
         .groups_of(DelimiterTag::OperationAttributes)
         .next()
-        .and_then(|g| g.attributes().get("requesting-user-name"))
+        .and_then(|g| g.get("requesting-user-name"))
         .and_then(|a| match a.value() {
             IppValue::NameWithoutLanguage(n) => Some(n.as_str().to_string()),
             IppValue::TextWithoutLanguage(t) => Some(t.to_string()),
@@ -2705,15 +2705,15 @@ mod tests {
     #[test]
     fn test_job_media_pts_reads_keyword_and_media_col() {
         let by_keyword = job_request_with(IppAttribute::new(
-            "media".try_into().unwrap(),
+            IppName::try_from("media").unwrap(),
             IppValue::Keyword("iso_a4_210x297mm".try_into().unwrap()),
         ));
         assert_eq!(job_media_pts(&by_keyword, "na_letter_8.5x11in"), (595.0, 842.0));
 
         let by_collection = job_request_with(IppAttribute::new(
-            "media-col".try_into().unwrap(),
+            IppName::try_from("media-col").unwrap(),
             IppValue::Collection(BTreeMap::from([(
-                "media-size".try_into().unwrap(),
+                IppName::try_from("media-size").unwrap(),
                 media_size_collection(21000, 29700).unwrap(),
             )])),
         ));

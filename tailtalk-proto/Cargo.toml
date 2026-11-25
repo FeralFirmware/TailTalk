@@ -15,4 +15,4 @@ tokio-util = { version = "0.7", features = ["codec"] }
 
 [build-dependencies]
 prost-build = "0.14"
-protox = "0.9"
+protox = "0.10"
