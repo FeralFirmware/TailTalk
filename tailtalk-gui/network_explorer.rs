@@ -40,7 +40,7 @@ use tailtalk::{
     atp::{Atp, AtpAddress},
     ddp::DdpHandle,
     echo::{EchoHandle, MAX_ECHO_DATA},
-    imagewriter::{self, ImageWriter, ImageWriterStatus},
+    imagewriter::{self, ImageWriter, ImageWriterModel, ImageWriterStatus},
     pap::{PapClient, PapStatusHandle},
     stylewriter::{Cleaning, StyleWriterSession},
 };
@@ -123,7 +123,7 @@ impl DeviceKind {
         match self {
             DeviceKind::LaserWriter => &["LaserWriter"],
             DeviceKind::StyleWriter => &["ColorStyleWriter2400AT", "StyleWriter1200AT"],
-            DeviceKind::ImageWriter => &["ImageWriter"],
+            DeviceKind::ImageWriter => &imagewriter::NBP_TYPES,
             DeviceKind::InkTalk => &[inkproto::NBP_TYPE],
             DeviceKind::Generic => &[],
         }
@@ -173,7 +173,7 @@ const KNOWN_TYPES: &[(&str, &str, &str)] = &[
     ("ColorStyleWriter2400AT", "🖨", "Color StyleWriter"),
     ("StyleWriter1200AT", "🖨", "StyleWriter"),
     ("ImageWriter", "🖨", "ImageWriter"),
-    ("ImageWriter LQ", "🖨", "ImageWriter LQ"),
+    ("LQ", "🖨", "ImageWriter LQ"),
     ("InkTalk", "🖨", "InkTalk"),
     ("DeskWriter", "🖨", "HP DeskWriter"),
     ("AFPServer", "🗄", "File Server"),
@@ -263,6 +263,10 @@ impl Device {
             node_number: self.node,
             socket_number: self.socket,
         }
+    }
+
+    fn imagewriter_model(&self) -> ImageWriterModel {
+        ImageWriterModel::from_nbp_type(&self.nbp_type).unwrap_or_default()
     }
 
     /// The node itself. AEP answers on socket 4 of every node, so latency is a
@@ -753,10 +757,10 @@ async fn query_stylewriter(ddp: &DdpHandle, addr: AdspAddress) -> anyhow::Result
 /// Query an ImageWriter's LocalTalk Option Card over PAP. No connection is
 /// opened, so this works even while the printer is mid-job. Everything the card
 /// reports is in one 16-bit word, so there is nothing further to ask it.
-async fn query_imagewriter(ddp: &DdpHandle, addr: AtpAddress) -> anyhow::Result<Queried> {
+async fn query_imagewriter(ddp: &DdpHandle, addr: AtpAddress, model: ImageWriterModel) -> anyhow::Result<Queried> {
     let s = ImageWriter::status_of(ddp, addr).await?;
     Ok(Queried {
-        lines: imagewriter_lines(&s),
+        lines: imagewriter_lines(&s, model),
         settings: None,
         can_clean: false,
     })
@@ -840,7 +844,7 @@ fn format_uptime(secs: u32) -> String {
 /// the model comes out of that word, so the poller re-renders all of them
 /// together rather than refreshing the Condition line over a frozen copy of
 /// everything else.
-fn imagewriter_lines(s: &ImageWriterStatus) -> Vec<Line> {
+fn imagewriter_lines(s: &ImageWriterStatus, model: ImageWriterModel) -> Vec<Line> {
     let yes_no = |b: bool| if b { "Yes" } else { "No" };
 
     vec![
@@ -851,7 +855,7 @@ fn imagewriter_lines(s: &ImageWriterStatus) -> Vec<Line> {
         Line::field("Busy", yes_no(s.busy())),
         Line::field("Printing", yes_no(s.active())),
         Line::section("Hardware"),
-        Line::field("Model", "Apple ImageWriter II/LQ"),
+        Line::field("Model", model.name()),
         Line::field("Ribbon", s.ribbon_text()),
         Line::field(
             "Colour printing",
@@ -1382,7 +1386,7 @@ pub fn open(
                         query_stylewriter(&ddp, device.adsp_print_addr()).await
                     }
                     DeviceKind::LaserWriter => query_laserwriter(&ddp, device.atp_addr()).await,
-                    DeviceKind::ImageWriter => query_imagewriter(&ddp, device.atp_addr()).await,
+                    DeviceKind::ImageWriter => query_imagewriter(&ddp, device.atp_addr(), device.imagewriter_model()).await,
                     DeviceKind::InkTalk => {
                         query_inktalk(&ddp, device.adsp_print_addr(), device.printer_socket.is_some()).await
                     }
@@ -1782,6 +1786,7 @@ fn start_status_poller(
     // caller holds it open for re-showing), so without this the poller would
     // keep questioning the printer every five seconds for the life of the app.
     let open = Arc::new(AtomicBool::new(true));
+    let model = device.imagewriter_model();
 
     rt.spawn(async move {
         let status_socket = PapStatusHandle::new(&ddp, addr).await;
@@ -1798,7 +1803,7 @@ fn start_status_poller(
                 // them all rather than leaving the raw reply showing an older
                 // reading than the Condition line above it.
                 DeviceKind::ImageWriter => {
-                    imagewriter.read().await.map(|s| PollUpdate::Rows(imagewriter_lines(&s)))
+                    imagewriter.read().await.map(|s| PollUpdate::Rows(imagewriter_lines(&s, model)))
                 }
                 // A LaserWriter's other rows come from PostScript queries this
                 // poll doesn't run, so only the condition is refreshed.
