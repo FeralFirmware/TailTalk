@@ -45,29 +45,6 @@
 //! | loaded | on           | `0x0080` |
 //! | loaded | off          | `0x0088` |
 //! | empty  | off          | `0x00AA` |
-//!
-//! The first two differ only in the Select light, and only in bit 3, so bit 3
-//! is **off line** as the figure says. Emptying the printer then raised bit 5,
-//! **paper out**, and bit 1, the general fault, with it: those two move
-//! together. The printer was already off line for that third reading, so
-//! whether running out deselects it on its own is untested. Bit 7, the colour
-//! ribbon, is set throughout.
-//!
-//! Every bit confirmed that way is active-high, so a ready printer reads
-//! all-clear below bit 7. Bits 6, 4, 2 and 0 are still the figure's word alone,
-//! never having been deliberately triggered and checked, so a surprising error
-//! from [`error_text`](ImageWriterStatus::error_text) naming one of those is as
-//! likely to be a wrong bit as a real fault.
-//!
-//! The card sends the low byte first, so the word is assembled little-endian
-//! even though AppleTalk is otherwise big-endian. All three readings put the
-//! meaningful bits in the byte that arrives first, which is also why the
-//! card's documented glitch reply is "all ones in the low byte".
-//!
-//! That glitch is occasional and not sticky: the card sometimes answers with
-//! every bit of the low byte set, and the call simply has to be repeated.
-//! [`StatusHandle::read`] does that; [`ImageWriterStatus::parse`] rejects it.
-
 use crate::atp::{Atp, AtpAddress};
 use crate::ddp::DdpHandle;
 use crate::nbp::NbpHandle;
@@ -77,8 +54,48 @@ use encoding_rs::MACINTOSH;
 use tailtalk_packets::nbp::{EntityName, NbpTuple};
 use tokio::io::AsyncRead;
 
-/// The NBP type the LocalTalk Option Card registers itself under.
-pub const NBP_TYPE: &str = "ImageWriter";
+/// Which printer an option card is fitted to, as its NBP type shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImageWriterModel {
+    OG, /// Not originally supported, but works via InkTalk
+    #[default]
+    II,
+    LQ,
+}
+
+impl ImageWriterModel {
+    /// Matches an NBP type to a model. Since the OG ImageWriter was never officially networkable
+    /// we only return a II or an LQ. With InkTalk it should correctly identify as a B/W ribbon
+    /// unit with no feeder, which is backwards compatible with the same II code.
+    pub fn from_nbp_type(nbp_type: &str) -> Option<Self> {
+        [Self::II, Self::LQ]
+            .into_iter()
+            .find(|m| m.nbp_type().eq_ignore_ascii_case(nbp_type))
+    }
+
+    pub const fn nbp_type(self) -> &'static str {
+        match self {
+            Self::OG => "ImageWriter",
+            Self::II => "ImageWriter",
+            Self::LQ => "LQ",
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::OG => "Apple ImageWriter (Original)",
+            Self::II => "Apple ImageWriter II",
+            Self::LQ => "Apple ImageWriter LQ",
+        }
+    }
+}
+
+/// The NBP type the LocalTalk Option Card registers itself under - "ImageWriter" for
+/// the II, and "LQ" for when it is plugged in to an LQ.
+pub const NBP_TYPES: [&str; 2] = [
+    ImageWriterModel::II.nbp_type(),
+    ImageWriterModel::LQ.nbp_type(),
+];
 
 /// `ESC b`, the option card's rename command. See [`rename_command`].
 const RENAME_COMMAND: [u8; 2] = [0x1B, 0x62];
@@ -278,17 +295,26 @@ pub struct ImageWriter {
 }
 
 impl ImageWriter {
-    /// Find ImageWriters on the network. `object` is an NBP object name, `=`
-    /// for any, and the type is always [`NBP_TYPE`].
+    /// Find ImageWriters on the network by type, where `object` is the NBP name to look for.
+    /// This method will find both ImageWriter II and LQ devices.
     pub async fn lookup(nbp: &NbpHandle, object: &str) -> Result<Vec<NbpTuple>> {
-        let entity = EntityName {
-            object: object
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("object name is too long for NBP: {object}"))?,
-            entity_type: NBP_TYPE.try_into().expect("literal fits"),
-            zone: "*".try_into().expect("literal fits"),
-        };
-        Ok(nbp.lookup(entity).await?)
+        let object = object
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("object name is too long for NBP: {object}"))?;
+        let zone = "*".try_into().unwrap();
+
+        let queries = NBP_TYPES.into_iter().map(|entity_type| EntityName {
+            object,
+            entity_type: entity_type.try_into().unwrap(),
+            zone,
+        });
+
+        Ok(nbp
+            .lookup_many(queries)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     /// Open a PAP connection to the printer at `address`.
@@ -309,9 +335,9 @@ impl ImageWriter {
     /// that answers. Pass `=` to take whichever ImageWriter is on the network.
     pub async fn connect_named(ddp: &DdpHandle, nbp: &NbpHandle, object: &str) -> Result<Self> {
         let tuples = Self::lookup(nbp, object).await?;
-        let printer = tuples.first().ok_or_else(|| {
-            anyhow!("no ImageWriter named '{object}:{NBP_TYPE}@*' on the network")
-        })?;
+        let printer = tuples
+            .first()
+            .ok_or_else(|| anyhow!("no ImageWriter II/LQ named '{object}' on the network"))?;
         tracing::info!(
             "ImageWriter: found {} at {}.{} socket {}",
             printer.entity_name,
@@ -576,7 +602,10 @@ mod tests {
         assert!(s.cover_open());
 
         let s = ImageWriterStatus::parse(&wire(0x08, 0x00)).unwrap();
-        assert!(s.off_line() && s.paper_present(), "bit 3 is not about paper");
+        assert!(
+            s.off_line() && s.paper_present(),
+            "bit 3 is not about paper"
+        );
 
         let s = ImageWriterStatus::parse(&wire(0x04, 0x00)).unwrap();
         assert!(s.paper_jam_bit());
