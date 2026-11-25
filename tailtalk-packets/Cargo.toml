@@ -20,7 +20,7 @@ afp = ["std"]
 bitflags = { version = "2.13", default-features = false }
 byteorder = { workspace = true } #unified
 encoding_rs = { workspace = true } #unified
-heapless = { version = "0.9.3", default-features = false }
+heapless = { version = "0.9.4", default-features = false }
 thiserror = { workspace = true } #unified
 
 [dev-dependencies]

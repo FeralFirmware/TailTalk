@@ -36,7 +36,9 @@ use embassy_rp::pac;
 use embassy_rp::pac::io::vals::Inover;
 use embassy_rp::peripherals::{DMA_CH2, PIO0};
 use embassy_rp::pio::{Config, Direction, FifoJoin, PioPin, ShiftConfig, ShiftDirection, StateMachine};
-use embassy_rp::{Peripheral, PeripheralRef};
+use embassy_rp::Peri;
+use embassy_rp::dma::{Channel, InterruptHandler};
+use embassy_rp::interrupt::typelevel::Binding;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use pio::{InstructionOperands, JmpCondition, SetDestination};
 
@@ -73,7 +75,7 @@ fn set_hski_inversion(invert: bool) {
 /// needs. The printer TX task owns it and switches between chunks.
 pub struct FastTx {
     sm: StateMachine<'static, PIO0, TX_SM>,
-    dma: PeripheralRef<'static, DMA_CH2>,
+    dma: Channel<'static>,
     /// The data pin, whose FUNCSEL moves between UART0 and PIO0.
     tx_gpio: usize,
     tx_origin: u8,
@@ -100,9 +102,10 @@ pub struct Received {
 /// takes them back.
 pub fn init(
     spare: Pio0Spare,
-    dma: DMA_CH2,
-    tx_pin: impl Peripheral<P = impl PioPin> + 'static,
-    rx_pin: impl Peripheral<P = impl PioPin> + 'static,
+    dma: Peri<'static, DMA_CH2>,
+    dma_irqs: impl Binding<<DMA_CH2 as embassy_rp::dma::ChannelInstance>::Interrupt, InterruptHandler<DMA_CH2>> + 'static,
+    tx_pin: Peri<'static, impl PioPin>,
+    rx_pin: Peri<'static, impl PioPin>,
 ) -> (FastTx, FastRx) {
     let Pio0Spare {
         mut common,
@@ -112,7 +115,7 @@ pub fn init(
 
     // One frame per byte pulled. The line stays at the last stop bit while
     // there is nothing to send.
-    let tx_prog = pio_proc::pio_asm!(
+    let tx_prog = pio::pio_asm!(
         ".wrap_target",
         "    pull block",
         "    set x, 7",
@@ -149,7 +152,7 @@ pub fn init(
     // from the top, so the stop bit lands in bit 31 and the data in 30..23.
     // `push noblock` drops a frame when the FIFO is full, and flags it in
     // FDEBUG.RXSTALL.
-    let rx_prog = pio_proc::pio_asm!(
+    let rx_prog = pio::pio_asm!(
         ".wrap_target",
         "idle:",
         "    wait 0 gpio 18",
@@ -185,7 +188,7 @@ pub fn init(
     (
         FastTx {
             sm: tx_sm,
-            dma: dma.into_ref(),
+            dma: Channel::new(dma, dma_irqs),
             tx_gpio: usize::from(tx_pin.pin()),
             tx_origin: tx_loaded.origin,
             rx_origin: rx_loaded.origin,
@@ -252,7 +255,7 @@ impl FastTx {
     /// into the FIFO. Each byte fills a whole FIFO word, and SM1 only shifts
     /// out the low eight bits.
     pub async fn write(&mut self, data: &[u8]) -> Result<(), ClockLost> {
-        let transfer = self.sm.tx().dma_push(self.dma.reborrow(), data);
+        let transfer = self.sm.tx().dma_push(&mut self.dma, data, false);
         with_timeout(CLOCK_LOST, transfer).await.map_err(|_| ClockLost)
     }
 

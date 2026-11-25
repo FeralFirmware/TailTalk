@@ -20,23 +20,23 @@ ethertalk = ["tailtalk/ethertalk"]
 anyhow = { workspace = true } #unified
 axum = "0.8.9"
 binhex-rs = "0.1.1"
-dirs = "6"
+dirs = "7"
 hfs-reader = { workspace = true } #unified
 if-addrs = "0.15"
 inkproto = { workspace = true }
-ipp = "6.0.1"
+ipp = "8.0.0"
 keepawake = "0.6"
-mdns-sd = "0.20.3"
-rfd = "0.17"
+mdns-sd = "0.22.0"
+rfd = "0.18"
 shellexpand = "3"
 serde = { version = "1", features = ["derive"] }
 serialport = { version = "4", optional = true }
 slint = "1"
-stuffit = "^0.2"
+stuffit = "^0.4"
 tailtalk = { workspace = true } #unified
 tailtalk-packets = { workspace = true } #unified
 tokio = { workspace = true, features = ["io-util"] } #unified
-toml = "^1.1"
+toml = "^1.2"
 tracing = { workspace = true } #unified
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -49,7 +49,7 @@ libc = "0.2"
 # asks winit for by default. `default-features = false` so the renderer choice
 # stays whatever the `slint` dependency selects; Cargo unifies the two. Version
 # must track `slint` exactly, these crates ship in lockstep.
-i-slint-backend-winit = { version = "=1.17.1", default-features = false }
+i-slint-backend-winit = { version = "=1.19.1", default-features = false }
 
 [build-dependencies]
 slint-build = "1"

@@ -147,9 +147,9 @@ pub fn start(spawner: &Spawner, shared: &'static SharedState, role: Role, name: 
     }));
     let (net, runner) = tailtalk_net::new(state, InkLink { shared });
     let _ = NET.init(net);
-    defmt::unwrap!(spawner.spawn(run_node(runner)));
-    defmt::unwrap!(spawner.spawn(serve_printer(shared, net, role, name)));
-    defmt::unwrap!(spawner.spawn(control::run(shared, net, control::Running { role, baud })));
+    spawner.spawn(defmt::unwrap!(run_node(runner)));
+    spawner.spawn(defmt::unwrap!(serve_printer(shared, net, role, name)));
+    spawner.spawn(defmt::unwrap!(control::run(shared, net, control::Running { role, baud })));
 }
 
 #[embassy_executor::task]

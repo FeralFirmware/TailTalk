@@ -45,7 +45,6 @@ use portable_atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use crate::tt_log;
 
 use embassy_futures::select::{Either, select};
-use embassy_rp::peripherals::UART0;
 use embassy_rp::uart::{BufferedUartRx, BufferedUartTx};
 use embassy_sync::blocking_mutex;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
@@ -246,6 +245,10 @@ impl Write for PortTx {
         send(buf).await;
         Ok(buf.len())
     }
+
+    async fn flush(&mut self) -> Result<(), Infallible> {
+        Ok(())
+    }
 }
 
 /// The printer port's receive half, as `tailtalk-net` reads from it.
@@ -282,7 +285,7 @@ const TX_CHUNK: usize = 256;
 /// Feed the printer from [`TX_PIPE`], at whichever clock the port is on.
 /// `base_baud` is what the UART runs at outside a fast mode.
 #[embassy_executor::task]
-pub async fn tx_run(mut tx: BufferedUartTx<'static, UART0>, mut fast: FastTx, base_baud: u32) -> ! {
+pub async fn tx_run(mut tx: BufferedUartTx, mut fast: FastTx, base_baud: u32) -> ! {
     let mut buf = [0u8; TX_CHUNK];
     loop {
         // The pipe is polled first, so a clock switch waits for every byte
@@ -323,7 +326,7 @@ pub async fn tx_run(mut tx: BufferedUartTx<'static, UART0>, mut fast: FastTx, ba
 
 /// Move the port to `to`, once what is already on its way has gone out at
 /// the old clock.
-async fn switch_clock(tx: &mut BufferedUartTx<'static, UART0>, fast: &mut FastTx, base_baud: u32, to: PortClock) {
+async fn switch_clock(tx: &mut BufferedUartTx, fast: &mut FastTx, base_baud: u32, to: PortClock) {
     let from = port_clock();
     if to == from {
         return;
@@ -420,7 +423,7 @@ pub async fn handshake_run() -> ! {
 }
 
 #[embassy_executor::task]
-pub async fn rx_run(mut rx: BufferedUartRx<'static, UART0>, mut fast: FastRx) -> ! {
+pub async fn rx_run(mut rx: BufferedUartRx, mut fast: FastRx) -> ! {
     let mut buf = [0u8; 64];
     let mut fast_buf = [0u8; 64];
     loop {
